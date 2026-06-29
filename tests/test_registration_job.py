@@ -179,3 +179,19 @@ def test_browser_options_apply_configured_proxy(monkeypatch):
     options = reg.create_browser_options()
 
     assert ("--proxy-server", "http://host.docker.internal:7890") in options.arguments
+
+
+def test_docker_forces_visible_mode_even_if_legacy_headless_env_is_set(monkeypatch):
+    monkeypatch.setenv("GROK_REG_IN_DOCKER", "1")
+    monkeypatch.setenv("GROK_REG_HEADLESS", "1")
+    monkeypatch.delenv("GROK_REG_ALLOW_HEADLESS", raising=False)
+
+    assert reg.should_run_headless() is False
+
+
+def test_headless_can_only_be_forced_with_explicit_override(monkeypatch):
+    monkeypatch.setenv("GROK_REG_IN_DOCKER", "1")
+    monkeypatch.setenv("GROK_REG_HEADLESS", "1")
+    monkeypatch.setenv("GROK_REG_ALLOW_HEADLESS", "1")
+
+    assert reg.should_run_headless() is True

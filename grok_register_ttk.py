@@ -186,6 +186,16 @@ def normalize_proxy_for_runtime(proxy):
     return re.sub(r"(?<=://)(127\.0\.0\.1|localhost)(?=[:/]|$)", "host.docker.internal", raw)
 
 
+def _env_truthy(name, default="0"):
+    return str(os.environ.get(name, default)).lower() in {"1", "true", "yes", "on"}
+
+
+def should_run_headless():
+    if _env_truthy("GROK_REG_IN_DOCKER") and not _env_truthy("GROK_REG_ALLOW_HEADLESS"):
+        return False
+    return _env_truthy("GROK_REG_HEADLESS")
+
+
 def get_duckmail_api_key():
     return config.get("duckmail_api_key", "")
 
@@ -428,7 +438,7 @@ def create_browser_options():
     proxy = normalize_proxy_for_runtime(config.get("proxy", ""))
     if proxy:
         options.set_argument("--proxy-server", proxy)
-    if str(os.environ.get("GROK_REG_HEADLESS", "0")).lower() in {"1", "true", "yes", "on"}:
+    if should_run_headless():
         options.headless(True)
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
@@ -1752,7 +1762,7 @@ def start_browser(log_callback=None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback:
                 proxy = normalize_proxy_for_runtime(config.get("proxy", ""))
-                mode = "headless" if str(os.environ.get("GROK_REG_HEADLESS", "0")).lower() in {"1", "true", "yes", "on"} else "visible"
+                mode = "headless" if should_run_headless() else "visible"
                 log_callback(f"[Debug] 浏览器模式: {mode}，代理: {proxy or '直连'}")
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")

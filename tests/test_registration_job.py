@@ -137,3 +137,45 @@ def test_docker_runs_visible_chromium_under_xvfb_by_default():
     assert 'GROK_REG_HEADLESS=0' in dockerfile
     assert 'xvfb-run' in dockerfile
     assert 'GROK_REG_HEADLESS: "0"' in compose
+
+
+def test_loopback_proxy_is_rewritten_inside_docker(monkeypatch):
+    monkeypatch.setenv("GROK_REG_IN_DOCKER", "1")
+
+    assert (
+        reg.normalize_proxy_for_runtime("http://127.0.0.1:7890")
+        == "http://host.docker.internal:7890"
+    )
+    assert (
+        reg.normalize_proxy_for_runtime("socks5://localhost:1080")
+        == "socks5://host.docker.internal:1080"
+    )
+
+
+def test_browser_options_apply_configured_proxy(monkeypatch):
+    class FakeOptions:
+        def __init__(self):
+            self.arguments = []
+
+        def auto_port(self):
+            return self
+
+        def set_timeouts(self, base=1):
+            self.base_timeout = base
+            return self
+
+        def set_argument(self, key, value=None):
+            self.arguments.append((key, value))
+            return self
+
+        def add_extension(self, path):
+            self.extension = path
+            return self
+
+    monkeypatch.setattr(reg, "ChromiumOptions", FakeOptions)
+    monkeypatch.setenv("GROK_REG_IN_DOCKER", "1")
+    monkeypatch.setitem(reg.config, "proxy", "http://127.0.0.1:7890")
+
+    options = reg.create_browser_options()
+
+    assert ("--proxy-server", "http://host.docker.internal:7890") in options.arguments

@@ -3,6 +3,7 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     GROK_REG_DATA_DIR=/app/data \
+    GROK_REG_IN_DOCKER=1 \
     GROK_REG_HEADLESS=0 \
     CHROME_BIN=/usr/bin/chromium
 

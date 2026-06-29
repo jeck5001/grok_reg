@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 
 import pytest
 
@@ -110,3 +111,9 @@ def test_registration_job_stop_request_sets_stopped_status(monkeypatch, tmp_path
 
     assert status["status"] == "stopped"
     assert status["stop_requested"] is True
+
+
+def test_optional_tkinter_import_handles_missing_shared_library():
+    source = Path(reg.__file__).read_text(encoding="utf-8")
+
+    assert "except ImportError:" in source

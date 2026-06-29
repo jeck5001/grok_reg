@@ -22,7 +22,7 @@ import uuid
 try:
     import tkinter as tk
     from tkinter import ttk, messagebox, scrolledtext
-except ModuleNotFoundError:
+except ImportError:
     tk = None
     ttk = None
     messagebox = None

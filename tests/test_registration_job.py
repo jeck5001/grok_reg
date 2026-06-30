@@ -422,11 +422,54 @@ def test_exchange_xai_oauth_code_for_token_posts_pkce_form(monkeypatch):
 def test_xai_oauth_consent_click_script_has_deep_fallbacks():
     script = reg.build_xai_oauth_consent_click_script()
 
+    assert "if (!isConsentPage)" in script
     assert "shadowRoot" in script
     assert "querySelectorAll('*')" in script
     assert "form.submit()" in script
     assert "buttons[buttons.length - 1]" in script
     assert "oauth2/consent" in script
+
+
+def test_fetch_xai_oauth_refresh_token_sets_sso_cookies_before_authorize(monkeypatch):
+    events = []
+
+    class FakePage:
+        def __init__(self):
+            self.url = "https://127.0.0.1/callback?code=auth-code&state=fixed-state"
+
+        def run_cdp(self, method, **kwargs):
+            events.append(("cdp", method, kwargs))
+
+        def get(self, url):
+            events.append(("get", url))
+
+        def run_js(self, script):
+            return {"clicked": False}
+
+    class FakeBrowser:
+        def __init__(self):
+            self.page = FakePage()
+
+        def new_tab(self, url):
+            events.append(("new_tab", url))
+            return self.page
+
+    monkeypatch.setattr(reg, "_get_browser", lambda: FakeBrowser())
+    monkeypatch.setattr(reg, "_get_page", lambda: FakePage())
+    monkeypatch.setattr(reg, "_set_page", lambda page: None)
+    monkeypatch.setattr(reg.secrets, "token_hex", lambda size: "fixed-state" if size == 32 else "fixed-nonce")
+    monkeypatch.setattr(reg.secrets, "token_bytes", lambda size: b"a" * size)
+    monkeypatch.setattr(
+        reg,
+        "exchange_xai_oauth_code_for_token",
+        lambda code, verifier, redirect_uri=None: {"refresh_token": "refresh-token"},
+    )
+
+    assert reg.fetch_xai_oauth_refresh_token("sso-token") == "refresh-token"
+    cookie_names = [item[2].get("name") for item in events if item[0] == "cdp"]
+    assert "sso" in cookie_names
+    assert "sso-rw" in cookie_names
+    assert any(item[0] == "get" and "oauth2/authorize" in item[1] for item in events)
 
 
 def test_should_log_cloudflare_wait_throttles_repeated_same_length(monkeypatch):

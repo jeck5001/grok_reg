@@ -830,6 +830,15 @@ def parse_xai_oauth_callback_url(url):
 def build_xai_oauth_consent_click_script():
     return r"""
 const isConsentPage = String(location.href || '').includes('oauth2/consent');
+if (!isConsentPage) {
+  return {
+    clicked: false,
+    skipped: true,
+    isConsentPage,
+    url: String(location.href || ''),
+    text: document.body ? String(document.body.innerText || '').slice(0, 300) : ''
+  };
+}
 const denyWords = ['cancel', 'deny', 'decline', 'reject', '拒绝', '取消'];
 const allowWords = [
   'allow', 'authorize', 'authorise', 'continue', 'approve', 'accept',
@@ -910,6 +919,31 @@ def _click_xai_oauth_consent_if_present(page):
         return False
 
 
+def set_xai_sso_cookies_for_oauth(page, sso):
+    token = _normalize_sso_token(sso)
+    if not page or not token:
+        return False
+    cookies = [
+        {"name": "sso", "value": token, "domain": ".x.ai", "path": "/", "secure": True, "httpOnly": True},
+        {"name": "sso-rw", "value": token, "domain": ".x.ai", "path": "/", "secure": True, "httpOnly": True},
+    ]
+    ok = False
+    for cookie in cookies:
+        try:
+            page.run_cdp("Network.setCookie", **cookie)
+            ok = True
+        except Exception:
+            pass
+    try:
+        setter = getattr(getattr(page, "set", None), "cookies", None)
+        if setter:
+            setter(cookies)
+            ok = True
+    except Exception:
+        pass
+    return ok
+
+
 def exchange_xai_oauth_code_for_token(code, code_verifier, redirect_uri=None):
     payload = {
         "grant_type": "authorization_code",
@@ -956,6 +990,7 @@ def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_cal
     auth_url = build_xai_oauth_authorize_url(state, code_challenge, nonce)
     if log_callback:
         log_callback("[*] 获取 xAI OAuth Refresh Token...")
+    set_xai_sso_cookies_for_oauth(page, token)
     page.get(auth_url)
 
     deadline = time.time() + timeout

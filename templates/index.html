@@ -119,6 +119,37 @@
             grok2api 远端 app_key
             <input name="grok2api_remote_app_key" type="password" autocomplete="off" />
           </label>
+          <label>
+            sub2api Base
+            <input name="sub2api_base" placeholder="https://sub2api.example.com 或 https://sub2api.example.com/api/v1" />
+          </label>
+          <label>
+            sub2api 鉴权模式
+            <select name="sub2api_auth_mode">
+              <option value="x-api-key">x-api-key</option>
+              <option value="bearer">bearer</option>
+            </select>
+          </label>
+          <label>
+            sub2api 管理 Token
+            <input name="sub2api_admin_token" type="password" autocomplete="off" />
+          </label>
+          <label>
+            sub2api 账号名前缀
+            <input name="sub2api_account_name" placeholder="Grok Auto" />
+          </label>
+          <label>
+            sub2api 分组 ID
+            <input name="sub2api_group_ids" placeholder="1,2" />
+          </label>
+          <label>
+            sub2api 并发
+            <input name="sub2api_concurrency" type="number" min="0" max="1000" value="3" />
+          </label>
+          <label>
+            sub2api 优先级
+            <input name="sub2api_priority" type="number" min="0" max="1000" value="50" />
+          </label>
         </form>
 
         <aside class="control-panel">
@@ -127,6 +158,35 @@
           <button id="stopBtn" type="button" class="danger" disabled>停止任务</button>
           <p id="message" class="message"></p>
         </aside>
+      </section>
+
+      <section class="accounts">
+        <div class="accounts-head">
+          <div>
+            <h2>账号管理</h2>
+            <p id="accountsSummary">共 0 个账号</p>
+          </div>
+          <div class="accounts-actions">
+            <button id="refreshAccountsBtn" type="button">刷新账号</button>
+            <button id="importSub2apiBtn" type="button" class="primary">创建 sub2api 账号</button>
+          </div>
+        </div>
+        <p class="hint">账号来自 data 目录下的 accounts_*.txt。页面只显示 token 摘要。当前注册机保存的是 x.ai sso cookie，sub2api 当前 Grok 调度读取 OAuth access_token，创建后请在 sub2api 侧测试可用性。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>选择</th>
+                <th>邮箱</th>
+                <th>SSO 摘要</th>
+                <th>来源文件</th>
+                <th>行号</th>
+                <th>密码</th>
+              </tr>
+            </thead>
+            <tbody id="accountsBody"></tbody>
+          </table>
+        </div>
       </section>
 
       <section class="logs">

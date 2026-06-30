@@ -19,6 +19,7 @@ import string
 import json
 import uuid
 import subprocess
+import hashlib
 
 try:
     import tkinter as tk
@@ -79,6 +80,13 @@ DEFAULT_CONFIG = {
     "grok2api_auto_add_remote": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
+    "sub2api_base": "",
+    "sub2api_auth_mode": "x-api-key",
+    "sub2api_admin_token": "",
+    "sub2api_account_name": "Grok Auto",
+    "sub2api_group_ids": "",
+    "sub2api_concurrency": 3,
+    "sub2api_priority": 50,
     "register_threads": 1,
     "thread_start_interval": 0.8,
     "show_tutorial_on_start": True,
@@ -342,6 +350,8 @@ def resolve_grok2api_local_token_file():
     configured = str(config.get("grok2api_local_token_file", "") or "").strip()
     if configured:
         return configured
+    if os.name != "nt":
+        return ""
     return r"D:\注册机\3255d5ee6e702db9220a897df64635a1ec9df644\vendor\grok2api\data\token.json"
 
 
@@ -352,6 +362,171 @@ def _normalize_sso_token(raw_token):
     return token
 
 
+def _mask_token(token, head=6, tail=6):
+    value = str(token or "").strip()
+    if len(value) <= 8:
+        return value
+    return f"{value[:head]}...{value[-tail:]}"
+
+
+def _account_id(source, line_no, email, sso):
+    seed = f"{source}:{line_no}:{email}:{_normalize_sso_token(sso)}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+
+
+def parse_registered_account_line(line, source="", line_no=0, include_sso=True):
+    parts = str(line or "").rstrip("\n").split("----", 2)
+    if len(parts) != 3:
+        return None
+    email, password, sso = [part.strip() for part in parts]
+    sso = _normalize_sso_token(sso)
+    if not email or not sso:
+        return None
+    account = {
+        "id": _account_id(source, line_no, email, sso),
+        "email": email,
+        "password": password,
+        "sso_preview": _mask_token(sso),
+        "source_file": source,
+        "line_no": line_no,
+    }
+    if include_sso:
+        account["sso"] = sso
+    return account
+
+
+def list_registered_accounts(include_sso=True):
+    data_dir = get_data_dir()
+    accounts = []
+    for name in sorted(os.listdir(data_dir), reverse=True):
+        if not (name.startswith("accounts_") and name.endswith(".txt")):
+            continue
+        path = os.path.join(data_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line_no, line in enumerate(f, start=1):
+                    account = parse_registered_account_line(
+                        line, source=name, line_no=line_no, include_sso=include_sso
+                    )
+                    if account:
+                        accounts.append(account)
+        except Exception:
+            continue
+    return accounts
+
+
+def find_registered_accounts(account_ids):
+    wanted = {str(item) for item in (account_ids or []) if str(item).strip()}
+    if not wanted:
+        return []
+    return [account for account in list_registered_accounts(include_sso=True) if account["id"] in wanted]
+
+
+def _parse_int_list(value):
+    ids = []
+    if isinstance(value, (list, tuple)):
+        candidates = value
+    else:
+        candidates = str(value or "").split(",")
+    for candidate in candidates:
+        try:
+            parsed = int(str(candidate).strip())
+        except Exception:
+            continue
+        if parsed > 0:
+            ids.append(parsed)
+    return ids
+
+
+def _optional_positive_int(value, default=None):
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def build_sub2api_account_payload(account, settings=None, index=1):
+    settings = {**config, **dict(settings or {})}
+    token = _normalize_sso_token((account or {}).get("sso", ""))
+    if not token:
+        raise ValueError("账号缺少 token")
+    email = str((account or {}).get("email") or "").strip()
+    base_name = str(settings.get("sub2api_account_name") or "Grok Auto").strip() or "Grok Auto"
+    name = f"{base_name} - {email}" if email else f"{base_name} #{index}"
+    payload = {
+        "name": name,
+        "platform": "grok",
+        "type": "oauth",
+        "credentials": {
+            # sub2api 当前 Grok 调度只读取 access_token；这里保留来源标记，便于后续排查。
+            "access_token": token,
+            "source_token_type": "xai_sso_cookie",
+            "email": email,
+        },
+        "extra": {
+            "import_source": "grok_reg",
+            "source_file": str((account or {}).get("source_file") or ""),
+            "source_line": (account or {}).get("line_no") or 0,
+        },
+    }
+    group_ids = _parse_int_list(settings.get("sub2api_group_ids", ""))
+    if group_ids:
+        payload["group_ids"] = group_ids
+    concurrency = _optional_positive_int(settings.get("sub2api_concurrency"), None)
+    if concurrency is not None:
+        payload["concurrency"] = concurrency
+    priority = _optional_positive_int(settings.get("sub2api_priority"), None)
+    if priority is not None:
+        payload["priority"] = priority
+    return payload
+
+
+def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
+    settings = {**config, **dict(settings or {})}
+    base = str(settings.get("sub2api_base") or "").strip().rstrip("/")
+    token = str(settings.get("sub2api_admin_token") or "").strip()
+    if not base:
+        raise ValueError("sub2api Base 未配置")
+    if not token:
+        raise ValueError("sub2api 管理 Token 未配置")
+    if not base.endswith("/api/v1"):
+        base = f"{base}/api/v1"
+
+    auth_mode = str(settings.get("sub2api_auth_mode") or "x-api-key").strip().lower()
+    headers = {"Content-Type": "application/json"}
+    if auth_mode == "bearer":
+        headers["Authorization"] = f"Bearer {token}"
+    else:
+        headers["x-api-key"] = token
+
+    valid_accounts = [account for account in (accounts or []) if _normalize_sso_token(account.get("sso", ""))]
+    if not valid_accounts:
+        raise ValueError("没有可导入的账号 token")
+
+    url = f"{base}/admin/accounts"
+    items = []
+    for index, account in enumerate(valid_accounts, start=1):
+        payload = build_sub2api_account_payload(account, settings, index=index)
+        resp = http_post(url, headers=headers, json=payload, timeout=30, proxies={})
+        resp.raise_for_status()
+        try:
+            response_payload = resp.json()
+        except Exception:
+            response_payload = {"raw": resp.text[:1000]}
+        items.append({"email": account.get("email", ""), "response": response_payload})
+    if log_callback:
+        log_callback(f"[+] 已导入 sub2api 账号管理: {len(items)} 个账号")
+    return {
+        "imported": True,
+        "total": len(items),
+        "items": items,
+        "warning": "当前注册机产物是 x.ai sso cookie；sub2api Grok 调度读取 OAuth access_token，导入后需在 sub2api 侧测试账号可用性。",
+    }
+
+
 def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
     token = _normalize_sso_token(raw_token)
     if not token:
@@ -360,7 +535,13 @@ def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
     pool_name = str(config.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip()
     if not pool_name:
         pool_name = "ssoBasic"
-    os.makedirs(os.path.dirname(token_file), exist_ok=True)
+    if not token_file:
+        if log_callback:
+            log_callback("[Debug] grok2api 本地 token.json 未配置，跳过")
+        return False
+    token_dir = os.path.dirname(token_file)
+    if token_dir:
+        os.makedirs(token_dir, exist_ok=True)
     data = {}
     if os.path.exists(token_file):
         try:
@@ -549,6 +730,17 @@ def sleep_with_cancel(seconds, cancel_callback=None):
         if remaining <= 0:
             return
         time.sleep(min(0.2, remaining))
+
+
+def should_log_cloudflare_wait(state, scope, token_len, interval=5.0):
+    now = time.time()
+    key = str(scope or "default")
+    token_len = str(token_len)
+    last = state.get(key, {}) if isinstance(state, dict) else {}
+    if last.get("token_len") != token_len or now - float(last.get("time", 0.0)) >= interval:
+        state[key] = {"token_len": token_len, "time": now}
+        return True
+    return False
 
 
 def detect_cloudflare_block_page(page_html):
@@ -969,6 +1161,14 @@ def validate_registration_config(settings):
     normalized["register_threads"] = _parse_positive_int(
         normalized.get("register_threads"), 1, minimum=1, maximum=10
     )
+    normalized["sub2api_concurrency"] = _parse_positive_int(
+        normalized.get("sub2api_concurrency"), 3, minimum=0, maximum=1000
+    )
+    normalized["sub2api_priority"] = _parse_positive_int(
+        normalized.get("sub2api_priority"), 50, minimum=0, maximum=1000
+    )
+    auth_mode = str(normalized.get("sub2api_auth_mode") or "x-api-key").strip().lower()
+    normalized["sub2api_auth_mode"] = "bearer" if auth_mode == "bearer" else "x-api-key"
 
     raw_paths = normalized.pop("cloudflare_paths", "")
     if raw_paths:
@@ -2742,6 +2942,7 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     form_filled_once = False
     wait_cf_since = None
     last_cf_retry_at = 0.0
+    cf_wait_log_state = {}
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -2813,8 +3014,8 @@ return 'profile-filled';
 
             if isinstance(filled, str) and filled.startswith("wait-cloudflare"):
                 form_filled_once = True
-                if log_callback:
-                    token_len = filled.split(":", 1)[1] if ":" in filled else "0"
+                token_len = filled.split(":", 1)[1] if ":" in filled else "0"
+                if log_callback and should_log_cloudflare_wait(cf_wait_log_state, "profile-fill", token_len):
                     log_callback(f"[*] 资料已填写，等待 Cloudflare 人机验证通过... 当前token长度={token_len}")
                 now = time.time()
                 if wait_cf_since is None:
@@ -2862,8 +3063,8 @@ return String(cfInput.value || '').trim().length;
         submit_state = page.run_js(build_profile_submit_script("submit"))
 
         if isinstance(submit_state, str) and submit_state.startswith("wait-cloudflare"):
-            if log_callback:
-                token_len = submit_state.split(":", 1)[1] if ":" in submit_state else "0"
+            token_len = submit_state.split(":", 1)[1] if ":" in submit_state else "0"
+            if log_callback and should_log_cloudflare_wait(cf_wait_log_state, "profile-submit", token_len):
                 log_callback(f"[*] 等待 Cloudflare 人机验证通过后再提交... 当前token长度={token_len}")
             now = time.time()
             if wait_cf_since is None:

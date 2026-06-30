@@ -14,6 +14,7 @@ SENSITIVE_KEYS = {
     "cloudflare_api_key",
     "cloudmail_password",
     "grok2api_remote_app_key",
+    "sub2api_admin_token",
     "yyds_api_key",
     "yyds_jwt",
 }
@@ -76,6 +77,34 @@ def update_config(payload: dict):
     reg.config = validated
     reg.save_config()
     return mask_config(validated)
+
+
+def public_account(account):
+    item = dict(account)
+    item.pop("sso", None)
+    return item
+
+
+@app.get("/api/accounts")
+def list_accounts():
+    accounts = reg.list_registered_accounts(include_sso=False)
+    return {"total": len(accounts), "accounts": accounts}
+
+
+@app.post("/api/accounts/import/sub2api")
+def import_accounts_to_sub2api(payload: dict):
+    settings = merge_sensitive_values(payload)
+    account_ids = payload.get("account_ids") or []
+    accounts = reg.find_registered_accounts(account_ids)
+    if not accounts:
+        raise HTTPException(status_code=404, detail="未找到选中的账号")
+    try:
+        result = reg.import_accounts_to_sub2api(accounts, settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"导入 sub2api 失败: {exc}")
+    return {**result, "accounts": [public_account(account) for account in accounts]}
 
 
 @app.post("/api/jobs/start")

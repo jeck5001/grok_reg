@@ -60,6 +60,7 @@ h1 {
 
 .status-panel,
 .control-panel,
+.accounts,
 .logs {
   border: 1px solid var(--line);
   background: var(--panel);
@@ -160,6 +161,72 @@ button:disabled {
   font-size: 13px;
 }
 
+.accounts {
+  margin: 22px 0;
+  overflow: hidden;
+}
+
+.accounts-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.accounts-head p,
+.hint {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.accounts-actions {
+  display: flex;
+  gap: 10px;
+  align-items: start;
+}
+
+.hint {
+  padding: 0 18px 12px;
+}
+
+.table-wrap {
+  overflow: auto;
+}
+
+table {
+  width: 100%;
+  min-width: 760px;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  padding: 12px 14px;
+  border-top: 1px solid rgba(196, 255, 215, 0.1);
+  text-align: left;
+  font-size: 13px;
+}
+
+th {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+td {
+  color: var(--text);
+}
+
+td.empty {
+  color: var(--muted);
+  text-align: center;
+}
+
+.account-check {
+  width: auto;
+}
+
 .logs {
   overflow: hidden;
 }
@@ -206,5 +273,10 @@ h2 {
 
   label.wide {
     grid-column: auto;
+  }
+
+  .accounts-head,
+  .accounts-actions {
+    display: grid;
   }
 }

@@ -77,6 +77,83 @@ def test_yyds_config_round_trip_masks_sensitive_values(monkeypatch, tmp_path):
     assert "jwt-value" in saved
 
 
+def test_sub2api_config_round_trip_masks_sensitive_values(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    from web_app import app
+
+    client = TestClient(app)
+    response = client.put(
+        "/api/config",
+        json={
+            "email_provider": "duckmail",
+            "sub2api_base": "https://sub2api.example/api/v1",
+            "sub2api_auth_mode": "x-api-key",
+            "sub2api_admin_token": "admin-secret",
+            "register_count": 1,
+            "register_threads": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["sub2api_admin_token"] == "********"
+
+    saved = tmp_path.joinpath("config.json").read_text(encoding="utf-8")
+    assert "admin-secret" in saved
+
+
+def test_accounts_endpoint_lists_registered_accounts(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
+        "user@example.com----Pass----sso-token\n",
+        encoding="utf-8",
+    )
+    from web_app import app
+
+    client = TestClient(app)
+    response = client.get("/api/accounts")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    assert payload["accounts"][0]["email"] == "user@example.com"
+    assert "sso" not in payload["accounts"][0]
+    assert payload["accounts"][0]["sso_preview"] == "sso-to...-token"
+
+
+def test_import_selected_accounts_to_sub2api(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
+        "user@example.com----Pass----sso-token\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_import(accounts, settings, log_callback=None):
+        calls.append((accounts, settings))
+        return {"imported": True, "total": len(accounts), "response": {"ok": True}}
+
+    monkeypatch.setattr(reg, "import_accounts_to_sub2api", fake_import)
+    from web_app import app
+
+    client = TestClient(app)
+    accounts = client.get("/api/accounts").json()["accounts"]
+    response = client.post(
+        "/api/accounts/import/sub2api",
+        json={
+            "account_ids": [accounts[0]["id"]],
+            "sub2api_base": "https://sub2api.example/api/v1",
+            "sub2api_auth_mode": "bearer",
+            "sub2api_admin_token": "jwt-token",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert calls[0][0][0]["email"] == "user@example.com"
+    assert calls[0][0][0]["sso"] == "sso-token"
+    assert calls[0][1]["sub2api_auth_mode"] == "bearer"
+
+
 def test_start_job_rejects_duplicate_active_job(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))

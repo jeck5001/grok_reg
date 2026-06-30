@@ -265,6 +265,90 @@ def test_yyds_pick_domain_skips_rejected_domains_and_rotates(monkeypatch):
     assert reg.yyds_pick_domain() == "third.example"
 
 
+def test_list_registered_accounts_reads_accounts_files(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
+        "user1@example.com----Pass-1----sso-token-1\n"
+        "bad line\n"
+        "user2@example.com----Pass-2----sso=sso-token-2\n",
+        encoding="utf-8",
+    )
+
+    accounts = reg.list_registered_accounts()
+
+    assert [item["email"] for item in accounts] == ["user1@example.com", "user2@example.com"]
+    assert accounts[0]["password"] == "Pass-1"
+    assert accounts[0]["sso_preview"] == "sso-to...oken-1"
+    assert accounts[0]["sso"] == "sso-token-1"
+    assert accounts[1]["sso"] == "sso-token-2"
+    assert accounts[0]["line_no"] == 1
+    assert accounts[1]["line_no"] == 3
+
+
+def test_import_accounts_to_sub2api_creates_grok_accounts(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"success":true}'
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"success": True, "data": {"created": 2}}
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr(reg, "http_post", fake_post)
+
+    result = reg.import_accounts_to_sub2api(
+        [
+            {"email": "user1@example.com", "sso": "sso-token-1"},
+            {"email": "user2@example.com", "sso": "sso=sso-token-2"},
+        ],
+        {
+            "sub2api_base": "https://sub2api.example/api/v1",
+            "sub2api_auth_mode": "x-api-key",
+            "sub2api_admin_token": "admin-key",
+            "sub2api_account_name": "Grok Auto",
+            "sub2api_group_ids": "1, 2",
+            "sub2api_concurrency": 5,
+            "sub2api_priority": 40,
+        },
+    )
+
+    assert result["imported"] is True
+    assert result["total"] == 2
+    assert calls[0][0] == "https://sub2api.example/api/v1/admin/accounts"
+    assert calls[0][1]["headers"]["x-api-key"] == "admin-key"
+    assert calls[0][1]["json"]["name"] == "Grok Auto - user1@example.com"
+    assert calls[0][1]["json"]["platform"] == "grok"
+    assert calls[0][1]["json"]["type"] == "oauth"
+    assert calls[0][1]["json"]["credentials"]["access_token"] == "sso-token-1"
+    assert calls[0][1]["json"]["credentials"]["source_token_type"] == "xai_sso_cookie"
+    assert calls[0][1]["json"]["group_ids"] == [1, 2]
+    assert calls[0][1]["json"]["concurrency"] == 5
+    assert calls[0][1]["json"]["priority"] == 40
+    assert len(calls) == 2
+
+
+def test_should_log_cloudflare_wait_throttles_repeated_same_length(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(reg.time, "time", lambda: now[0])
+    state = {}
+
+    assert reg.should_log_cloudflare_wait(state, "submit", "0") is True
+    assert reg.should_log_cloudflare_wait(state, "submit", "0") is False
+    now[0] += 4.9
+    assert reg.should_log_cloudflare_wait(state, "submit", "0") is False
+    now[0] += 0.2
+    assert reg.should_log_cloudflare_wait(state, "submit", "0") is True
+    assert reg.should_log_cloudflare_wait(state, "submit", "794") is True
+
+
 def test_profile_submit_script_supports_role_button_and_aria_labels():
     script = reg.build_profile_submit_script("submit")
 

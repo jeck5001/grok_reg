@@ -223,6 +223,18 @@ td.empty {
   text-align: center;
 }
 
+.push-ok {
+  color: var(--accent);
+}
+
+.push-running {
+  color: #79b7ff;
+}
+
+.push-failed {
+  color: var(--danger);
+}
+
 .account-check {
   width: auto;
 }

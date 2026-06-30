@@ -168,7 +168,7 @@
           </div>
           <div class="accounts-actions">
             <button id="refreshAccountsBtn" type="button">刷新账号</button>
-            <button id="importSub2apiBtn" type="button" class="primary">创建 sub2api 账号</button>
+            <button id="importSub2apiBtn" type="button" class="primary">推送到 sub2api</button>
           </div>
         </div>
         <p class="hint">账号来自 data 目录下的 accounts_*.txt。页面只显示 token 摘要。导入 sub2api 时会使用现有 x.ai sso cookie 打开 Grok OAuth 授权页，换取 sub2api 可刷新的 access_token/refresh_token。</p>
@@ -182,6 +182,7 @@
                 <th>来源文件</th>
                 <th>行号</th>
                 <th>密码</th>
+                <th>推送状态</th>
               </tr>
             </thead>
             <tbody id="accountsBody"></tbody>

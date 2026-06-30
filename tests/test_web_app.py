@@ -149,6 +149,8 @@ def test_import_selected_accounts_to_sub2api(monkeypatch, tmp_path):
 
     assert response.status_code == 200
     assert response.json()["total"] == 1
+    assert response.json()["status"] == "pushed"
+    assert "已推送" in response.json()["message"]
     assert calls[0][0][0]["email"] == "user@example.com"
     assert calls[0][0][0]["sso"] == "sso-token"
     assert calls[0][1]["sub2api_auth_mode"] == "bearer"

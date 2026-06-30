@@ -15,6 +15,8 @@ let currentJobId = null;
 let logOffset = 0;
 let pollTimer = null;
 let accounts = [];
+let accountPushStatus = {};
+let pushingToSub2api = false;
 
 function setMessage(text) {
   message.textContent = text || "";
@@ -133,7 +135,7 @@ function renderAccounts() {
   accountsSummary.textContent = `共 ${accounts.length} 个账号`;
   if (!accounts.length) {
     const row = document.createElement("tr");
-    row.innerHTML = '<td colspan="6" class="empty">暂无账号，注册成功后会出现在这里</td>';
+    row.innerHTML = '<td colspan="7" class="empty">暂无账号，注册成功后会出现在这里</td>';
     accountsBody.appendChild(row);
     return;
   }
@@ -152,9 +154,13 @@ function renderAccounts() {
       account.source_file || "",
       account.line_no || "",
       account.password ? "已保存" : "-",
+      accountPushStatus[account.id] || "未推送",
     ]) {
       const cell = document.createElement("td");
       cell.textContent = String(value ?? "");
+      if (value === "已推送") cell.className = "push-ok";
+      if (value === "推送中") cell.className = "push-running";
+      if (String(value).startsWith("失败")) cell.className = "push-failed";
       row.appendChild(cell);
     }
     accountsBody.appendChild(row);
@@ -170,15 +176,38 @@ async function loadAccounts() {
 async function importSelectedToSub2api() {
   const accountIds = selectedAccountIds();
   if (!accountIds.length) {
-    setMessage("请选择要导入的账号");
+    setMessage("请选择要推送的账号");
     return;
   }
-  const payload = { ...formPayload(), account_ids: accountIds };
-  const result = await requestJson("/api/accounts/import/sub2api", {
-    method: "POST",
-    body: JSON.stringify(payload),
+  pushingToSub2api = true;
+  importSub2apiBtn.disabled = true;
+  importSub2apiBtn.textContent = `推送中 ${accountIds.length} 个...`;
+  accountIds.forEach((id) => {
+    accountPushStatus[id] = "推送中";
   });
-  setMessage(`已创建 sub2api 账号：${result.total} 个。${result.warning || ""}`);
+  renderAccounts();
+  setMessage(`开始推送到 sub2api：${accountIds.length} 个账号`);
+  const payload = { ...formPayload(), account_ids: accountIds };
+  try {
+    const result = await requestJson("/api/accounts/import/sub2api", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    accountIds.forEach((id) => {
+      accountPushStatus[id] = "已推送";
+    });
+    setMessage(`${result.message || `已推送到 sub2api：${result.total} 个账号`}。${result.warning || ""}`);
+  } catch (error) {
+    accountIds.forEach((id) => {
+      accountPushStatus[id] = `失败：${error.message}`;
+    });
+    setMessage(`推送 sub2api 失败：${error.message}`);
+  } finally {
+    pushingToSub2api = false;
+    importSub2apiBtn.disabled = false;
+    importSub2apiBtn.textContent = "推送到 sub2api";
+    renderAccounts();
+  }
 }
 
 function startPolling() {

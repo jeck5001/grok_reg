@@ -104,7 +104,13 @@ def import_accounts_to_sub2api(payload: dict):
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"导入 sub2api 失败: {exc}")
-    return {**result, "accounts": [public_account(account) for account in accounts]}
+    total = int(result.get("total") or len(accounts))
+    return {
+        **result,
+        "status": "pushed",
+        "message": f"已推送到 sub2api：{total} 个账号",
+        "accounts": [public_account(account) for account in accounts],
+    }
 
 
 @app.post("/api/jobs/start")

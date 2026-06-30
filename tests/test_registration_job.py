@@ -784,3 +784,18 @@ def test_web_form_exposes_yyds_credentials():
 
     assert 'name="yyds_api_key"' in html
     assert 'name="yyds_jwt"' in html
+
+
+def test_web_console_uses_tabs_and_grouped_configuration():
+    html = Path("templates/index.html").read_text(encoding="utf-8")
+
+    assert 'data-tab-target="register"' in html
+    assert 'data-tab-target="accounts"' in html
+    assert 'data-tab-target="logs"' in html
+    assert 'id="tab-register"' in html
+    assert 'id="tab-accounts"' in html
+    assert 'id="tab-logs"' in html
+    assert 'data-config-section="基础注册"' in html
+    assert 'data-config-section="邮箱服务"' in html
+    assert 'data-config-section="sub2api"' in html
+    assert html.index('id="tab-accounts"') > html.index('</form>')

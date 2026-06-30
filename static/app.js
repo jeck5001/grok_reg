@@ -10,6 +10,8 @@ const refreshAccountsBtn = document.querySelector("#refreshAccountsBtn");
 const importSub2apiBtn = document.querySelector("#importSub2apiBtn");
 const accountsBody = document.querySelector("#accountsBody");
 const accountsSummary = document.querySelector("#accountsSummary");
+const tabButtons = Array.from(document.querySelectorAll("[data-tab-target]"));
+const tabPanels = Array.from(document.querySelectorAll("[data-tab-panel]"));
 
 let currentJobId = null;
 let logOffset = 0;
@@ -20,6 +22,20 @@ let pushingToSub2api = false;
 
 function setMessage(text) {
   message.textContent = text || "";
+}
+
+function activateTab(name) {
+  tabButtons.forEach((button) => {
+    const active = button.dataset.tabTarget === name;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  tabPanels.forEach((panel) => {
+    panel.classList.toggle("active", panel.dataset.tabPanel === name);
+  });
+  if (name === "accounts") {
+    loadAccounts().catch((error) => setMessage(error.message));
+  }
 }
 
 function formPayload() {
@@ -250,6 +266,10 @@ refreshAccountsBtn.addEventListener("click", () => {
 
 importSub2apiBtn.addEventListener("click", () => {
   importSelectedToSub2api().catch((error) => setMessage(error.message));
+});
+
+tabButtons.forEach((button) => {
+  button.addEventListener("click", () => activateTab(button.dataset.tabTarget));
 });
 
 loadConfig().catch((error) => setMessage(error.message));

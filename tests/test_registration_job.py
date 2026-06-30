@@ -220,6 +220,33 @@ def test_registration_job_retries_when_email_domain_is_rejected(monkeypatch, tmp
     assert any("邮箱域名被 x.ai 拒收" in line for line in job.logs())
 
 
+def test_registration_job_stops_queue_when_email_provider_is_unusable(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "restart_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "stop_browser", lambda: None)
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+    monkeypatch.setattr(reg, "open_signup_page", lambda log_callback=None, cancel_callback=None: None)
+
+    attempts = []
+
+    def fake_fill_email(log_callback=None, cancel_callback=None):
+        attempts.append(1)
+        raise reg.EmailProviderUnavailable("DuckMail 可用域名已被 x.ai 拒收: duckmail.sbs")
+
+    monkeypatch.setattr(reg, "fill_email_and_submit", fake_fill_email)
+
+    job = reg.RegistrationJob({"email_provider": "duckmail", "register_count": 6, "register_threads": 1})
+    job.start()
+    status = wait_for_job(job)
+
+    assert status["status"] == "failed"
+    assert status["fail_count"] == 1
+    assert len(attempts) == 1
+    assert job.stop_requested is True
+    assert any("邮箱服务商不可用" in line for line in job.logs())
+
+
 def test_yyds_code_polling_triggers_resend_callback(monkeypatch):
     now = [0.0]
     resend_calls = []

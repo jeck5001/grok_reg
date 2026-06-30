@@ -106,6 +106,10 @@ class EmailDomainRejected(Exception):
         super().__init__(f"邮箱域名被 x.ai 拒收: {self.domain or 'unknown'}")
 
 
+class EmailProviderUnavailable(Exception):
+    pass
+
+
 def load_config():
     global config
     config_file = get_config_file()
@@ -893,6 +897,7 @@ class RegistrationJob:
         self.fail_count = 0
         self.results = []
         self.stop_requested = False
+        self.fatal_error = False
         self.created_at = datetime.datetime.now().isoformat(timespec="seconds")
         self.started_at = None
         self.finished_at = None
@@ -1042,6 +1047,13 @@ class RegistrationJob:
                 except RegistrationCancelled:
                     logf("[!] 注册被用户停止")
                     break
+                except EmailProviderUnavailable as exc:
+                    with self.stats_lock:
+                        self.fail_count += 1
+                    self.fatal_error = True
+                    self.stop_requested = True
+                    logf(f"[!] 邮箱服务商不可用，停止剩余任务: {exc}")
+                    break
                 except Exception as exc:
                     with self.stats_lock:
                         self.fail_count += 1
@@ -1090,7 +1102,9 @@ class RegistrationJob:
                     sleep_with_cancel(start_interval, self.should_stop)
             for worker in workers:
                 worker.join()
-            if self.stop_requested:
+            if self.fatal_error:
+                self.status_value = "failed"
+            elif self.stop_requested:
                 self.status_value = "stopped"
             elif self.fail_count and not self.success_count:
                 self.status_value = "failed"
@@ -1480,7 +1494,7 @@ def pick_domain(api_key=None):
                 if d.get("domain")
             }
         )
-        raise Exception(f"DuckMail 可用域名已被 x.ai 拒收: {', '.join(rejected)}")
+        raise EmailProviderUnavailable(f"DuckMail 可用域名已被 x.ai 拒收: {', '.join(rejected)}")
     private = [d for d in candidates if d.get("ownerId")]
     verified_private = [d for d in private if d.get("isVerified")]
     if verified_private:

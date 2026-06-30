@@ -894,8 +894,11 @@ const ranked = clickables.map((node) => ({ node, score: score(node), text: textO
 const target = ranked.find((item) => item.score >= 100)?.node || buttons[buttons.length - 1];
 if (target) {
   target.scrollIntoView?.({ block: 'center', inline: 'center' });
+  const rect = target.getBoundingClientRect();
+  const centerX = Math.round(rect.left + rect.width / 2);
+  const centerY = Math.round(rect.top + rect.height / 2);
   target.click();
-  return { clicked: true, text: textOf(target), count: clickables.length, isConsentPage };
+  return { clicked: true, text: textOf(target), count: clickables.length, isConsentPage, centerX, centerY };
 }
 const forms = Array.from(document.querySelectorAll('form'));
 if (forms.length) {
@@ -914,7 +917,32 @@ return {
 
 def _click_xai_oauth_consent_if_present(page):
     try:
-        return page.run_js(build_xai_oauth_consent_click_script())
+        result = page.run_js(build_xai_oauth_consent_click_script())
+        if isinstance(result, dict) and result.get("centerX") is not None and result.get("centerY") is not None:
+            x = int(result.get("centerX"))
+            y = int(result.get("centerY"))
+            try:
+                page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
+                page.run_cdp(
+                    "Input.dispatchMouseEvent",
+                    type="mousePressed",
+                    x=x,
+                    y=y,
+                    button="left",
+                    clickCount=1,
+                )
+                page.run_cdp(
+                    "Input.dispatchMouseEvent",
+                    type="mouseReleased",
+                    x=x,
+                    y=y,
+                    button="left",
+                    clickCount=1,
+                )
+                result["nativeClicked"] = True
+            except Exception as exc:
+                result["nativeClickError"] = str(exc)[:160]
+        return result
     except Exception:
         return False
 

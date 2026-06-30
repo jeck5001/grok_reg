@@ -427,7 +427,31 @@ def test_xai_oauth_consent_click_script_has_deep_fallbacks():
     assert "querySelectorAll('*')" in script
     assert "form.submit()" in script
     assert "buttons[buttons.length - 1]" in script
+    assert "centerX" in script
+    assert "centerY" in script
     assert "oauth2/consent" in script
+
+
+def test_click_xai_oauth_consent_uses_cdp_mouse_events():
+    events = []
+
+    class FakePage:
+        def run_js(self, script):
+            return {"clicked": False, "centerX": 123, "centerY": 456}
+
+        def run_cdp(self, method, **kwargs):
+            events.append((method, kwargs))
+
+    result = reg._click_xai_oauth_consent_if_present(FakePage())
+
+    assert result["nativeClicked"] is True
+    assert [item[0] for item in events] == [
+        "Input.dispatchMouseEvent",
+        "Input.dispatchMouseEvent",
+        "Input.dispatchMouseEvent",
+    ]
+    assert events[0][1]["x"] == 123
+    assert events[0][1]["y"] == 456
 
 
 def test_fetch_xai_oauth_refresh_token_sets_sso_cookies_before_authorize(monkeypatch):

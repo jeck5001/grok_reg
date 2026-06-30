@@ -130,6 +130,20 @@ def test_cloudflare_block_page_is_detected():
     assert reg.detect_cloudflare_block_page(html) is True
 
 
+def test_email_form_script_supports_identifier_input_and_continue_button():
+    script = reg.build_email_form_script("fill")
+
+    assert 'input[name="identifier"]' in reg.EMAIL_INPUT_SELECTOR
+    assert 'input[placeholder*="email" i]' in reg.EMAIL_INPUT_SELECTOR
+    assert 'action = "fill"' in script
+
+    submit_script = reg.build_email_form_script("submit")
+
+    assert "continue" in reg.EMAIL_SUBMIT_KEYWORDS
+    assert "next" in reg.EMAIL_SUBMIT_KEYWORDS
+    assert 'action = "submit"' in submit_script
+
+
 def test_docker_runs_visible_chromium_under_xvfb_by_default():
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     compose = Path("docker-compose.yml").read_text(encoding="utf-8")

@@ -525,7 +525,7 @@ def http_post(url, **kwargs):
 
 def raise_if_cancelled(cancel_callback=None):
     if cancel_callback and cancel_callback():
-        raise RegistrationCancelled("鐢ㄦ埛鍋滄娉ㄥ唽")
+        raise RegistrationCancelled("用户停止注册")
 
 
 def sleep_with_cancel(seconds, cancel_callback=None):
@@ -545,6 +545,159 @@ def detect_cloudflare_block_page(page_html):
         or "sorry, you have been blocked" in html
         or "cf-error-code" in html
     )
+
+
+EMAIL_INPUT_SELECTOR = ", ".join(
+    [
+        'input[data-testid="email"]',
+        'input[name="email"]',
+        'input[name="identifier"]',
+        'input[id*="email" i]',
+        'input[id*="identifier" i]',
+        'input[type="email"]',
+        'input[autocomplete="email"]',
+        'input[placeholder*="email" i]',
+        'input[placeholder*="邮箱"]',
+        'input[aria-label*="email" i]',
+        'input[aria-label*="邮箱"]',
+        'input[type="text"]',
+        "input:not([type])",
+    ]
+)
+
+EMAIL_SUBMIT_KEYWORDS = (
+    "注册",
+    "继续",
+    "下一步",
+    "sign up",
+    "signup",
+    "continue",
+    "next",
+    "submit",
+)
+
+
+def build_email_form_script(action):
+    if action not in {"fill", "submit", "diagnose"}:
+        raise ValueError(f"Unsupported email form action: {action}")
+    selector = json.dumps(EMAIL_INPUT_SELECTOR, ensure_ascii=False)
+    keywords = json.dumps(list(EMAIL_SUBMIT_KEYWORDS), ensure_ascii=False)
+    action_json = json.dumps(action)
+    return f"""
+const action = {action_json};
+const email = arguments[0] || '';
+const emailSelector = {selector};
+const submitKeywords = {keywords};
+function isVisible(node) {{
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}}
+function nodeText(node) {{
+    return String(
+        node.innerText ||
+        node.textContent ||
+        node.value ||
+        node.getAttribute('aria-label') ||
+        node.getAttribute('title') ||
+        ''
+    ).replace(/\\s+/g, ' ').trim();
+}}
+function inputScore(node) {{
+    const attrs = [
+        node.getAttribute('data-testid'),
+        node.getAttribute('name'),
+        node.getAttribute('id'),
+        node.getAttribute('type'),
+        node.getAttribute('autocomplete'),
+        node.getAttribute('placeholder'),
+        node.getAttribute('aria-label'),
+    ].join(' ').toLowerCase();
+    if (attrs.includes('email') || attrs.includes('邮箱')) return 100;
+    if (attrs.includes('identifier')) return 95;
+    if (attrs.includes('login') || attrs.includes('account')) return 70;
+    if ((node.getAttribute('type') || '').toLowerCase() === 'text') return 25;
+    return 10;
+}}
+function pickEmailInput() {{
+    const inputs = Array.from(document.querySelectorAll(emailSelector)).filter((node) => {{
+        const type = (node.getAttribute('type') || 'text').toLowerCase();
+        return isVisible(node) && !node.disabled && !node.readOnly && !['hidden', 'password', 'checkbox', 'radio', 'submit', 'button'].includes(type);
+    }});
+    return inputs.sort((a, b) => inputScore(b) - inputScore(a))[0] || null;
+}}
+function setInputValue(input, value) {{
+    input.focus();
+    input.click();
+    const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    const tracker = input._valueTracker;
+    if (tracker) tracker.setValue('');
+    if (valueSetter) valueSetter.call(input, value);
+    else input.value = value;
+    input.dispatchEvent(new Event('focus', {{ bubbles: true }}));
+    input.dispatchEvent(new InputEvent('beforeinput', {{ bubbles: true, data: value, inputType: 'insertText' }}));
+    input.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: value, inputType: 'insertText' }}));
+    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    input.dispatchEvent(new KeyboardEvent('keyup', {{ key: '@', bubbles: true }}));
+    input.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+    return String(input.value || '').trim() === String(value || '').trim();
+}}
+function pickSubmitButton() {{
+    const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]')).filter((node) => {{
+        return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+    }});
+    return buttons.find((node) => {{
+        const text = nodeText(node).toLowerCase().replace(/\\s+/g, '');
+        return submitKeywords.some((keyword) => text.includes(String(keyword).toLowerCase().replace(/\\s+/g, '')));
+    }}) || buttons.find((node) => {{
+        const type = String(node.getAttribute('type') || '').toLowerCase();
+        return type === 'submit';
+    }}) || buttons[0] || null;
+}}
+if (action === 'diagnose') {{
+    const inputs = Array.from(document.querySelectorAll('input')).filter(isVisible).slice(0, 8).map((node) => ({{
+        type: node.getAttribute('type') || '',
+        name: node.getAttribute('name') || '',
+        id: node.getAttribute('id') || '',
+        autocomplete: node.getAttribute('autocomplete') || '',
+        placeholder: node.getAttribute('placeholder') || '',
+        aria: node.getAttribute('aria-label') || '',
+    }}));
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]')).filter(isVisible).slice(0, 8).map(nodeText);
+    return JSON.stringify({{
+        url: location.href,
+        title: document.title,
+        hasEmailInput: !!pickEmailInput(),
+        hasSubmitButton: !!pickSubmitButton(),
+        inputs,
+        buttons,
+    }});
+}}
+const input = pickEmailInput();
+if (!input) return 'not-ready';
+if (action === 'fill') {{
+    if (setInputValue(input, email)) return 'filled';
+    input.value = '';
+    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+    for (const ch of email) {{
+        input.dispatchEvent(new KeyboardEvent('keydown', {{ key: ch, bubbles: true }}));
+        input.value += ch;
+        input.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: ch, inputType: 'insertText' }}));
+        input.dispatchEvent(new KeyboardEvent('keyup', {{ key: ch, bubbles: true }}));
+    }}
+    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    if (String(input.value || '').trim() === email) return 'filled';
+    return input.value || 'empty-after-fill';
+}}
+if (!(input.value || '').trim()) return 'input-empty';
+const submitButton = pickSubmitButton();
+if (!submitButton) return 'no-submit-button';
+submitButton.focus();
+submitButton.click();
+return true;
+"""
 
 
 def _parse_positive_int(value, default, minimum=1, maximum=None):
@@ -1957,59 +2110,23 @@ return !!(givenInput && familyInput && passwordInput);
         return False
 
 
-def fill_email_and_submit(timeout=15, log_callback=None, cancel_callback=None):
+def fill_email_and_submit(timeout=30, log_callback=None, cancel_callback=None):
     page = _get_page()
     raise_if_cancelled(cancel_callback)
     email, dev_token = get_email_and_token()
     if not email or not dev_token:
-        raise Exception("鑾峰彇閭澶辫触")
+        raise Exception("获取邮箱失败")
     if log_callback:
-        log_callback(f"[*] 宸插垱寤洪偖绠? {email}")
+        log_callback(f"[*] 已创建邮箱: {email}")
     deadline = time.time() + timeout
+    last_state = "not-started"
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         filled = page.run_js(
-            """
-const email = arguments[0];
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-const input = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]')).find((node) => isVisible(node) && !node.disabled && !node.readOnly) || null;
-if (!input) return 'not-ready';
-input.focus(); input.click();
-// 清空并设置值
-const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-const tracker = input._valueTracker;
-if (tracker) tracker.setValue('');
-if (valueSetter) valueSetter.call(input, email); else input.value = email;
-// 完整事件序列，确保 React 受控组件同步
-input.dispatchEvent(new Event('focus', { bubbles: true }));
-input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: email, inputType: 'insertText' }));
-input.dispatchEvent(new InputEvent('input', { bubbles: true, data: email, inputType: 'insertText' }));
-input.dispatchEvent(new Event('change', { bubbles: true }));
-input.dispatchEvent(new Event('blur', { bubbles: true }));
-// 验证：值已写入即可（不依赖 checkValidity，部分站点自定义校验会导致误判）
-const current = (input.value || '').trim();
-if (current === email) return 'filled';
-// 兜底：尝试逐字符输入
-input.value = '';
-input.dispatchEvent(new Event('input', { bubbles: true }));
-for (const ch of email) {
-    input.dispatchEvent(new KeyboardEvent('keydown', { key: ch, bubbles: true }));
-    input.value += ch;
-    input.dispatchEvent(new InputEvent('input', { bubbles: true, data: ch, inputType: 'insertText' }));
-    input.dispatchEvent(new KeyboardEvent('keyup', { key: ch, bubbles: true }));
-}
-input.dispatchEvent(new Event('change', { bubbles: true }));
-if ((input.value || '').trim() === email) return 'filled';
-return input.value;
-            """,
+            build_email_form_script("fill"),
             email,
         )
+        last_state = str(filled)
         if filled == "not-ready":
             sleep_with_cancel(0.5, cancel_callback)
             continue
@@ -2020,38 +2137,21 @@ return input.value;
             continue
         sleep_with_cancel(0.8, cancel_callback)
         clicked = page.run_js(
-            r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-const input = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]')).find((node) => isVisible(node) && !node.disabled && !node.readOnly) || null;
-if (!input || !input.checkValidity() || !(input.value || '').trim()) return false;
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true');
-const submitButton = buttons.find((node) => {
-    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
-    const lower = text.toLowerCase();
-    return (
-        text === '注册' ||
-        text.includes('注册') ||
-        lower.includes('sign up') ||
-        lower.includes('continue') ||
-        lower.includes('next')
-    );
-});
-if (!submitButton || submitButton.disabled) return false;
-submitButton.click();
-return true;
-            """
+            build_email_form_script("submit"),
+            email,
         )
-        if clicked:
+        last_state = str(clicked)
+        if clicked is True:
             if log_callback:
                 log_callback(f"[*] 已填写邮箱并点击注册: {email}")
             return email, dev_token
         sleep_with_cancel(0.5, cancel_callback)
+    if log_callback:
+        try:
+            diag = page.run_js(build_email_form_script("diagnose"), email)
+        except Exception as diag_exc:
+            diag = f"诊断失败: {diag_exc}"
+        log_callback(f"[Debug] 邮箱表单诊断: last_state={last_state}; {diag}")
     raise Exception("未找到邮箱输入框或注册按钮")
 
 

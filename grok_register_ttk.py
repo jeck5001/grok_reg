@@ -89,6 +89,7 @@ DEFAULT_CONFIG = {
 
 config = DEFAULT_CONFIG.copy()
 _cf_domain_index = 0
+_yyds_domain_index = 0
 _rejected_email_domains = set()
 _rejected_email_domains_lock = threading.Lock()
 # CloudMail 公开 token 单例（多线程共享，避免并发覆盖）
@@ -1362,15 +1363,28 @@ def yyds_pick_domain(api_key=None, jwt=None):
     domains = yyds_get_domains(api_key=api_key, jwt=jwt)
     if not domains:
         raise Exception("YYDS 没有返回任何可用域名")
-    private = [d for d in domains if d.get("isVerified") and not d.get("isPublic")]
+    candidates = [
+        d for d in domains
+        if not is_email_domain_rejected(d.get("domain"))
+    ]
+    if not candidates:
+        rejected = sorted(
+            {
+                str(d.get("domain") or "").strip().lower()
+                for d in domains
+                if d.get("domain")
+            }
+        )
+        raise EmailProviderUnavailable(f"YYDS 可用域名已被 x.ai 拒收: {', '.join(rejected)}")
+    private = [d for d in candidates if d.get("isVerified") and not d.get("isPublic")]
     if private:
-        return private[0]["domain"]
-    public = [d for d in domains if d.get("isVerified") and d.get("isPublic")]
+        return pick_rotating_domain(private, "_yyds_domain_index")
+    public = [d for d in candidates if d.get("isVerified") and d.get("isPublic")]
     if public:
-        return public[0]["domain"]
-    verified = [d for d in domains if d.get("isVerified")]
+        return pick_rotating_domain(public, "_yyds_domain_index")
+    verified = [d for d in candidates if d.get("isVerified")]
     if verified:
-        return verified[0]["domain"]
+        return pick_rotating_domain(verified, "_yyds_domain_index")
     raise Exception("YYDS 无已验证域名可用")
 
 
@@ -1478,6 +1492,15 @@ def is_email_domain_rejected(domain):
         return normalized in _rejected_email_domains
 
 
+def pick_rotating_domain(candidates, index_name):
+    if not candidates:
+        return None
+    current = int(globals().get(index_name, 0) or 0)
+    domain = candidates[current % len(candidates)].get("domain")
+    globals()[index_name] = current + 1
+    return domain
+
+
 def pick_domain(api_key=None):
     domains = get_domains(api_key=api_key)
     if not domains:
@@ -1498,10 +1521,10 @@ def pick_domain(api_key=None):
     private = [d for d in candidates if d.get("ownerId")]
     verified_private = [d for d in private if d.get("isVerified")]
     if verified_private:
-        return verified_private[0]["domain"]
+        return pick_rotating_domain(verified_private, "_cf_domain_index")
     public = [d for d in candidates if d.get("isVerified")]
     if public:
-        return public[0]["domain"]
+        return pick_rotating_domain(public, "_cf_domain_index")
     raise Exception("DuckMail 无已验证域名可用")
 
 

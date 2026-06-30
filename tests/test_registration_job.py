@@ -247,6 +247,24 @@ def test_registration_job_stops_queue_when_email_provider_is_unusable(monkeypatc
     assert any("邮箱服务商不可用" in line for line in job.logs())
 
 
+def test_yyds_pick_domain_skips_rejected_domains_and_rotates(monkeypatch):
+    reg._rejected_email_domains.clear()
+    reg.remember_rejected_email_domain("first.example")
+    monkeypatch.setattr(
+        reg,
+        "yyds_get_domains",
+        lambda api_key=None, jwt=None: [
+            {"domain": "first.example", "isVerified": True, "isPublic": True},
+            {"domain": "second.example", "isVerified": True, "isPublic": True},
+            {"domain": "third.example", "isVerified": True, "isPublic": True},
+        ],
+    )
+    monkeypatch.setattr(reg, "_yyds_domain_index", 0, raising=False)
+
+    assert reg.yyds_pick_domain() == "second.example"
+    assert reg.yyds_pick_domain() == "third.example"
+
+
 def test_yyds_code_polling_triggers_resend_callback(monkeypatch):
     now = [0.0]
     resend_calls = []

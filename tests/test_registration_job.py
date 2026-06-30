@@ -46,6 +46,7 @@ def test_registration_job_runs_successfully(monkeypatch, tmp_path):
     monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))
     monkeypatch.setattr(reg, "restart_browser", lambda log_callback=None: (object(), object()))
     monkeypatch.setattr(reg, "stop_browser", lambda: None)
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
     monkeypatch.setattr(reg, "open_signup_page", lambda log_callback=None, cancel_callback=None: None)
     monkeypatch.setattr(
         reg,
@@ -157,6 +158,66 @@ def test_wait_for_email_verification_step_waits_until_otp(monkeypatch):
 
     assert reg.wait_for_email_verification_step(FakePage(), "user@example.com", timeout=5) == "otp"
     assert sleeps == [0.8]
+
+
+def test_wait_for_email_verification_step_detects_rejected_domain(monkeypatch):
+    class FakePage:
+        def run_js(self, script, *args):
+            return (
+                '{"step":"email","errorText":"",'
+                '"bodySnippet":"Your email domain duckmail.sbs has been rejected. Please use a different email address."}'
+            )
+
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+
+    with pytest.raises(reg.EmailDomainRejected) as exc:
+        reg.wait_for_email_verification_step(FakePage(), "user@duckmail.sbs", timeout=0.1)
+
+    assert exc.value.domain == "duckmail.sbs"
+
+
+def test_registration_job_retries_when_email_domain_is_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    reg._rejected_email_domains.clear()
+    monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "restart_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "stop_browser", lambda: None)
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+    monkeypatch.setattr(reg, "open_signup_page", lambda log_callback=None, cancel_callback=None: None)
+
+    attempts = []
+
+    def fake_fill_email(log_callback=None, cancel_callback=None):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise reg.EmailDomainRejected("duckmail.sbs")
+        return "user@example.com", "mail-token"
+
+    monkeypatch.setattr(reg, "fill_email_and_submit", fake_fill_email)
+    monkeypatch.setattr(
+        reg,
+        "fill_code_and_submit",
+        lambda email, token, log_callback=None, cancel_callback=None: "123456",
+    )
+    monkeypatch.setattr(
+        reg,
+        "fill_profile_and_submit",
+        lambda log_callback=None, cancel_callback=None: {
+            "given_name": "Ada",
+            "family_name": "Lovelace",
+            "password": "secret",
+        },
+    )
+    monkeypatch.setattr(reg, "wait_for_sso_cookie", lambda log_callback=None, cancel_callback=None: "sso-token")
+    monkeypatch.setattr(reg, "add_token_to_grok2api_pools", lambda raw_token, email="", log_callback=None: None)
+
+    job = reg.RegistrationJob({"email_provider": "duckmail", "register_count": 1, "register_threads": 1})
+    job.start()
+    status = wait_for_job(job)
+
+    assert status["status"] == "completed"
+    assert len(attempts) == 2
+    assert any("邮箱域名被 x.ai 拒收" in line for line in job.logs())
 
 
 def test_yyds_code_polling_triggers_resend_callback(monkeypatch):

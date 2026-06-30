@@ -89,6 +89,8 @@ DEFAULT_CONFIG = {
 
 config = DEFAULT_CONFIG.copy()
 _cf_domain_index = 0
+_rejected_email_domains = set()
+_rejected_email_domains_lock = threading.Lock()
 # CloudMail 公开 token 单例（多线程共享，避免并发覆盖）
 _cloudmail_public_token = None
 _cloudmail_public_token_lock = threading.Lock()
@@ -96,6 +98,12 @@ _cloudmail_public_token_lock = threading.Lock()
 
 class RegistrationCancelled(Exception):
     pass
+
+
+class EmailDomainRejected(Exception):
+    def __init__(self, domain):
+        self.domain = str(domain or "").strip().lower()
+        super().__init__(f"邮箱域名被 x.ai 拒收: {self.domain or 'unknown'}")
 
 
 def load_config():
@@ -776,6 +784,21 @@ return JSON.stringify({
 def wait_for_email_verification_step(
     page, email, timeout=20, log_callback=None, cancel_callback=None
 ):
+    def _raise_if_domain_rejected(state):
+        combined = " ".join(
+            str(state.get(key) or "")
+            for key in ("errorText", "bodySnippet", "raw")
+        )
+        match = re.search(
+            r"email domain\s+([A-Za-z0-9.-]+\.[A-Za-z]{2,})\s+has been rejected",
+            combined,
+            re.IGNORECASE,
+        )
+        if not match and "has been rejected" in combined.lower():
+            match = re.search(r"@([A-Za-z0-9.-]+\.[A-Za-z]{2,})", email or "")
+        if match:
+            raise EmailDomainRejected(match.group(1))
+
     deadline = time.time() + timeout
     last_state = {}
     while time.time() < deadline:
@@ -786,6 +809,7 @@ def wait_for_email_verification_step(
         except Exception:
             state = {"step": "unknown", "raw": str(raw)}
         last_state = state
+        _raise_if_domain_rejected(state)
         if state.get("step") == "otp":
             return "otp"
         error_text = str(state.get("errorText") or "").strip()
@@ -797,6 +821,7 @@ def wait_for_email_verification_step(
             "[Debug] 邮箱提交后页面状态: "
             + json.dumps(last_state, ensure_ascii=False)[:1200]
         )
+    _raise_if_domain_rejected(last_state)
     raise Exception("邮箱已提交，但未进入验证码页面，x.ai 可能未发送验证码")
 
 
@@ -937,9 +962,18 @@ class RegistrationJob:
             logf(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
             open_signup_page(log_callback=logf, cancel_callback=self.should_stop)
             logf("[*] 2. 创建邮箱并提交")
-            email, dev_token = fill_email_and_submit(
-                log_callback=logf, cancel_callback=self.should_stop
-            )
+            try:
+                email, dev_token = fill_email_and_submit(
+                    log_callback=logf, cancel_callback=self.should_stop
+                )
+            except EmailDomainRejected as rejected:
+                remember_rejected_email_domain(rejected.domain)
+                if mail_try < max_mail_retry:
+                    logf(f"[!] 邮箱域名被 x.ai 拒收，自动换邮箱重试: {rejected.domain}")
+                    restart_browser(log_callback=logf)
+                    sleep_with_cancel(1, self.should_stop)
+                    continue
+                raise
             logf(f"[*] 邮箱: {email}")
             try:
                 with open(
@@ -1416,18 +1450,45 @@ def generate_username(length=10):
     return "".join(secrets.choice(chars) for _ in range(length))
 
 
+def remember_rejected_email_domain(domain):
+    normalized = str(domain or "").strip().lower()
+    if not normalized:
+        return
+    with _rejected_email_domains_lock:
+        _rejected_email_domains.add(normalized)
+
+
+def is_email_domain_rejected(domain):
+    normalized = str(domain or "").strip().lower()
+    with _rejected_email_domains_lock:
+        return normalized in _rejected_email_domains
+
+
 def pick_domain(api_key=None):
     domains = get_domains(api_key=api_key)
     if not domains:
-        raise Exception("DuckMail 娌℃湁杩斿洖浠讳綍鍙敤鍩熷悕")
-    private = [d for d in domains if d.get("ownerId")]
+        raise Exception("DuckMail 没有返回任何可用域名")
+    candidates = [
+        d for d in domains
+        if not is_email_domain_rejected(d.get("domain"))
+    ]
+    if not candidates:
+        rejected = sorted(
+            {
+                str(d.get("domain") or "").strip().lower()
+                for d in domains
+                if d.get("domain")
+            }
+        )
+        raise Exception(f"DuckMail 可用域名已被 x.ai 拒收: {', '.join(rejected)}")
+    private = [d for d in candidates if d.get("ownerId")]
     verified_private = [d for d in private if d.get("isVerified")]
     if verified_private:
         return verified_private[0]["domain"]
-    public = [d for d in domains if d.get("isVerified")]
+    public = [d for d in candidates if d.get("isVerified")]
     if public:
         return public[0]["domain"]
-    raise Exception("DuckMail 鏃犲凡楠岃瘉鍩熷悕鍙敤")
+    raise Exception("DuckMail 无已验证域名可用")
 
 
 # ──────────────────────── CloudMail (maillab/cloud-mail) ────────────────────────

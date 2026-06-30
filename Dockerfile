@@ -23,6 +23,7 @@ RUN apt-get update \
         libxrandr2 \
         libgbm1 \
         libu2f-udev \
+        xauth \
         xvfb \
     && rm -rf /var/lib/apt/lists/*
 

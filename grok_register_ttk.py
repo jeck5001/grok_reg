@@ -196,6 +196,10 @@ def should_run_headless():
     return _env_truthy("GROK_REG_HEADLESS")
 
 
+def should_apply_container_chrome_flags():
+    return _env_truthy("GROK_REG_IN_DOCKER") or sys.platform.startswith("linux")
+
+
 def get_duckmail_api_key():
     return config.get("duckmail_api_key", "")
 
@@ -438,12 +442,13 @@ def create_browser_options():
     proxy = normalize_proxy_for_runtime(config.get("proxy", ""))
     if proxy:
         options.set_argument("--proxy-server", proxy)
-    if should_run_headless():
-        options.headless(True)
+    if should_apply_container_chrome_flags():
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
         options.set_argument("--disable-gpu")
         options.set_argument("--window-size", "1365,900")
+    if should_run_headless():
+        options.headless(True)
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
     return options
@@ -1771,6 +1776,13 @@ def start_browser(log_callback=None):
             last_exc = exc
             if log_callback:
                 log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
+                log_callback(
+                    "[Debug] 浏览器启动环境: "
+                    f"DISPLAY={os.environ.get('DISPLAY', '') or '(empty)'}，"
+                    f"CHROME_BIN={os.environ.get('CHROME_BIN', '') or '(empty)'}，"
+                    f"模式={'headless' if should_run_headless() else 'visible'}，"
+                    f"代理={normalize_proxy_for_runtime(config.get('proxy', '')) or '直连'}"
+                )
             try:
                 current = _get_browser()
                 if current is not None:

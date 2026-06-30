@@ -181,6 +181,36 @@ def test_browser_options_apply_configured_proxy(monkeypatch):
     assert ("--proxy-server", "http://host.docker.internal:7890") in options.arguments
 
 
+def test_docker_visible_browser_keeps_linux_startup_flags(monkeypatch):
+    class FakeOptions:
+        def __init__(self):
+            self.arguments = []
+
+        def auto_port(self):
+            return self
+
+        def set_timeouts(self, base=1):
+            return self
+
+        def set_argument(self, key, value=None):
+            self.arguments.append((key, value))
+            return self
+
+        def add_extension(self, path):
+            return self
+
+    monkeypatch.setattr(reg, "ChromiumOptions", FakeOptions)
+    monkeypatch.setenv("GROK_REG_IN_DOCKER", "1")
+    monkeypatch.setenv("GROK_REG_HEADLESS", "0")
+
+    options = reg.create_browser_options()
+
+    assert ("--no-sandbox", None) in options.arguments
+    assert ("--disable-dev-shm-usage", None) in options.arguments
+    assert ("--disable-gpu", None) in options.arguments
+    assert ("--window-size", "1365,900") in options.arguments
+
+
 def test_docker_forces_visible_mode_even_if_legacy_headless_env_is_set(monkeypatch):
     monkeypatch.setenv("GROK_REG_IN_DOCKER", "1")
     monkeypatch.setenv("GROK_REG_HEADLESS", "1")

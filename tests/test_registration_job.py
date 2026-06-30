@@ -265,6 +265,19 @@ def test_yyds_pick_domain_skips_rejected_domains_and_rotates(monkeypatch):
     assert reg.yyds_pick_domain() == "third.example"
 
 
+def test_profile_submit_script_supports_role_button_and_aria_labels():
+    script = reg.build_profile_submit_script("submit")
+
+    assert '[role="button"]' in script
+    assert "aria-label" in script
+    assert "continue" in reg.PROFILE_SUBMIT_KEYWORDS
+    assert "create" in reg.PROFILE_SUBMIT_KEYWORDS
+
+    diagnose_script = reg.build_profile_submit_script("diagnose")
+
+    assert 'action = "diagnose"' in diagnose_script
+
+
 def test_yyds_code_polling_triggers_resend_callback(monkeypatch):
     now = [0.0]
     resend_calls = []

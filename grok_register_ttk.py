@@ -590,6 +590,24 @@ EMAIL_SUBMIT_KEYWORDS = (
 )
 
 
+PROFILE_SUBMIT_KEYWORDS = (
+    "完成注册",
+    "创建账户",
+    "创建账号",
+    "注册",
+    "继续",
+    "下一步",
+    "sign up",
+    "signup",
+    "create account",
+    "createaccount",
+    "create",
+    "continue",
+    "next",
+    "submit",
+)
+
+
 def build_email_form_script(action):
     if action not in {"fill", "submit", "diagnose"}:
         raise ValueError(f"Unsupported email form action: {action}")
@@ -783,6 +801,99 @@ return JSON.stringify({
     })),
     buttons: buttons.slice(0, 6).map(textOf),
 });
+"""
+
+
+def build_profile_submit_script(action):
+    if action not in {"check", "submit", "diagnose"}:
+        raise ValueError(f"Unsupported profile submit action: {action}")
+    keywords = json.dumps(list(PROFILE_SUBMIT_KEYWORDS), ensure_ascii=False)
+    action_json = json.dumps(action)
+    return f"""
+const action = {action_json};
+const submitKeywords = {keywords};
+function isVisible(node) {{
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}}
+function nodeText(node) {{
+    return String(
+        node.innerText ||
+        node.textContent ||
+        node.value ||
+        node.getAttribute('aria-label') ||
+        node.getAttribute('title') ||
+        ''
+    ).replace(/\\s+/g, ' ').trim();
+}}
+function normalizedText(node) {{
+    return nodeText(node).toLowerCase().replace(/\\s+/g, '');
+}}
+function pickSubmitButton() {{
+    const buttons = Array.from(document.querySelectorAll(
+        'button[type="submit"], button, [role="button"], input[type="submit"], a[href]'
+    )).filter((node) => {{
+        return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+    }});
+    return buttons.find((node) => {{
+        const text = normalizedText(node);
+        return submitKeywords.some((keyword) => text.includes(String(keyword).toLowerCase().replace(/\\s+/g, '')));
+    }}) || buttons.find((node) => {{
+        return String(node.getAttribute('type') || '').toLowerCase() === 'submit';
+    }}) || null;
+}}
+function cloudflareState() {{
+    const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+    const cfPresent = !!cfInput
+      || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
+    if (!cfPresent) return 'none';
+    const token = String((cfInput && cfInput.value) || '').trim();
+    if (token.length >= 80) return 'solved';
+    return 'wait-cloudflare:' + token.length;
+}}
+if (action === 'diagnose') {{
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a[href]'))
+        .filter(isVisible)
+        .slice(0, 10)
+        .map((node) => ({{
+            text: nodeText(node),
+            tag: node.tagName,
+            role: node.getAttribute('role') || '',
+            type: node.getAttribute('type') || '',
+            aria: node.getAttribute('aria-label') || '',
+            disabled: !!node.disabled,
+            ariaDisabled: node.getAttribute('aria-disabled') || '',
+        }}));
+    const inputs = Array.from(document.querySelectorAll('input'))
+        .filter(isVisible)
+        .slice(0, 10)
+        .map((node) => ({{
+            type: node.getAttribute('type') || '',
+            name: node.getAttribute('name') || '',
+            autocomplete: node.getAttribute('autocomplete') || '',
+            aria: node.getAttribute('aria-label') || '',
+        }}));
+    return JSON.stringify({{
+        url: location.href,
+        title: document.title,
+        cf: cloudflareState(),
+        hasSubmitButton: !!pickSubmitButton(),
+        buttons,
+        inputs,
+        bodySnippet: nodeText(document.body).slice(0, 300),
+    }});
+}}
+const cf = cloudflareState();
+if (cf.startsWith('wait-cloudflare')) return cf;
+const submitBtn = pickSubmitButton();
+if (!submitBtn) return 'no-submit-button';
+if (action === 'check') return 'ready-to-submit';
+submitBtn.focus();
+submitBtn.click();
+return 'submitted';
 """
 
 
@@ -2683,14 +2794,6 @@ const ok3 = setInputValue(passwordInput, password);
 
 if (!ok1 || !ok2 || !ok3) return 'fill-failed';
 
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
-    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-const submitBtn = buttons.find((node) => {
-    const t = (node.innerText || node.textContent || '').replace(/\\s+/g, '').toLowerCase();
-    return t.includes('完成注册') || t.includes('创建账户') || t.includes('sign up') || t.includes('createaccount');
-});
-
 // 必须等待 Cloudflare 校验通过后再提交
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
 const cfPresent = !!cfInput
@@ -2701,10 +2804,7 @@ if (cfPresent) {
     if (!solvedByToken) return 'wait-cloudflare:' + token.length;
 }
 
-if (submitBtn) {
-    return 'ready-to-submit';
-}
-return 'filled-no-submit';
+return 'profile-filled';
             """,
                 given_name,
                 family_name,
@@ -2749,7 +2849,7 @@ return String(cfInput.value || '').trim().length;
                 sleep_with_cancel(0.8, cancel_callback)
                 continue
 
-            if filled in ("ready-to-submit", "filled-no-submit"):
+            if filled in ("profile-filled", "ready-to-submit", "filled-no-submit"):
                 form_filled_once = True
             elif filled == "fill-failed" and log_callback:
                 log_callback("[Debug] 资料输入失败，重试中...")
@@ -2759,38 +2859,7 @@ return String(cfInput.value || '').trim().length;
                 sleep_with_cancel(0.5, cancel_callback)
                 continue
 
-        submit_state = page.run_js(
-            r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-const cfPresent = !!cfInput
-  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
-if (cfPresent) {
-    const token = String((cfInput && cfInput.value) || '').trim();
-    const solvedByToken = token.length >= 80;
-    if (!solvedByToken) return 'wait-cloudflare:' + token.length;
-}
-
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
-    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-const submitBtn = buttons.find((node) => {
-    const t = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
-    return t.includes('完成注册') || t.includes('创建账户') || t.includes('sign up') || t.includes('createaccount');
-});
-if (!submitBtn) return 'no-submit-button';
-submitBtn.focus();
-submitBtn.click();
-return 'submitted';
-            """
-        )
+        submit_state = page.run_js(build_profile_submit_script("submit"))
 
         if isinstance(submit_state, str) and submit_state.startswith("wait-cloudflare"):
             if log_callback:
@@ -2838,6 +2907,12 @@ return String(cfInput.value || '').trim().length;
 
         sleep_with_cancel(0.5, cancel_callback)
 
+    if log_callback:
+        try:
+            diag = page.run_js(build_profile_submit_script("diagnose"))
+        except Exception as diag_exc:
+            diag = f"诊断失败: {diag_exc}"
+        log_callback(f"[Debug] 最终注册页诊断: {diag}")
     raise Exception("最终注册页资料填写失败")
 
 

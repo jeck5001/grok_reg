@@ -924,12 +924,6 @@ if (target) {
     buttonDiagnostics
   };
 }
-const forms = Array.from(document.querySelectorAll('form'));
-if (forms.length) {
-  const form = forms[forms.length - 1];
-  form.requestSubmit ? form.requestSubmit() : form.submit();
-  return { clicked: false, submitted: true, count: clickables.length, isConsentPage, buttonDiagnostics };
-}
 return {
   clicked: false,
   count: clickables.length,
@@ -977,6 +971,41 @@ def _click_xai_oauth_consent_if_present(page):
         return result
     except Exception:
         return False
+
+
+def save_xai_oauth_debug_snapshot(page, log_callback=None):
+    if not page:
+        return []
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    base = os.path.join(get_data_dir(), f"oauth_debug_{stamp}")
+    saved = []
+    try:
+        html = str(getattr(page, "html", "") or "")
+        html_path = f"{base}.html"
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        saved.append(html_path)
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] OAuth HTML 快照保存失败: {str(exc)[:160]}")
+    png_path = f"{base}.png"
+    screenshot_methods = [
+        lambda: page.get_screenshot(path=png_path),
+        lambda: page.get_screenshot(png_path),
+        lambda: page.save_screenshot(png_path),
+        lambda: page.screenshot(path=png_path),
+    ]
+    for method in screenshot_methods:
+        try:
+            method()
+            if os.path.exists(png_path):
+                saved.append(png_path)
+                break
+        except Exception:
+            continue
+    if log_callback and saved:
+        log_callback(f"[Debug] OAuth 调试快照已保存: {', '.join(saved)}")
+    return saved
 
 
 def set_xai_sso_cookies_for_oauth(page, sso):
@@ -1056,6 +1085,8 @@ def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_cal
     deadline = time.time() + timeout
     last_url = ""
     next_diag_at = 0
+    consent_submitted_at = 0
+    consent_submitted_url = ""
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         current_url = str(getattr(page, "url", "") or "")
@@ -1071,12 +1102,24 @@ def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_cal
             if log_callback:
                 log_callback(f"[*] 已获取 xAI OAuth Refresh Token，长度={len(refresh_token)}")
             return refresh_token
-        click_result = _click_xai_oauth_consent_if_present(page)
+        click_result = {"skipped": "waiting_after_submit"}
+        waiting_after_submit = (
+            consent_submitted_at
+            and "oauth2/consent" in current_url
+            and current_url == consent_submitted_url
+        )
+        if not waiting_after_submit:
+            click_result = _click_xai_oauth_consent_if_present(page)
+            if isinstance(click_result, dict) and (click_result.get("clicked") or click_result.get("submitted")):
+                consent_submitted_at = time.time()
+                consent_submitted_url = current_url
         if log_callback and time.time() >= next_diag_at:
             log_callback(f"[Debug] xAI OAuth consent 点击结果: {click_result}")
             next_diag_at = time.time() + 5
-        sleep_with_cancel(0.8, cancel_callback)
-    raise Exception(f"xAI OAuth 未在 {timeout}s 内返回 code，最后URL: {last_url}")
+        sleep_with_cancel(1.2 if waiting_after_submit else 0.8, cancel_callback)
+    snapshot_paths = save_xai_oauth_debug_snapshot(page, log_callback=log_callback)
+    snapshot_text = f"，调试快照: {', '.join(snapshot_paths)}" if snapshot_paths else ""
+    raise Exception(f"xAI OAuth 未在 {timeout}s 内返回 code，最后URL: {last_url}{snapshot_text}")
 
 
 def raise_if_cancelled(cancel_callback=None):

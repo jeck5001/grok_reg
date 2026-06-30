@@ -457,6 +457,96 @@ def test_click_xai_oauth_consent_uses_cdp_mouse_events():
     assert events[0][1]["y"] == 456
 
 
+def test_fetch_xai_oauth_refresh_token_waits_after_first_consent_submit(monkeypatch):
+    now = [1000.0]
+    clicks = []
+    sleeps = []
+    logs = []
+
+    class FakePage:
+        def __init__(self):
+            self.url = "https://accounts.x.ai/oauth2/consent?state=fixed-state"
+
+        def run_cdp(self, method, **kwargs):
+            return None
+
+        def get(self, url):
+            self.url = "https://accounts.x.ai/oauth2/consent?state=fixed-state"
+
+    class FakeBrowser:
+        def __init__(self):
+            self.page = FakePage()
+
+        def new_tab(self, url):
+            return self.page
+
+    def fake_click(page):
+        clicks.append(now[0])
+        return {"clicked": True, "submitted": True, "text": "allow", "isConsentPage": True}
+
+    def fake_sleep(seconds, cancel_callback=None):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(reg.time, "time", lambda: now[0])
+    monkeypatch.setattr(reg, "_get_browser", lambda: FakeBrowser())
+    monkeypatch.setattr(reg, "_get_page", lambda: FakePage())
+    monkeypatch.setattr(reg, "_set_page", lambda page: None)
+    monkeypatch.setattr(reg, "_click_xai_oauth_consent_if_present", fake_click)
+    monkeypatch.setattr(reg, "sleep_with_cancel", fake_sleep)
+    monkeypatch.setattr(reg, "save_xai_oauth_debug_snapshot", lambda page, log_callback=None: [])
+    monkeypatch.setattr(reg.secrets, "token_hex", lambda size: "fixed-state" if size == 32 else "fixed-nonce")
+    monkeypatch.setattr(reg.secrets, "token_bytes", lambda size: b"a" * size)
+
+    with pytest.raises(Exception, match="未在 3s 内返回 code"):
+        reg.fetch_xai_oauth_refresh_token("sso-token", timeout=3, log_callback=logs.append)
+
+    assert len(clicks) == 1
+    assert any(seconds >= 1.0 for seconds in sleeps)
+
+
+def test_fetch_xai_oauth_refresh_token_saves_debug_snapshot_on_timeout(monkeypatch, tmp_path):
+    now = [1000.0]
+    logs = []
+
+    class FakePage:
+        url = "https://accounts.x.ai/oauth2/consent?state=fixed-state"
+        html = "<html><body>consent stuck</body></html>"
+
+        def run_cdp(self, method, **kwargs):
+            return None
+
+        def get(self, url):
+            self.url = "https://accounts.x.ai/oauth2/consent?state=fixed-state"
+
+    class FakeBrowser:
+        def __init__(self):
+            self.page = FakePage()
+
+        def new_tab(self, url):
+            return self.page
+
+    def fake_sleep(seconds, cancel_callback=None):
+        now[0] += seconds
+
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(reg.time, "time", lambda: now[0])
+    monkeypatch.setattr(reg, "_get_browser", lambda: FakeBrowser())
+    monkeypatch.setattr(reg, "_get_page", lambda: FakePage())
+    monkeypatch.setattr(reg, "_set_page", lambda page: None)
+    monkeypatch.setattr(reg, "_click_xai_oauth_consent_if_present", lambda page: {"clicked": False})
+    monkeypatch.setattr(reg, "sleep_with_cancel", fake_sleep)
+    monkeypatch.setattr(reg.secrets, "token_hex", lambda size: "fixed-state" if size == 32 else "fixed-nonce")
+    monkeypatch.setattr(reg.secrets, "token_bytes", lambda size: b"a" * size)
+
+    with pytest.raises(Exception, match="oauth_debug"):
+        reg.fetch_xai_oauth_refresh_token("sso-token", timeout=1, log_callback=logs.append)
+
+    debug_files = sorted(path.name for path in tmp_path.glob("oauth_debug_*"))
+    assert any(name.endswith(".html") for name in debug_files)
+    assert any("OAuth 调试快照" in line for line in logs)
+
+
 def test_fetch_xai_oauth_refresh_token_sets_sso_cookies_before_authorize(monkeypatch):
     events = []
 

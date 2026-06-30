@@ -74,6 +74,11 @@ def test_registration_job_runs_successfully(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         reg,
+        "fetch_xai_oauth_refresh_token",
+        lambda sso, log_callback=None, cancel_callback=None: "refresh-token",
+    )
+    monkeypatch.setattr(
+        reg,
         "add_token_to_grok2api_pools",
         lambda raw_token, email="", log_callback=None: None,
     )
@@ -86,7 +91,7 @@ def test_registration_job_runs_successfully(monkeypatch, tmp_path):
     assert status["success_count"] == 1
     assert status["fail_count"] == 0
     assert status["output_file"].endswith(".txt")
-    assert "user@example.com----secret----sso-token" in tmp_path.joinpath(status["output_file"]).read_text(
+    assert "user@example.com----secret----sso-token----refresh-token" in tmp_path.joinpath(status["output_file"]).read_text(
         encoding="utf-8"
     )
     assert any("注册成功" in line for line in job.logs())
@@ -209,6 +214,11 @@ def test_registration_job_retries_when_email_domain_is_rejected(monkeypatch, tmp
         },
     )
     monkeypatch.setattr(reg, "wait_for_sso_cookie", lambda log_callback=None, cancel_callback=None: "sso-token")
+    monkeypatch.setattr(
+        reg,
+        "fetch_xai_oauth_refresh_token",
+        lambda sso, log_callback=None, cancel_callback=None: "refresh-token",
+    )
     monkeypatch.setattr(reg, "add_token_to_grok2api_pools", lambda raw_token, email="", log_callback=None: None)
 
     job = reg.RegistrationJob({"email_provider": "duckmail", "register_count": 1, "register_threads": 1})
@@ -377,6 +387,36 @@ def test_import_accounts_to_sub2api_posts_grok_refresh_token(monkeypatch):
     assert calls[1][1]["json"]["concurrency"] == 5
     assert calls[1][1]["json"]["priority"] == 40
     assert "sso-token-1" not in str(calls[1][1]["json"])
+
+
+def test_exchange_xai_oauth_code_for_token_posts_pkce_form(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"access_token": "access-token", "refresh_token": "refresh-token"}
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr(reg, "http_post", fake_post)
+
+    token_data = reg.exchange_xai_oauth_code_for_token("auth-code", "verifier")
+
+    assert token_data["refresh_token"] == "refresh-token"
+    assert calls[0][0] == "https://auth.x.ai/oauth2/token"
+    assert calls[0][1]["data"]["grant_type"] == "authorization_code"
+    assert calls[0][1]["data"]["client_id"] == reg.XAI_GROK_OAUTH_CLIENT_ID
+    assert calls[0][1]["data"]["code"] == "auth-code"
+    assert calls[0][1]["data"]["code_verifier"] == "verifier"
+    assert calls[0][1]["data"]["redirect_uri"] == reg.XAI_GROK_OAUTH_REDIRECT_URI
 
 
 def test_should_log_cloudflare_wait_throttles_repeated_same_length(monkeypatch):

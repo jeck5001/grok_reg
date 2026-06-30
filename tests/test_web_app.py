@@ -224,6 +224,11 @@ def test_job_status_and_logs(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         reg,
+        "fetch_xai_oauth_refresh_token",
+        lambda sso, log_callback=None, cancel_callback=None: "refresh-token",
+    )
+    monkeypatch.setattr(
+        reg,
         "add_token_to_grok2api_pools",
         lambda raw_token, email="", log_callback=None: None,
     )

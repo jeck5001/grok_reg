@@ -20,6 +20,8 @@ import json
 import uuid
 import subprocess
 import hashlib
+import base64
+import urllib.parse
 
 try:
     import tkinter as tk
@@ -96,6 +98,10 @@ DEFAULT_CONFIG = {
 }
 
 XAI_GROK_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+XAI_GROK_OAUTH_AUTHORIZE_URL = "https://auth.x.ai/oauth2/authorize"
+XAI_GROK_OAUTH_TOKEN_URL = "https://auth.x.ai/oauth2/token"
+XAI_GROK_OAUTH_SCOPE = "openid profile email offline_access grok-cli:access api:access"
+XAI_GROK_OAUTH_REDIRECT_URI = "http://127.0.0.1:56121/callback"
 XAI_GROK_API_BASE_URL = "https://api.x.ai/v1"
 
 config = DEFAULT_CONFIG.copy()
@@ -787,6 +793,137 @@ def http_post(url, **kwargs):
         raise
 
 
+def _base64_urlsafe_no_padding(data):
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def build_xai_oauth_authorize_url(state, code_challenge, nonce, redirect_uri=None):
+    params = {
+        "response_type": "code",
+        "client_id": XAI_GROK_OAUTH_CLIENT_ID,
+        "redirect_uri": redirect_uri or XAI_GROK_OAUTH_REDIRECT_URI,
+        "scope": XAI_GROK_OAUTH_SCOPE,
+        "state": state,
+        "nonce": nonce,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "plan": "generic",
+        "referrer": "sub2api",
+    }
+    return f"{XAI_GROK_OAUTH_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
+
+
+def parse_xai_oauth_callback_url(url):
+    parsed = urllib.parse.urlparse(str(url or ""))
+    values = urllib.parse.parse_qs(parsed.query)
+    code = (values.get("code") or [""])[0].strip()
+    state = (values.get("state") or [""])[0].strip()
+    error = (values.get("error") or [""])[0].strip()
+    if not code and parsed.fragment:
+        fragment_values = urllib.parse.parse_qs(parsed.fragment)
+        code = (fragment_values.get("code") or [""])[0].strip()
+        state = state or (fragment_values.get("state") or [""])[0].strip()
+        error = error or (fragment_values.get("error") or [""])[0].strip()
+    return {"code": code, "state": state, "error": error, "url": str(url or "")}
+
+
+def _click_xai_oauth_consent_if_present(page):
+    try:
+        return page.run_js(
+            r"""
+const buttons = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="submit"]'));
+const denyWords = ['cancel', 'deny', 'decline', '拒绝', '取消'];
+const allowWords = ['allow', 'authorize', 'continue', 'approve', '同意', '授权', '继续', '允许'];
+const textOf = (node) => String(node.innerText || node.textContent || node.value || node.getAttribute('aria-label') || '')
+  .replace(/\s+/g, ' ').trim().toLowerCase();
+const target = buttons.find((node) => {
+  const text = textOf(node);
+  return allowWords.some((word) => text.includes(word)) && !denyWords.some((word) => text.includes(word));
+}) || buttons.filter((node) => {
+  const text = textOf(node);
+  return !denyWords.some((word) => text.includes(word));
+}).slice(-1)[0];
+if (target && !target.disabled && target.getAttribute('aria-disabled') !== 'true') {
+  target.click();
+  return true;
+}
+return false;
+            """
+        )
+    except Exception:
+        return False
+
+
+def exchange_xai_oauth_code_for_token(code, code_verifier, redirect_uri=None):
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": XAI_GROK_OAUTH_CLIENT_ID,
+        "code": code,
+        "redirect_uri": redirect_uri or XAI_GROK_OAUTH_REDIRECT_URI,
+        "code_verifier": code_verifier,
+    }
+    resp = http_post(
+        XAI_GROK_OAUTH_TOKEN_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "sub2api-grok-oauth/1.0",
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict) or not str(data.get("refresh_token") or "").strip():
+        raise Exception(f"xAI OAuth token 返回缺少 refresh_token: {str(data)[:300]}")
+    return data
+
+
+def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_callback=None):
+    token = _normalize_sso_token(sso)
+    if not token:
+        raise ValueError("账号缺少 sso cookie，无法获取 Refresh Token")
+    browser = _get_browser()
+    page = _get_page()
+    if browser is None or page is None:
+        browser, page = start_browser(log_callback=log_callback)
+    try:
+        page = browser.new_tab("https://auth.x.ai")
+        _set_page(page)
+    except Exception:
+        page = refresh_active_page()
+
+    code_verifier = _base64_urlsafe_no_padding(secrets.token_bytes(32))
+    challenge = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    code_challenge = _base64_urlsafe_no_padding(challenge)
+    state = secrets.token_hex(32)
+    nonce = secrets.token_hex(16)
+    auth_url = build_xai_oauth_authorize_url(state, code_challenge, nonce)
+    if log_callback:
+        log_callback("[*] 获取 xAI OAuth Refresh Token...")
+    page.get(auth_url)
+
+    deadline = time.time() + timeout
+    last_url = ""
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        current_url = str(getattr(page, "url", "") or "")
+        last_url = current_url or last_url
+        parsed = parse_xai_oauth_callback_url(current_url)
+        if parsed.get("error"):
+            raise Exception(f"xAI OAuth 返回错误: {parsed['error']}")
+        if parsed.get("code"):
+            if parsed.get("state") and parsed.get("state") != state:
+                raise Exception("xAI OAuth state 不匹配")
+            token_data = exchange_xai_oauth_code_for_token(parsed["code"], code_verifier)
+            refresh_token = str(token_data.get("refresh_token") or "").strip()
+            if log_callback:
+                log_callback(f"[*] 已获取 xAI OAuth Refresh Token，长度={len(refresh_token)}")
+            return refresh_token
+        _click_xai_oauth_consent_if_present(page)
+        sleep_with_cancel(0.8, cancel_callback)
+    raise Exception(f"xAI OAuth 未在 {timeout}s 内返回 code，最后URL: {last_url}")
+
+
 def raise_if_cancelled(cancel_callback=None):
     if cancel_callback and cancel_callback():
         raise RegistrationCancelled("用户停止注册")
@@ -1396,10 +1533,16 @@ class RegistrationJob:
         logf(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
         logf("[*] 5. 等待 sso cookie")
         sso = wait_for_sso_cookie(log_callback=logf, cancel_callback=self.should_stop)
+        logf("[*] 6. 获取 Refresh Token")
+        refresh_token = fetch_xai_oauth_refresh_token(
+            sso, log_callback=logf, cancel_callback=self.should_stop
+        )
         with self.stats_lock:
-            self.results.append({"email": email, "sso": sso, "profile": profile})
+            self.results.append(
+                {"email": email, "sso": sso, "refresh_token": refresh_token, "profile": profile}
+            )
             self.success_count += 1
-            line = f"{email}----{profile.get('password','')}----{sso}\n"
+            line = f"{email}----{profile.get('password','')}----{sso}----{refresh_token}\n"
             try:
                 with open(
                     os.path.join(get_data_dir(), self.output_file),

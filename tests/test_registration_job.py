@@ -97,7 +97,6 @@ def test_registration_job_runs_successfully(monkeypatch, tmp_path):
         "add_token_to_grok2api_pools",
         lambda raw_token, email="", log_callback=None: None,
     )
-
     job = reg.RegistrationJob({"email_provider": "duckmail", "register_count": 1, "register_threads": 1})
     job.start()
     status = wait_for_job(job)
@@ -110,6 +109,62 @@ def test_registration_job_runs_successfully(monkeypatch, tmp_path):
         encoding="utf-8"
     )
     assert any("注册成功" in line for line in job.logs())
+
+
+def test_registration_job_enables_nsfw_when_enabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "restart_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "stop_browser", lambda: None)
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+    monkeypatch.setattr(reg, "open_signup_page", lambda log_callback=None, cancel_callback=None: None)
+    monkeypatch.setattr(reg, "fill_email_and_submit", lambda log_callback=None, cancel_callback=None: ("user@example.com", "mail-token"))
+    monkeypatch.setattr(reg, "fill_code_and_submit", lambda email, token, log_callback=None, cancel_callback=None: "123456")
+    monkeypatch.setattr(reg, "fill_profile_and_submit", lambda log_callback=None, cancel_callback=None: {"given_name": "Ada", "family_name": "Lovelace", "password": "secret"})
+    monkeypatch.setattr(reg, "wait_for_sso_cookie", lambda log_callback=None, cancel_callback=None: "sso-token")
+    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda sso, log_callback=None, cancel_callback=None: "refresh-token")
+    monkeypatch.setattr(reg, "add_token_to_grok2api_pools", lambda raw_token, email="", log_callback=None: None)
+    calls = []
+
+    def fake_enable(token, cf_clearance="", log_callback=None):
+        calls.append((token, cf_clearance))
+        return True, "ok"
+
+    monkeypatch.setattr(reg, "enable_nsfw_for_token", fake_enable)
+
+    job = reg.RegistrationJob(
+        {"email_provider": "duckmail", "register_count": 1, "register_threads": 1, "enable_nsfw": True}
+    )
+    job.start()
+    status = wait_for_job(job)
+
+    assert status["status"] == "completed"
+    assert calls == [("sso-token", "")]
+    assert any("NSFW 已开启" in line for line in job.logs())
+
+
+def test_registration_job_skips_nsfw_when_disabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "restart_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "stop_browser", lambda: None)
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+    monkeypatch.setattr(reg, "open_signup_page", lambda log_callback=None, cancel_callback=None: None)
+    monkeypatch.setattr(reg, "fill_email_and_submit", lambda log_callback=None, cancel_callback=None: ("user@example.com", "mail-token"))
+    monkeypatch.setattr(reg, "fill_code_and_submit", lambda email, token, log_callback=None, cancel_callback=None: "123456")
+    monkeypatch.setattr(reg, "fill_profile_and_submit", lambda log_callback=None, cancel_callback=None: {"given_name": "Ada", "family_name": "Lovelace", "password": "secret"})
+    monkeypatch.setattr(reg, "wait_for_sso_cookie", lambda log_callback=None, cancel_callback=None: "sso-token")
+    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda sso, log_callback=None, cancel_callback=None: "refresh-token")
+    monkeypatch.setattr(reg, "add_token_to_grok2api_pools", lambda raw_token, email="", log_callback=None: None)
+    monkeypatch.setattr(reg, "enable_nsfw_for_token", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("NSFW should not run")))
+
+    job = reg.RegistrationJob(
+        {"email_provider": "duckmail", "register_count": 1, "register_threads": 1, "enable_nsfw": False}
+    )
+    job.start()
+    status = wait_for_job(job)
+
+    assert status["status"] == "completed"
 
 
 def test_registration_job_auto_pushes_to_remote_services_when_enabled(monkeypatch, tmp_path):

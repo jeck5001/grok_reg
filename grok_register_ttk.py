@@ -1947,6 +1947,10 @@ def validate_registration_config(settings):
     )
     auth_mode = str(normalized.get("sub2api_auth_mode") or "x-api-key").strip().lower()
     normalized["sub2api_auth_mode"] = "bearer" if auth_mode == "bearer" else "x-api-key"
+    if isinstance(normalized.get("enable_nsfw"), str):
+        normalized["enable_nsfw"] = normalized["enable_nsfw"].strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        normalized["enable_nsfw"] = bool(normalized.get("enable_nsfw"))
     normalized["grok2api_auto_add_remote"] = bool(normalized.get("grok2api_auto_add_remote"))
     normalized["sub2api_auto_import_remote"] = bool(normalized.get("sub2api_auto_import_remote"))
 
@@ -2106,7 +2110,14 @@ class RegistrationJob:
         logf(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
         logf("[*] 5. 等待 sso cookie")
         sso = wait_for_sso_cookie(log_callback=logf, cancel_callback=self.should_stop)
-        logf("[*] 6. 获取 Refresh Token")
+        if self.settings.get("enable_nsfw"):
+            logf("[*] 6. 开启 NSFW")
+            nsfw_ok, nsfw_message = enable_nsfw_for_token(sso, log_callback=logf)
+            if nsfw_ok:
+                logf("[*] NSFW 已开启")
+            else:
+                logf(f"[!] NSFW 开启失败，继续注册流程: {nsfw_message}")
+        logf("[*] 7. 获取 Refresh Token")
         refresh_token = fetch_xai_oauth_refresh_token(
             sso, log_callback=logf, cancel_callback=self.should_stop
         )

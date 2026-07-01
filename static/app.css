@@ -335,6 +335,74 @@ button:disabled {
   padding: 0 16px 12px;
 }
 
+.accounts-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  padding: 0 16px 14px;
+}
+
+label.compact,
+.toolbar-field {
+  display: inline-flex;
+  width: auto;
+  min-height: 42px;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--text);
+  background: rgba(5, 8, 6, 0.48);
+}
+
+label.compact input {
+  width: auto;
+}
+
+.toolbar-field select {
+  width: auto;
+  min-width: 92px;
+  padding: 8px 10px;
+}
+
+.column-menu {
+  position: relative;
+}
+
+.column-menu summary {
+  min-height: 42px;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--text);
+  background: rgba(5, 8, 6, 0.48);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  list-style: none;
+}
+
+.column-menu summary::-webkit-details-marker {
+  display: none;
+}
+
+.column-options {
+  position: absolute;
+  z-index: 5;
+  top: calc(100% + 8px);
+  right: 0;
+  display: grid;
+  min-width: 210px;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel-strong);
+  box-shadow: var(--shadow);
+}
+
 .table-wrap {
   overflow: auto;
 }
@@ -363,17 +431,12 @@ td {
   color: var(--text);
 }
 
-th:nth-child(2),
-td:nth-child(2) {
+.email-column {
   min-width: 220px;
 }
 
-th:nth-child(3),
-td:nth-child(3),
-th:nth-child(4),
-td:nth-child(4),
-th:nth-child(5),
-td:nth-child(5) {
+.token-column,
+.source-column {
   min-width: 150px;
 }
 
@@ -396,6 +459,29 @@ td.empty {
 
 .account-check {
   width: auto;
+}
+
+.pagination {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 12px 16px 16px;
+  border-top: 1px solid rgba(196, 255, 215, 0.1);
+}
+
+.pagination-summary,
+.page-current {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.page-button {
+  padding: 9px 12px;
+  color: var(--text);
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .logs {
@@ -491,7 +577,24 @@ td.empty {
   }
 
   .accounts-head,
-  .accounts-actions {
+  .accounts-actions,
+  .pagination {
     display: grid;
+    justify-content: stretch;
+  }
+
+  .accounts-toolbar {
+    align-items: stretch;
+  }
+
+  label.compact,
+  .toolbar-field,
+  .column-menu {
+    width: 100%;
+  }
+
+  .column-options {
+    position: static;
+    margin-top: 8px;
   }
 }

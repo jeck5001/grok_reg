@@ -1150,8 +1150,8 @@ def test_web_console_exposes_grok2api_push_action():
     js = Path("static/app.js").read_text(encoding="utf-8")
 
     assert 'id="importGrok2apiBtn"' in html
-    assert "<th>grok2api</th>" in html
-    assert "<th>sub2api</th>" in html
+    assert 'label: "grok2api"' in js
+    assert 'label: "sub2api"' in js
     assert "/api/accounts/import/grok2api" in js
     assert "accountGrok2apiPushStatus" in js
     assert "可推送到 grok2api" in js
@@ -1165,6 +1165,23 @@ def test_web_console_exposes_auto_push_switches():
     assert 'name="sub2api_auto_import_remote"' in html
     assert "data.grok2api_auto_add_remote" in js
     assert "data.sub2api_auto_import_remote" in js
+
+
+def test_web_console_exposes_account_table_controls():
+    html = Path("templates/index.html").read_text(encoding="utf-8")
+    js = Path("static/app.js").read_text(encoding="utf-8")
+
+    assert 'id="selectPageAccounts"' in html
+    assert 'id="accountPageSize"' in html
+    assert 'id="accountColumnsPanel"' in html
+    assert 'id="accountPagination"' in html
+    assert 'id="accountsHead"' in html
+    assert 'data-column-toggle' in js
+    assert "localStorage" in js
+    assert "grok-reg.accounts.table" in js
+    assert "ACCOUNT_COLUMNS" in js
+    assert "selectedAccountIdsSet" in js
+    assert "renderPagination" in js
 
 
 def test_web_console_uses_roomier_operational_layout():

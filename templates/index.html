@@ -238,24 +238,32 @@
               </div>
             </div>
             <p class="hint">账号来自 data 目录下的 accounts_*.txt。grok2api 推送使用 SSO Token；sub2api 推送使用第四段 Refresh Token，格式为 email----password----sso----refresh_token。</p>
+            <div class="accounts-toolbar">
+              <label class="check compact">
+                <input id="selectPageAccounts" type="checkbox" />
+                当页全选
+              </label>
+              <label class="toolbar-field">
+                每页
+                <select id="accountPageSize">
+                  <option value="10">10 条</option>
+                  <option value="20">20 条</option>
+                  <option value="50">50 条</option>
+                  <option value="100">100 条</option>
+                </select>
+              </label>
+              <details id="accountColumnsPanel" class="column-menu">
+                <summary>列显示</summary>
+                <div id="accountColumnOptions" class="column-options"></div>
+              </details>
+            </div>
             <div class="table-wrap">
               <table>
-                <thead>
-                  <tr>
-                    <th>选择</th>
-                    <th>邮箱</th>
-                    <th>SSO 摘要</th>
-                    <th>Refresh Token</th>
-                    <th>来源文件</th>
-                    <th>行号</th>
-                    <th>密码</th>
-                    <th>grok2api</th>
-                    <th>sub2api</th>
-                  </tr>
-                </thead>
+                <thead id="accountsHead"></thead>
                 <tbody id="accountsBody"></tbody>
               </table>
             </div>
+            <div id="accountPagination" class="pagination" aria-label="账号分页"></div>
           </section>
 
           <section id="tab-logs" class="tab-panel logs" data-tab-panel="logs">

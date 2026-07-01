@@ -9,15 +9,40 @@ const stopBtn = document.querySelector("#stopBtn");
 const refreshAccountsBtn = document.querySelector("#refreshAccountsBtn");
 const importGrok2apiBtn = document.querySelector("#importGrok2apiBtn");
 const importSub2apiBtn = document.querySelector("#importSub2apiBtn");
+const selectPageAccounts = document.querySelector("#selectPageAccounts");
+const accountPageSize = document.querySelector("#accountPageSize");
+const accountColumnOptions = document.querySelector("#accountColumnOptions");
+const accountPagination = document.querySelector("#accountPagination");
+const accountsHead = document.querySelector("#accountsHead");
 const accountsBody = document.querySelector("#accountsBody");
 const accountsSummary = document.querySelector("#accountsSummary");
 const tabButtons = Array.from(document.querySelectorAll("[data-tab-target]"));
 const tabPanels = Array.from(document.querySelectorAll("[data-tab-panel]"));
 
+const ACCOUNT_TABLE_PREFS_KEY = "grok-reg.accounts.table";
+const ACCOUNT_COLUMNS = [
+  { key: "select", label: "选择", locked: true },
+  { key: "email", label: "邮箱", className: "email-column" },
+  { key: "sso", label: "SSO 摘要", className: "token-column" },
+  { key: "refresh", label: "Refresh Token", className: "token-column" },
+  { key: "source", label: "来源文件", className: "source-column" },
+  { key: "line", label: "行号" },
+  { key: "password", label: "密码" },
+  { key: "grok2api", label: "grok2api" },
+  { key: "sub2api", label: "sub2api" },
+];
+const DEFAULT_ACCOUNT_TABLE_PREFS = {
+  visibleColumns: ACCOUNT_COLUMNS.map((column) => column.key),
+  pageSize: 20,
+};
+
 let currentJobId = null;
 let logOffset = 0;
 let pollTimer = null;
 let accounts = [];
+let accountPage = 1;
+let accountTablePrefs = loadAccountTablePrefs();
+let selectedAccountIdsSet = new Set();
 let accountPushStatus = {};
 let accountGrok2apiPushStatus = {};
 let pushingToSub2api = false;
@@ -146,57 +171,199 @@ async function pollJob() {
   }
 }
 
+function loadAccountTablePrefs() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(ACCOUNT_TABLE_PREFS_KEY) || "{}");
+    const allowedColumns = new Set(ACCOUNT_COLUMNS.map((column) => column.key));
+    const visibleColumns = Array.isArray(saved.visibleColumns)
+      ? saved.visibleColumns.filter((key) => allowedColumns.has(key))
+      : DEFAULT_ACCOUNT_TABLE_PREFS.visibleColumns;
+    const pageSize = [10, 20, 50, 100].includes(Number(saved.pageSize))
+      ? Number(saved.pageSize)
+      : DEFAULT_ACCOUNT_TABLE_PREFS.pageSize;
+    return {
+      visibleColumns: visibleColumns.includes("select") ? visibleColumns : ["select", ...visibleColumns],
+      pageSize,
+    };
+  } catch (error) {
+    return { ...DEFAULT_ACCOUNT_TABLE_PREFS };
+  }
+}
+
+function saveAccountTablePrefs() {
+  localStorage.setItem(ACCOUNT_TABLE_PREFS_KEY, JSON.stringify(accountTablePrefs));
+}
+
+function visibleAccountColumns() {
+  const visible = new Set(accountTablePrefs.visibleColumns);
+  return ACCOUNT_COLUMNS.filter((column) => column.locked || visible.has(column.key));
+}
+
+function accountTotalPages() {
+  return Math.max(1, Math.ceil(accounts.length / accountTablePrefs.pageSize));
+}
+
+function currentPageAccounts() {
+  const start = (accountPage - 1) * accountTablePrefs.pageSize;
+  return accounts.slice(start, start + accountTablePrefs.pageSize);
+}
+
+function clampAccountPage() {
+  accountPage = Math.min(Math.max(1, accountPage), accountTotalPages());
+}
+
 function selectedAccountIds() {
-  return Array.from(document.querySelectorAll(".account-check:checked")).map((input) => input.value);
+  return Array.from(selectedAccountIdsSet).filter((id) => accounts.some((account) => account.id === id));
+}
+
+function renderAccountColumns() {
+  if (!accountColumnOptions) return;
+  accountColumnOptions.innerHTML = "";
+  for (const column of ACCOUNT_COLUMNS.filter((item) => !item.locked)) {
+    const label = document.createElement("label");
+    label.className = "check compact";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.setAttribute("data-column-toggle", column.key);
+    checkbox.checked = accountTablePrefs.visibleColumns.includes(column.key);
+    label.appendChild(checkbox);
+    label.append(document.createTextNode(column.label));
+    accountColumnOptions.appendChild(label);
+  }
+}
+
+function renderAccountsHead() {
+  if (!accountsHead) return;
+  const row = document.createElement("tr");
+  for (const column of visibleAccountColumns()) {
+    const cell = document.createElement("th");
+    cell.textContent = column.label;
+    if (column.className) cell.className = column.className;
+    row.appendChild(cell);
+  }
+  accountsHead.innerHTML = "";
+  accountsHead.appendChild(row);
+}
+
+function accountCellValue(account, key) {
+  const refreshStatus = account.has_refresh_token
+    ? `已保存 ${account.refresh_token_preview || ""}`.trim()
+    : "缺少";
+  const persistedGrok2apiStatus = account.grok2api_status_text || (account.grok2api_status === "pushed" ? "已推送" : "未推送");
+  const grok2apiStatus = accountGrok2apiPushStatus[account.id] || persistedGrok2apiStatus;
+  const persistedSub2apiStatus = account.sub2api_status_text || (account.sub2api_status === "pushed" ? "已推送" : "未推送");
+  const sub2apiStatus = accountPushStatus[account.id] || persistedSub2apiStatus;
+  const values = {
+    email: account.email,
+    sso: account.sso_preview || "",
+    refresh: refreshStatus,
+    source: account.source_file || "",
+    line: account.line_no || "",
+    password: account.password ? "已保存" : "-",
+    grok2api: grok2apiStatus,
+    sub2api: sub2apiStatus,
+  };
+  return values[key] ?? "";
+}
+
+function syncSelectPageAccounts() {
+  if (!selectPageAccounts) return;
+  const pageAccounts = currentPageAccounts();
+  const selectedCount = pageAccounts.filter((account) => selectedAccountIdsSet.has(account.id)).length;
+  selectPageAccounts.checked = pageAccounts.length > 0 && selectedCount === pageAccounts.length;
+  selectPageAccounts.indeterminate = selectedCount > 0 && selectedCount < pageAccounts.length;
+  selectPageAccounts.disabled = pageAccounts.length === 0;
+}
+
+function renderPagination() {
+  if (!accountPagination) return;
+  accountPagination.innerHTML = "";
+  const totalPages = accountTotalPages();
+  const start = accounts.length ? (accountPage - 1) * accountTablePrefs.pageSize + 1 : 0;
+  const end = Math.min(accounts.length, accountPage * accountTablePrefs.pageSize);
+  const summary = document.createElement("span");
+  summary.className = "pagination-summary";
+  summary.textContent = `${start}-${end} / ${accounts.length}`;
+  accountPagination.appendChild(summary);
+
+  const prevButton = document.createElement("button");
+  prevButton.type = "button";
+  prevButton.className = "page-button";
+  prevButton.textContent = "上一页";
+  prevButton.disabled = accountPage <= 1;
+  prevButton.addEventListener("click", () => {
+    accountPage -= 1;
+    renderAccounts();
+  });
+  accountPagination.appendChild(prevButton);
+
+  const pageText = document.createElement("span");
+  pageText.className = "page-current";
+  pageText.textContent = `${accountPage} / ${totalPages}`;
+  accountPagination.appendChild(pageText);
+
+  const nextButton = document.createElement("button");
+  nextButton.type = "button";
+  nextButton.className = "page-button";
+  nextButton.textContent = "下一页";
+  nextButton.disabled = accountPage >= totalPages;
+  nextButton.addEventListener("click", () => {
+    accountPage += 1;
+    renderAccounts();
+  });
+  accountPagination.appendChild(nextButton);
 }
 
 function renderAccounts() {
   if (!accountsBody) return;
+  selectedAccountIdsSet = new Set(selectedAccountIds());
+  clampAccountPage();
+  renderAccountsHead();
+  renderAccountColumns();
   accountsBody.innerHTML = "";
-  accountsSummary.textContent = `共 ${accounts.length} 个账号`;
+  accountsSummary.textContent = `共 ${accounts.length} 个账号，已选择 ${selectedAccountIdsSet.size} 个`;
+  if (accountPageSize) accountPageSize.value = String(accountTablePrefs.pageSize);
   if (!accounts.length) {
     const row = document.createElement("tr");
-    row.innerHTML = '<td colspan="9" class="empty">暂无账号，注册成功后会出现在这里</td>';
+    row.innerHTML = `<td colspan="${visibleAccountColumns().length}" class="empty">暂无账号，注册成功后会出现在这里</td>`;
     accountsBody.appendChild(row);
+    syncSelectPageAccounts();
+    renderPagination();
     return;
   }
-  for (const account of accounts) {
+  for (const account of currentPageAccounts()) {
     const row = document.createElement("tr");
-    const checkCell = document.createElement("td");
-    const checkbox = document.createElement("input");
-    checkbox.className = "account-check";
-    checkbox.type = "checkbox";
-    checkbox.value = account.id;
-    checkbox.disabled = false;
-    checkbox.title = account.has_refresh_token ? "" : "可推送到 grok2api；缺少 Refresh Token 时不能推送到 sub2api";
-    checkCell.appendChild(checkbox);
-    row.appendChild(checkCell);
-    const refreshStatus = account.has_refresh_token
-      ? `已保存 ${account.refresh_token_preview || ""}`.trim()
-      : "缺少";
-    const persistedGrok2apiStatus = account.grok2api_status_text || (account.grok2api_status === "pushed" ? "已推送" : "未推送");
-    const grok2apiStatus = accountGrok2apiPushStatus[account.id] || persistedGrok2apiStatus;
-    const persistedSub2apiStatus = account.sub2api_status_text || (account.sub2api_status === "pushed" ? "已推送" : "未推送");
-    const sub2apiStatus = accountPushStatus[account.id] || persistedSub2apiStatus;
-    for (const value of [
-      account.email,
-      account.sso_preview || "",
-      refreshStatus,
-      account.source_file || "",
-      account.line_no || "",
-      account.password ? "已保存" : "-",
-      grok2apiStatus,
-      sub2apiStatus,
-    ]) {
+    for (const column of visibleAccountColumns()) {
       const cell = document.createElement("td");
+      if (column.key === "select") {
+        const checkbox = document.createElement("input");
+        checkbox.className = "account-check";
+        checkbox.type = "checkbox";
+        checkbox.value = account.id;
+        checkbox.checked = selectedAccountIdsSet.has(account.id);
+        checkbox.title = account.has_refresh_token ? "" : "可推送到 grok2api；缺少 Refresh Token 时不能推送到 sub2api";
+        checkbox.addEventListener("change", () => {
+          if (checkbox.checked) selectedAccountIdsSet.add(account.id);
+          else selectedAccountIdsSet.delete(account.id);
+          accountsSummary.textContent = `共 ${accounts.length} 个账号，已选择 ${selectedAccountIdsSet.size} 个`;
+          syncSelectPageAccounts();
+        });
+        cell.appendChild(checkbox);
+        row.appendChild(cell);
+        continue;
+      }
+      const value = accountCellValue(account, column.key);
       cell.textContent = String(value ?? "");
-      if (value === "已推送") cell.className = "push-ok";
-      if (value === "推送中") cell.className = "push-running";
-      if (String(value).startsWith("失败")) cell.className = "push-failed";
+      if (column.className) cell.classList.add(column.className);
+      if (value === "已推送") cell.classList.add("push-ok");
+      if (value === "推送中") cell.classList.add("push-running");
+      if (String(value).startsWith("失败")) cell.classList.add("push-failed");
       row.appendChild(cell);
     }
     accountsBody.appendChild(row);
   }
+  syncSelectPageAccounts();
+  renderPagination();
 }
 
 async function loadAccounts() {
@@ -322,6 +489,35 @@ stopBtn.addEventListener("click", () => {
 
 refreshAccountsBtn.addEventListener("click", () => {
   loadAccounts().catch((error) => setMessage(error.message));
+});
+
+selectPageAccounts.addEventListener("change", () => {
+  for (const account of currentPageAccounts()) {
+    if (selectPageAccounts.checked) selectedAccountIdsSet.add(account.id);
+    else selectedAccountIdsSet.delete(account.id);
+  }
+  renderAccounts();
+});
+
+accountPageSize.addEventListener("change", () => {
+  accountTablePrefs.pageSize = Number(accountPageSize.value) || DEFAULT_ACCOUNT_TABLE_PREFS.pageSize;
+  accountPage = 1;
+  saveAccountTablePrefs();
+  renderAccounts();
+});
+
+accountColumnOptions.addEventListener("change", (event) => {
+  const checkbox = event.target.closest("[data-column-toggle]");
+  if (!checkbox) return;
+  const visible = new Set(accountTablePrefs.visibleColumns);
+  if (checkbox.checked) visible.add(checkbox.dataset.columnToggle);
+  else visible.delete(checkbox.dataset.columnToggle);
+  visible.add("select");
+  accountTablePrefs.visibleColumns = ACCOUNT_COLUMNS
+    .map((column) => column.key)
+    .filter((key) => visible.has(key));
+  saveAccountTablePrefs();
+  renderAccounts();
 });
 
 importSub2apiBtn.addEventListener("click", () => {

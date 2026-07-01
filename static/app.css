@@ -89,33 +89,50 @@ h2 {
   color: var(--muted);
 }
 
-.tabs {
-  display: flex;
-  gap: 10px;
+.app-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 18px;
   margin: 22px 0;
-  border-bottom: 1px solid var(--line);
+  align-items: start;
+}
+
+.side-nav {
+  position: sticky;
+  top: 18px;
+  display: grid;
+  gap: 8px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  backdrop-filter: blur(18px);
 }
 
 .tab-button {
   position: relative;
+  width: 100%;
   color: var(--muted);
   background: transparent;
-  border: 0;
-  padding: 14px 18px 16px;
+  border: 1px solid transparent;
+  padding: 13px 14px;
+  text-align: left;
 }
 
 .tab-button::after {
   position: absolute;
-  right: 16px;
-  bottom: -1px;
-  left: 16px;
-  height: 2px;
+  top: 11px;
+  bottom: 11px;
+  left: 0;
+  width: 2px;
+  height: auto;
   content: "";
   background: transparent;
 }
 
 .tab-button.active {
   color: var(--text);
+  border-color: var(--line);
+  background: rgba(184, 255, 92, 0.08);
 }
 
 .tab-button.active::after {
@@ -352,6 +369,10 @@ td.empty {
 }
 
 @media (max-width: 1100px) {
+  .app-layout {
+    grid-template-columns: 180px minmax(0, 1fr);
+  }
+
   .register-layout,
   .config-section {
     grid-template-columns: 1fr;
@@ -373,7 +394,35 @@ td.empty {
     align-items: start;
   }
 
-  .tabs {
+  .app-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .side-nav {
+    position: static;
+    display: flex;
+    overflow-x: auto;
+  }
+
+  .side-nav .section-kicker {
+    display: none;
+  }
+
+  .side-nav .tab-button {
+    width: auto;
+    min-width: max-content;
+  }
+
+  .side-nav .tab-button::after {
+    top: auto;
+    right: 14px;
+    bottom: 0;
+    left: 14px;
+    width: auto;
+    height: 2px;
+  }
+
+  .main-panel {
     overflow-x: auto;
   }
 

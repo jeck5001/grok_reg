@@ -921,3 +921,16 @@ def test_web_console_uses_tabs_and_grouped_configuration():
     assert 'data-config-section="邮箱服务"' in html
     assert 'data-config-section="sub2api"' in html
     assert html.index('id="tab-accounts"') > html.index('</form>')
+
+
+def test_web_console_places_menu_on_left_side():
+    html = Path("templates/index.html").read_text(encoding="utf-8")
+    css = Path("static/app.css").read_text(encoding="utf-8")
+
+    assert 'class="app-layout"' in html
+    assert 'class="side-nav"' in html
+    assert 'class="main-panel"' in html
+    assert html.index('class="side-nav"') < html.index('class="main-panel"')
+    assert ".app-layout" in css
+    assert "grid-template-columns: 220px minmax(0, 1fr)" in css
+    assert ".side-nav" in css

@@ -439,6 +439,97 @@ def test_import_accounts_to_sub2api_returns_per_account_failure(monkeypatch):
     assert "HTTP 502" in result["items"][0]["error"]
 
 
+def test_replace_registered_account_refresh_token_updates_source_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    account_file = tmp_path.joinpath("accounts_20260630_140000_job.txt")
+    account_file.write_text(
+        "user1@example.com----Pass-1----sso-token-1----old-refresh-token\n"
+        "user2@example.com----Pass-2----sso-token-2----refresh-token-2\n",
+        encoding="utf-8",
+    )
+    account = reg.list_registered_accounts()[0]
+
+    assert reg.replace_registered_account_refresh_token(account, "new-refresh-token") is True
+
+    assert account_file.read_text(encoding="utf-8").splitlines()[0] == (
+        "user1@example.com----Pass-1----sso-token-1----new-refresh-token"
+    )
+
+
+def test_import_accounts_to_sub2api_reauths_when_refresh_token_revoked(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
+        "user@example.com----Pass----sso-token----old-refresh-token\n",
+        encoding="utf-8",
+    )
+    account = reg.list_registered_accounts()[0]
+    calls = []
+
+    class FakeHTTPError(Exception):
+        def __init__(self):
+            super().__init__("HTTP Error 502: Bad Gateway")
+            self.response = type(
+                "Response",
+                (),
+                {
+                    "status_code": 502,
+                    "text": '{"error":"invalid_grant","error_description":"Refresh token has been revoked"}',
+                },
+            )()
+
+    class FakeResponse:
+        def __init__(self, payload=None, fail=False):
+            self.payload = payload or {}
+            self.fail = fail
+            self.status_code = 200
+            self.text = "{}"
+
+        def raise_for_status(self):
+            if self.fail:
+                raise FakeHTTPError()
+
+        def json(self):
+            return self.payload
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs["json"].get("refresh_token"), kwargs))
+        if url.endswith("/admin/grok/oauth/refresh-token"):
+            if kwargs["json"]["refresh_token"] == "old-refresh-token":
+                return FakeResponse(fail=True)
+            return FakeResponse(
+                {
+                    "code": 0,
+                    "data": {
+                        "access_token": "access-token",
+                        "refresh_token": "rotated-refresh-token",
+                    },
+                }
+            )
+        if url.endswith("/admin/accounts"):
+            return FakeResponse({"code": 0, "data": {"id": 101}})
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr(reg, "http_post", fake_post)
+    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda sso, log_callback=None, cancel_callback=None: "new-refresh-token")
+
+    result = reg.import_accounts_to_sub2api(
+        [account],
+        {
+            "sub2api_base": "https://sub2api.example/api/v1",
+            "sub2api_admin_token": "admin-key",
+        },
+    )
+
+    assert result["imported"] is True
+    assert result["failed"] == 0
+    assert [call[1] for call in calls if call[0].endswith("/admin/grok/oauth/refresh-token")] == [
+        "old-refresh-token",
+        "new-refresh-token",
+    ]
+    refreshed = reg.list_registered_accounts()[0]
+    assert refreshed["refresh_token"] == "rotated-refresh-token"
+
+
 def test_exchange_xai_oauth_code_for_token_posts_pkce_form(monkeypatch):
     calls = []
 

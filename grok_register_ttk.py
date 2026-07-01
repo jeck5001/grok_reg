@@ -461,6 +461,11 @@ def _sub2api_error_text(exc, step=""):
     return message[:1000]
 
 
+def is_refresh_token_revoked_error(error_text):
+    text = str(error_text or "").lower()
+    return "invalid_grant" in text or "revoked" in text or "refresh token has been revoked" in text
+
+
 def attach_account_status(account, statuses=None):
     if not isinstance(account, dict):
         return account
@@ -502,6 +507,37 @@ def list_registered_accounts(include_sso=True):
         except Exception:
             continue
     return accounts
+
+
+def replace_registered_account_refresh_token(account, refresh_token):
+    refresh_token = str(refresh_token or "").strip()
+    source = str((account or {}).get("source_file") or "").strip()
+    line_no = int((account or {}).get("line_no") or 0)
+    if not refresh_token or not source or line_no <= 0:
+        return False
+    path = os.path.join(get_data_dir(), source)
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if line_no > len(lines):
+            return False
+        parts = lines[line_no - 1].rstrip("\n").split("----", 3)
+        if len(parts) < 3:
+            return False
+        newline = "\n" if lines[line_no - 1].endswith("\n") else ""
+        lines[line_no - 1] = f"{parts[0]}----{parts[1]}----{parts[2]}----{refresh_token}{newline}"
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        os.replace(tmp_path, path)
+        account["refresh_token"] = refresh_token
+        account["refresh_token_preview"] = _mask_token(refresh_token)
+        account["has_refresh_token"] = True
+        return True
+    except Exception:
+        return False
 
 
 def persist_sub2api_push_status(accounts, result):
@@ -664,6 +700,32 @@ def build_sub2api_grok_refresh_token_payload(account, token_info=None, settings=
     return payload
 
 
+def _push_one_account_to_sub2api(account, settings, base, headers, index):
+    token_info = _sub2api_response_data(
+        http_post(
+            f"{base}/admin/grok/oauth/refresh-token",
+            headers=headers,
+            json=build_sub2api_grok_refresh_token_check_payload(account, settings),
+            timeout=60,
+            proxies={},
+        )
+    )
+    token_refresh = str((token_info or {}).get("refresh_token") or "").strip()
+    if token_refresh and token_refresh != str(account.get("refresh_token") or "").strip():
+        replace_registered_account_refresh_token(account, token_refresh)
+    payload = build_sub2api_grok_refresh_token_payload(account, token_info, settings, index=index)
+    created = _sub2api_response_data(
+        http_post(
+            f"{base}/admin/accounts",
+            headers=headers,
+            json=payload,
+            timeout=60,
+            proxies={},
+        )
+    )
+    return {"email": account.get("email", ""), "status": "pushed", "response": created}
+
+
 def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
     settings = {**config, **dict(settings or {})}
     base = _sub2api_api_base(settings)
@@ -685,34 +747,28 @@ def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
     for index, account in enumerate(valid_accounts, start=1):
         step = "refresh-token"
         try:
-            token_info = _sub2api_response_data(
-                http_post(
-                    f"{base}/admin/grok/oauth/refresh-token",
-                    headers=headers,
-                    json=build_sub2api_grok_refresh_token_check_payload(account, settings),
-                    timeout=60,
-                    proxies={},
-                )
-            )
-            payload = build_sub2api_grok_refresh_token_payload(account, token_info, settings, index=index)
-            step = "create-account"
-            created = _sub2api_response_data(
-                http_post(
-                    f"{base}/admin/accounts",
-                    headers=headers,
-                    json=payload,
-                    timeout=60,
-                    proxies={},
-                )
-            )
-            items.append({"email": account.get("email", ""), "status": "pushed", "response": created})
+            items.append(_push_one_account_to_sub2api(account, settings, base, headers, index))
         except Exception as exc:
+            error_text = _sub2api_error_text(exc, step=step)
+            if step == "refresh-token" and is_refresh_token_revoked_error(error_text) and account.get("sso"):
+                try:
+                    if log_callback:
+                        log_callback(f"[*] Refresh Token 已失效，尝试用 SSO 重新获取: {account.get('email', '')}")
+                    new_refresh_token = fetch_xai_oauth_refresh_token(
+                        account.get("sso"),
+                        log_callback=log_callback,
+                    )
+                    replace_registered_account_refresh_token(account, new_refresh_token)
+                    items.append(_push_one_account_to_sub2api(account, settings, base, headers, index))
+                    continue
+                except Exception as retry_exc:
+                    error_text = f"{error_text}; retry_with_sso_failed: {_sub2api_error_text(retry_exc)}"
             items.append(
                 {
                     "email": account.get("email", ""),
                     "status": "failed",
                     "step": step,
-                    "error": _sub2api_error_text(exc, step=step),
+                    "error": error_text,
                 }
             )
             if log_callback:

@@ -516,6 +516,85 @@ def test_account_push_statuses_do_not_overwrite_each_other(monkeypatch, tmp_path
     assert refreshed["sub2api_response"]["id"] == 101
 
 
+def test_exchange_xai_refresh_token_posts_refresh_grant(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"access_token": "access-token", "refresh_token": "rotated-refresh"}
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr(reg, "http_post", fake_post)
+
+    result = reg.exchange_xai_refresh_token("refresh-token")
+
+    assert result["access_token"] == "access-token"
+    assert calls[0][0] == "https://auth.x.ai/oauth2/token"
+    assert calls[0][1]["data"]["grant_type"] == "refresh_token"
+    assert calls[0][1]["data"]["client_id"] == reg.XAI_GROK_OAUTH_CLIENT_ID
+    assert calls[0][1]["data"]["refresh_token"] == "refresh-token"
+
+
+def test_check_registered_accounts_health_updates_rotated_refresh_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    account_file = tmp_path.joinpath("accounts_20260630_140000_job.txt")
+    account_file.write_text(
+        "user@example.com----Pass----sso-token----old-refresh\n",
+        encoding="utf-8",
+    )
+    account = reg.list_registered_accounts()[0]
+
+    monkeypatch.setattr(
+        reg,
+        "exchange_xai_refresh_token",
+        lambda refresh_token, settings=None: {
+            "access_token": "access-token",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        },
+    )
+
+    result = reg.check_registered_accounts_health([account])
+    reg.persist_account_health_status([account], result)
+
+    assert result["healthy"] == 1
+    assert result["failed"] == 0
+    assert result["items"][0]["status"] == "healthy"
+    assert "new-refresh" in account_file.read_text(encoding="utf-8")
+    refreshed = reg.list_registered_accounts()[0]
+    assert refreshed["health_status"] == "healthy"
+    assert refreshed["health_status_text"] == "可用"
+
+
+def test_check_registered_accounts_health_marks_missing_refresh_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
+        "user@example.com----Pass----sso-token\n",
+        encoding="utf-8",
+    )
+    account = reg.list_registered_accounts()[0]
+    monkeypatch.setattr(reg, "exchange_xai_refresh_token", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not call xAI")))
+
+    result = reg.check_registered_accounts_health([account])
+    reg.persist_account_health_status([account], result)
+
+    assert result["healthy"] == 0
+    assert result["failed"] == 1
+    assert result["items"][0]["status"] == "incomplete"
+    refreshed = reg.list_registered_accounts()[0]
+    assert refreshed["health_status"] == "incomplete"
+    assert refreshed["health_status_text"] == "资料不完整"
+
+
 def test_import_accounts_to_grok2api_posts_sso_tokens_to_admin_api(monkeypatch):
     calls = []
 
@@ -1210,6 +1289,17 @@ def test_web_console_exposes_grok2api_push_action():
     assert "/api/accounts/import/grok2api" in js
     assert "accountGrok2apiPushStatus" in js
     assert "可推送到 grok2api" in js
+
+
+def test_web_console_exposes_account_health_check_action():
+    html = Path("templates/index.html").read_text(encoding="utf-8")
+    js = Path("static/app.js").read_text(encoding="utf-8")
+
+    assert 'id="checkHealthBtn"' in html
+    assert 'label: "健康状态"' in js
+    assert "accountHealthStatus" in js
+    assert "/api/accounts/check-health" in js
+    assert "健康检查" in js
 
 
 def test_web_console_exposes_auto_push_switches():

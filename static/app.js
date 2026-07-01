@@ -7,6 +7,7 @@ const logBox = document.querySelector("#logBox");
 const startBtn = document.querySelector("#startBtn");
 const stopBtn = document.querySelector("#stopBtn");
 const refreshAccountsBtn = document.querySelector("#refreshAccountsBtn");
+const checkHealthBtn = document.querySelector("#checkHealthBtn");
 const importGrok2apiBtn = document.querySelector("#importGrok2apiBtn");
 const importSub2apiBtn = document.querySelector("#importSub2apiBtn");
 const selectPageAccounts = document.querySelector("#selectPageAccounts");
@@ -20,6 +21,7 @@ const tabButtons = Array.from(document.querySelectorAll("[data-tab-target]"));
 const tabPanels = Array.from(document.querySelectorAll("[data-tab-panel]"));
 
 const ACCOUNT_TABLE_PREFS_KEY = "grok-reg.accounts.table";
+const ACCOUNT_TABLE_PREFS_VERSION = 2;
 const ACCOUNT_COLUMNS = [
   { key: "select", label: "选择", locked: true },
   { key: "email", label: "邮箱", className: "email-column" },
@@ -28,12 +30,14 @@ const ACCOUNT_COLUMNS = [
   { key: "source", label: "来源文件", className: "source-column" },
   { key: "index", label: "序号" },
   { key: "password", label: "密码" },
+  { key: "health", label: "健康状态" },
   { key: "grok2api", label: "grok2api" },
   { key: "sub2api", label: "sub2api" },
 ];
 const DEFAULT_ACCOUNT_TABLE_PREFS = {
   visibleColumns: ACCOUNT_COLUMNS.map((column) => column.key),
   pageSize: 20,
+  version: ACCOUNT_TABLE_PREFS_VERSION,
 };
 
 let currentJobId = null;
@@ -43,6 +47,7 @@ let accounts = [];
 let accountPage = 1;
 let accountTablePrefs = loadAccountTablePrefs();
 let selectedAccountIdsSet = new Set();
+let accountHealthStatus = {};
 let accountPushStatus = {};
 let accountGrok2apiPushStatus = {};
 let pushingToSub2api = false;
@@ -180,12 +185,16 @@ function loadAccountTablePrefs() {
           .map((key) => (key === "line" ? "index" : key))
           .filter((key) => allowedColumns.has(key))
       : DEFAULT_ACCOUNT_TABLE_PREFS.visibleColumns;
+    if (Number(saved.version || 1) < ACCOUNT_TABLE_PREFS_VERSION && !visibleColumns.includes("health")) {
+      visibleColumns.push("health");
+    }
     const pageSize = [10, 20, 50, 100].includes(Number(saved.pageSize))
       ? Number(saved.pageSize)
       : DEFAULT_ACCOUNT_TABLE_PREFS.pageSize;
     return {
       visibleColumns: visibleColumns.includes("select") ? visibleColumns : ["select", ...visibleColumns],
       pageSize,
+      version: ACCOUNT_TABLE_PREFS_VERSION,
     };
   } catch (error) {
     return { ...DEFAULT_ACCOUNT_TABLE_PREFS };
@@ -255,6 +264,8 @@ function accountCellValue(account, key, rowNumber) {
   const grok2apiStatus = accountGrok2apiPushStatus[account.id] || persistedGrok2apiStatus;
   const persistedSub2apiStatus = account.sub2api_status_text || (account.sub2api_status === "pushed" ? "已推送" : "未推送");
   const sub2apiStatus = accountPushStatus[account.id] || persistedSub2apiStatus;
+  const persistedHealthStatus = account.health_status_text || "未检查";
+  const healthStatus = accountHealthStatus[account.id] || persistedHealthStatus;
   const values = {
     email: account.email,
     sso: account.sso_preview || "",
@@ -262,6 +273,7 @@ function accountCellValue(account, key, rowNumber) {
     source: account.source_file || "",
     index: rowNumber,
     password: account.password ? "已保存" : "-",
+    health: healthStatus,
     grok2api: grok2apiStatus,
     sub2api: sub2apiStatus,
   };
@@ -360,8 +372,11 @@ function renderAccounts() {
       cell.textContent = String(value ?? "");
       if (column.className) cell.classList.add(column.className);
       if (value === "已推送") cell.classList.add("push-ok");
+      if (value === "可用") cell.classList.add("push-ok");
       if (value === "推送中") cell.classList.add("push-running");
+      if (value === "检查中") cell.classList.add("push-running");
       if (String(value).startsWith("失败")) cell.classList.add("push-failed");
+      if (value === "失效" || value === "资料不完整") cell.classList.add("push-failed");
       row.appendChild(cell);
     }
     accountsBody.appendChild(row);
@@ -374,6 +389,45 @@ async function loadAccounts() {
   const payload = await requestJson("/api/accounts");
   accounts = payload.accounts || [];
   renderAccounts();
+}
+
+async function checkSelectedAccountHealth() {
+  const accountIds = selectedAccountIds();
+  if (!accountIds.length) {
+    setMessage("请选择账号再做健康检查");
+    return;
+  }
+  checkHealthBtn.disabled = true;
+  checkHealthBtn.textContent = `检查中 ${accountIds.length} 个...`;
+  accountIds.forEach((id) => {
+    accountHealthStatus[id] = "检查中";
+  });
+  renderAccounts();
+  setMessage(`开始健康检查：${accountIds.length} 个账号`);
+  try {
+    const result = await requestJson("/api/accounts/check-health", {
+      method: "POST",
+      body: JSON.stringify({ ...formPayload(), account_ids: accountIds }),
+    });
+    if (Array.isArray(result.accounts)) {
+      const returned = new Map(result.accounts.map((account) => [account.id, account]));
+      accounts = accounts.map((account) => returned.get(account.id) || account);
+      accountIds.forEach((id) => {
+        const account = returned.get(id);
+        accountHealthStatus[id] = account?.health_status_text || "未检查";
+      });
+    }
+    setMessage(result.message || `健康检查完成：可用 ${result.healthy || 0} 个，异常 ${result.failed || 0} 个`);
+  } catch (error) {
+    accountIds.forEach((id) => {
+      accountHealthStatus[id] = `失败：${error.message}`;
+    });
+    setMessage(`健康检查失败：${error.message}`);
+  } finally {
+    checkHealthBtn.disabled = false;
+    checkHealthBtn.textContent = "健康检查";
+    renderAccounts();
+  }
 }
 
 async function importSelectedToSub2api() {
@@ -495,6 +549,10 @@ refreshAccountsBtn.addEventListener("click", () => {
   loadAccounts().catch((error) => setMessage(error.message));
 });
 
+checkHealthBtn.addEventListener("click", () => {
+  checkSelectedAccountHealth().catch((error) => setMessage(error.message));
+});
+
 selectPageAccounts.addEventListener("change", () => {
   for (const account of currentPageAccounts()) {
     if (selectPageAccounts.checked) selectedAccountIdsSet.add(account.id);
@@ -520,6 +578,7 @@ accountColumnOptions.addEventListener("change", (event) => {
   accountTablePrefs.visibleColumns = ACCOUNT_COLUMNS
     .map((column) => column.key)
     .filter((key) => visible.has(key));
+  accountTablePrefs.version = ACCOUNT_TABLE_PREFS_VERSION;
   saveAccountTablePrefs();
   renderAccounts();
 });

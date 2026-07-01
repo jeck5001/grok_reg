@@ -82,6 +82,7 @@ def update_config(payload: dict):
 def public_account(account):
     item = dict(account)
     item.pop("sso", None)
+    item.pop("refresh_token", None)
     return item
 
 
@@ -145,6 +146,30 @@ def import_accounts_to_grok2api(payload: dict):
         **result,
         "status": status,
         "message": message,
+        "accounts": [public_account(account) for account in accounts],
+    }
+
+
+@app.post("/api/accounts/check-health")
+def check_accounts_health(payload: dict):
+    settings = merge_sensitive_values(payload)
+    account_ids = payload.get("account_ids") or []
+    accounts = reg.find_registered_accounts(account_ids)
+    if not accounts:
+        raise HTTPException(status_code=404, detail="未找到选中的账号")
+    try:
+        result = reg.check_registered_accounts_health(accounts, settings)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"健康检查失败: {exc}")
+    reg.persist_account_health_status(accounts, result)
+    accounts = reg.find_registered_accounts(account_ids)
+    healthy = int(result.get("healthy") or 0)
+    failed = int(result.get("failed") or 0)
+    status = "partial_failed" if failed else "healthy"
+    return {
+        **result,
+        "status": status,
+        "message": f"健康检查完成：可用 {healthy} 个，异常 {failed} 个",
         "accounts": [public_account(account) for account in accounts],
     }
 

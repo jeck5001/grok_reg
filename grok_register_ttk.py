@@ -450,6 +450,19 @@ def account_status_text(status):
     return "未推送"
 
 
+def account_health_status_text(status):
+    value = str(status or "").strip().lower()
+    if value == "healthy":
+        return "可用"
+    if value == "unhealthy":
+        return "失效"
+    if value == "incomplete":
+        return "资料不完整"
+    if value == "checking":
+        return "检查中"
+    return "未检查"
+
+
 def _sub2api_error_text(exc, step=""):
     response = getattr(exc, "response", None)
     status_code = getattr(response, "status_code", None)
@@ -492,6 +505,15 @@ def attach_account_status(account, statuses=None):
         account["grok2api_response"] = record.get("grok2api_response")
     if record.get("grok2api_error"):
         account["grok2api_error"] = record.get("grok2api_error")
+    health_status = str(record.get("health_status") or "unknown").strip() or "unknown"
+    account["health_status"] = health_status
+    account["health_status_text"] = str(record.get("health_status_text") or account_health_status_text(health_status))
+    if record.get("health_checked_at"):
+        account["health_checked_at"] = record.get("health_checked_at")
+    if record.get("health_error"):
+        account["health_error"] = record.get("health_error")
+    if "health_response" in record:
+        account["health_response"] = record.get("health_response")
     return account
 
 
@@ -634,6 +656,42 @@ def persist_grok2api_push_status(accounts, result):
                     "line_no": account.get("line_no", ""),
                 }
             )
+        statuses[account_id] = record
+    save_account_statuses(statuses)
+    return statuses
+
+
+def persist_account_health_status(accounts, result):
+    statuses = load_account_statuses()
+    items = result.get("items") if isinstance(result, dict) else []
+    if not isinstance(items, list):
+        items = []
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    for index, account in enumerate(accounts or []):
+        account_id = str(account.get("id") or "").strip()
+        if not account_id:
+            continue
+        record = statuses.get(account_id)
+        if not isinstance(record, dict):
+            record = {}
+        item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
+        health_status = str(item.get("status") or "unknown").strip().lower() or "unknown"
+        record.update(
+            {
+                "health_status": health_status,
+                "health_status_text": account_health_status_text(health_status),
+                "health_checked_at": now,
+                "email": account.get("email", ""),
+                "source_file": account.get("source_file", ""),
+                "line_no": account.get("line_no", ""),
+            }
+        )
+        if item.get("error"):
+            record["health_error"] = str(item.get("error") or "")
+        else:
+            record.pop("health_error", None)
+        if "response" in item:
+            record["health_response"] = item.get("response")
         statuses[account_id] = record
     save_account_statuses(statuses)
     return statuses
@@ -953,6 +1011,52 @@ def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
         "failed": failed_count,
         "items": items,
         "warning": "已按 Refresh Token 直接导入 sub2api；历史仅有 sso 的账号不能推送。",
+    }
+
+
+def check_registered_accounts_health(accounts, settings=None, log_callback=None):
+    settings = {**config, **dict(settings or {})}
+    items = []
+    for account in accounts or []:
+        email = str(account.get("email") or "").strip()
+        refresh_token = str(account.get("refresh_token") or "").strip()
+        if not refresh_token:
+            items.append(
+                {
+                    "email": email,
+                    "status": "incomplete",
+                    "error": "缺少 refresh_token",
+                }
+            )
+            continue
+        try:
+            token_info = exchange_xai_refresh_token(refresh_token, settings=settings)
+            token_refresh = str((token_info or {}).get("refresh_token") or "").strip()
+            if token_refresh and token_refresh != refresh_token:
+                replace_registered_account_refresh_token(account, token_refresh)
+            response = {
+                "token_type": token_info.get("token_type", ""),
+                "expires_in": token_info.get("expires_in", ""),
+                "scope": token_info.get("scope", ""),
+            }
+            items.append({"email": email, "status": "healthy", "response": response})
+        except Exception as exc:
+            items.append(
+                {
+                    "email": email,
+                    "status": "unhealthy",
+                    "error": _sub2api_error_text(exc, step="refresh-token"),
+                }
+            )
+    healthy_count = len([item for item in items if item.get("status") == "healthy"])
+    failed_count = len(items) - healthy_count
+    if log_callback:
+        log_callback(f"[+] 健康检查完成: 可用 {healthy_count} / 异常 {failed_count}")
+    return {
+        "checked": len(items),
+        "healthy": healthy_count,
+        "failed": failed_count,
+        "items": items,
     }
 
 
@@ -1427,6 +1531,32 @@ def exchange_xai_oauth_code_for_token(code, code_verifier, redirect_uri=None):
     data = resp.json()
     if not isinstance(data, dict) or not str(data.get("refresh_token") or "").strip():
         raise Exception(f"xAI OAuth token 返回缺少 refresh_token: {str(data)[:300]}")
+    return data
+
+
+def exchange_xai_refresh_token(refresh_token, settings=None):
+    settings = {**config, **dict(settings or {})}
+    token = str(refresh_token or "").strip()
+    if not token:
+        raise ValueError("缺少 refresh_token")
+    payload = {
+        "grant_type": "refresh_token",
+        "client_id": str(settings.get("sub2api_grok_client_id") or XAI_GROK_OAUTH_CLIENT_ID).strip(),
+        "refresh_token": token,
+    }
+    resp = http_post(
+        XAI_GROK_OAUTH_TOKEN_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "grok-register-health/1.0",
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict) or not str(data.get("access_token") or "").strip():
+        raise Exception(f"xAI OAuth refresh 返回缺少 access_token: {str(data)[:300]}")
     return data
 
 

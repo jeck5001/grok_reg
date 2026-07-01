@@ -241,6 +241,41 @@ def test_import_selected_accounts_persists_sub2api_failure_status(monkeypatch, t
     assert "refresh-token HTTP 502" in refreshed["sub2api_error"]
 
 
+def test_check_selected_accounts_health_persists_status(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
+        "user@example.com----Pass----sso-token----refresh-token\n",
+        encoding="utf-8",
+    )
+
+    def fake_check(accounts, settings=None, log_callback=None):
+        return {
+            "checked": 1,
+            "healthy": 1,
+            "failed": 0,
+            "items": [{"email": accounts[0]["email"], "status": "healthy"}],
+        }
+
+    monkeypatch.setattr(reg, "check_registered_accounts_health", fake_check)
+    from web_app import app
+
+    client = TestClient(app)
+    account = client.get("/api/accounts").json()["accounts"][0]
+    response = client.post(
+        "/api/accounts/check-health",
+        json={"account_ids": [account["id"]]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "healthy"
+    assert response.json()["message"] == "健康检查完成：可用 1 个，异常 0 个"
+    assert "sso" not in response.json()["accounts"][0]
+    assert "refresh_token" not in response.json()["accounts"][0]
+    refreshed = client.get("/api/accounts").json()["accounts"][0]
+    assert refreshed["health_status"] == "healthy"
+    assert refreshed["health_status_text"] == "可用"
+
+
 def test_start_job_rejects_duplicate_active_job(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))

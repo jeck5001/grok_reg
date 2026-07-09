@@ -4277,17 +4277,11 @@ return false;
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
-        native_state = _fill_otp_code_native(page, clean_code, cancel_callback=cancel_callback)
-        if isinstance(native_state, dict) and native_state.get("nativeInput"):
-            filled = "filled-native"
-            if log_callback:
-                log_callback(
-                    "[Debug] 验证码已通过 CDP 原生输入: "
-                    + json.dumps(native_state, ensure_ascii=False)[:500]
-                )
-        else:
-            filled = page.run_js(
-                """
+        # 上游验证码填充（JS + _valueTracker 同步）为主路径：已验证能正确驱动
+        # input-otp 受控组件的 onComplete；CDP 原生输入仅作兜底，避免其绕过
+        # React 状态导致自动提交携带无效值被 verify-email 拒绝。
+        filled = page.run_js(
+            """
 const code = String(arguments[0] || '').trim();
 if (!code) return 'empty-code';
 
@@ -4344,8 +4338,19 @@ if (otpBoxes.length >= code.length) {
 
 return 'not-ready';
             """,
-                clean_code,
-            )
+            clean_code,
+        )
+
+        # JS 主路径未成功时，回退到 CDP 原生按键输入
+        if filled == "not-ready" or "failed" in str(filled):
+            native_state = _fill_otp_code_native(page, clean_code, cancel_callback=cancel_callback)
+            if isinstance(native_state, dict) and native_state.get("nativeInput"):
+                filled = "filled-native"
+                if log_callback:
+                    log_callback(
+                        "[Debug] 验证码 JS 填充未就绪，回退 CDP 原生输入: "
+                        + json.dumps(native_state, ensure_ascii=False)[:500]
+                    )
 
         if filled == "not-ready":
             sleep_with_cancel(0.5, cancel_callback)

@@ -2508,12 +2508,14 @@ def wait_for_email_verification_step(
 
 
 def wait_for_post_code_transition(
-    page, email, timeout=45, log_callback=None, cancel_callback=None
+    page, email, timeout=60, log_callback=None, cancel_callback=None
 ):
     deadline = time.time() + timeout
     last_state = "not-started"
-    error_page_retries = 0
-    max_error_page_retries = 2
+    # 验证成功后可能闪现错误页/入口页等瞬时过渡态；容忍连续 N 次再判失败，
+    # 期间只要出现 profile-form 即成功。max_adverse_streak*~1.2s 为容忍窗口。
+    adverse_streak = 0
+    max_adverse_streak = 12
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         state = page.run_js(
@@ -2602,45 +2604,41 @@ return 'post-code-waiting';
             snippet = str(state.get("bodySnippet") or "")
             if name == "post-code-error-page":
                 resource_summary = state.get("resourceSummary")
-                retry_target = state.get("retryTarget")
-                # 验证码此时其实已被服务端接受(grpc-status:0)，会话 cookie 有效。
-                # 页面上的 "Retry" 按钮会重启整个注册流程、把会话冲回入口，
-                # 属破坏性操作。改为刷新当前页，让应用凭有效会话恢复到资料页。
-                if (
-                    error_page_retries < max_error_page_retries
-                    and isinstance(resource_summary, dict)
-                    and resource_summary.get("verifyEmailSeen")
-                ):
-                    error_page_retries += 1
-                    if log_callback:
+                # 验证码已被服务端接受(grpc-status:0)。这个 "an error occurred"
+                # 页面是成功后的瞬时过渡态，任何主动干预都会毁掉会话：
+                #   - 点 "Retry" 会重启注册流程回到入口
+                #   - refresh() 会丢掉存于前端内存的流程状态、回到入口
+                # 对齐上游(38dc6eb 时可用)：什么都不做，容忍瞬时并继续轮询等资料页。
+                adverse_streak += 1
+                if adverse_streak <= max_adverse_streak:
+                    if log_callback and adverse_streak == 1:
                         log_callback(
-                            f"[*] 验证码校验后过渡错误页，刷新页面恢复 ({error_page_retries}/{max_error_page_retries})"
+                            f"[Debug] 验证码校验后瞬时过渡页，静默等待资料页 snippet={snippet[:120]}"
                         )
-                        log_callback(
-                            "[Debug] 验证码后错误页恢复状态: "
-                            + json.dumps(
-                                {
-                                    "retryTarget": retry_target,
-                                    "resourceSummary": resource_summary,
-                                },
-                                ensure_ascii=False,
-                            )[:2500]
-                        )
-                    try:
-                        page.refresh()
-                    except Exception as refresh_exc:
-                        if log_callback:
-                            log_callback(f"[Debug] 刷新页面失败: {str(refresh_exc)[:160]}")
-                    sleep_with_cancel(3, cancel_callback)
+                    sleep_with_cancel(1.2, cancel_callback)
                     continue
                 detail = ""
                 if resource_summary:
                     detail = "；资源摘要: " + json.dumps(resource_summary, ensure_ascii=False)[:500]
-                raise ProfileSessionLost(f"验证码提交后 xAI 返回错误页: {snippet}{detail}")
+                raise ProfileSessionLost(f"验证码提交后 xAI 持续停在错误页: {snippet}{detail}")
             if name == "post-code-email-step":
+                # 容忍过渡中的瞬时快照；仅在持续退回邮箱页时才判失败
+                adverse_streak += 1
+                if adverse_streak <= max_adverse_streak:
+                    sleep_with_cancel(1.2, cancel_callback)
+                    continue
                 raise ProfileSessionLost(f"验证码提交后退回邮箱输入页，验证码会话已失效: {snippet}")
             if name == "post-code-entry-page":
+                # 容忍过渡中的瞬时快照；仅在持续退回入口时才判失败
+                adverse_streak += 1
+                if adverse_streak <= max_adverse_streak:
+                    if log_callback and adverse_streak == 1:
+                        log_callback("[Debug] 验证码校验后短暂闪现入口页，继续等待资料页...")
+                    sleep_with_cancel(1.2, cancel_callback)
+                    continue
                 raise ProfileSessionLost(f"验证码提交后退回注册入口，验证码会话已失效: {snippet}")
+        else:
+            adverse_streak = 0
         sleep_with_cancel(0.8, cancel_callback)
     if log_callback:
         log_callback(f"[Debug] 验证码提交后未进入资料页，最后状态: {last_state}")

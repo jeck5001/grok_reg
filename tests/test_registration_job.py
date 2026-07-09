@@ -412,6 +412,25 @@ def test_wait_for_post_code_transition_retries_email_on_error_page():
         reg.wait_for_post_code_transition(FakePage(), "user@example.com", timeout=5)
 
 
+def test_wait_for_post_code_transition_includes_error_resource_diagnostics():
+    class FakePage:
+        def run_js(self, script):
+            return {
+                "state": "post-code-error-page",
+                "bodySnippet": "An error occurred There was an error loading this page.",
+                "resourceSummary": {
+                    "verifyEmailSeen": True,
+                    "validatePasswordSeen": False,
+                    "signupSeen": False,
+                },
+            }
+
+    with pytest.raises(reg.ProfileSessionLost) as exc:
+        reg.wait_for_post_code_transition(FakePage(), "user@example.com", timeout=5)
+
+    assert "verifyEmailSeen" in str(exc.value)
+
+
 def test_fill_code_waits_for_frontend_state_after_otp_input():
     source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
 
@@ -419,7 +438,7 @@ def test_fill_code_waits_for_frontend_state_after_otp_input():
     assert "sleep_with_cancel(0.6, cancel_callback)" in source
 
 
-def test_fill_code_uses_native_cdp_input_for_otp(monkeypatch):
+def test_fill_code_types_otp_one_character_at_a_time_with_cdp(monkeypatch):
     class FakePage:
         def __init__(self):
             self.cdp_calls = []
@@ -460,7 +479,12 @@ def test_fill_code_uses_native_cdp_input_for_otp(monkeypatch):
 
     assert reg.fill_code_and_submit("user@example.com", "mail-token") == "TFF-KTN"
 
-    assert ("Input.insertText", {"text": "TFFKTN"}) in page.cdp_calls
+    inserted = [
+        params["text"]
+        for method, params in page.cdp_calls
+        if method == "Input.insertText"
+    ]
+    assert inserted == list("TFFKTN")
     assert any(
         method == "Input.dispatchMouseEvent"
         and params.get("type") == "mousePressed"

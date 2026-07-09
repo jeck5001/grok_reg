@@ -1480,7 +1480,7 @@ def _dispatch_cdp_text(page, text):
     page.run_cdp("Input.insertText", text=str(text or ""))
 
 
-def _fill_otp_code_native(page, clean_code):
+def _fill_otp_code_native(page, clean_code, cancel_callback=None):
     target = page.run_js(build_otp_native_target_script(), len(clean_code))
     if not isinstance(target, dict) or target.get("state") != "otp-target":
         return target
@@ -1492,8 +1492,12 @@ def _fill_otp_code_native(page, clean_code):
         int(target.get("centerY")),
         include_keyboard=False,
     )
-    _dispatch_cdp_text(page, clean_code)
-    return {**target, "nativeInput": True}
+    inserted = 0
+    for ch in str(clean_code or ""):
+        _dispatch_cdp_text(page, ch)
+        inserted += 1
+        sleep_with_cancel(0.08, cancel_callback)
+    return {**target, "nativeInput": True, "insertedChars": inserted}
 
 
 def _click_otp_submit_native(page):
@@ -2479,6 +2483,19 @@ function visible(node) {
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
 }
+function resourceSummary() {
+    try {
+        const names = performance.getEntriesByType('resource').map((entry) => String(entry && entry.name || ''));
+        return {
+            verifyEmailSeen: names.some((name) => name.includes('VerifyEmailValidationCode')),
+            validatePasswordSeen: names.some((name) => name.includes('ValidatePassword')),
+            signupSeen: names.some((name) => /\/sign-up(?:\?|$)/.test(name)),
+            authMgmtCount: names.filter((name) => name.includes('/auth_mgmt.')).length,
+        };
+    } catch (e) {
+        return {error: String(e && e.message || e).slice(0, 120)};
+    }
+}
 const bodyText = String(document.body?.innerText || document.body?.textContent || '').replace(/\s+/g, ' ').trim();
 const compact = bodyText.toLowerCase().replace(/\s+/g, '');
 const hasProfile = !!document.querySelector('input[name="givenName"], input[autocomplete="given-name"]')
@@ -2486,7 +2503,7 @@ const hasProfile = !!document.querySelector('input[name="givenName"], input[auto
     && !!document.querySelector('input[name="password"], input[type="password"]');
 if (hasProfile) return 'profile-form';
 if (compact.includes('anerroroccurred') || compact.includes('therewasanerrorloadingthispage')) {
-    return {state: 'post-code-error-page', bodySnippet: bodyText.slice(0, 240)};
+    return {state: 'post-code-error-page', bodySnippet: bodyText.slice(0, 240), resourceSummary: resourceSummary()};
 }
 const hasEmailInput = !!Array.from(document.querySelectorAll('input[type="email"], input[name="email"], input[autocomplete="email"]')).find(visible);
 if (hasEmailInput) return {state: 'post-code-email-step', bodySnippet: bodyText.slice(0, 240)};
@@ -2503,7 +2520,11 @@ return 'post-code-waiting';
             name = str(state.get("state") or "")
             snippet = str(state.get("bodySnippet") or "")
             if name == "post-code-error-page":
-                raise ProfileSessionLost(f"验证码提交后 xAI 返回错误页: {snippet}")
+                resource_summary = state.get("resourceSummary")
+                detail = ""
+                if resource_summary:
+                    detail = "；资源摘要: " + json.dumps(resource_summary, ensure_ascii=False)[:500]
+                raise ProfileSessionLost(f"验证码提交后 xAI 返回错误页: {snippet}{detail}")
             if name == "post-code-email-step":
                 raise ProfileSessionLost(f"验证码提交后退回邮箱输入页，验证码会话已失效: {snippet}")
             if name == "post-code-entry-page":
@@ -4139,7 +4160,7 @@ return false;
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
-        native_state = _fill_otp_code_native(page, clean_code)
+        native_state = _fill_otp_code_native(page, clean_code, cancel_callback=cancel_callback)
         if isinstance(native_state, dict) and native_state.get("nativeInput"):
             filled = "filled-native"
             if log_callback:
@@ -4263,9 +4284,19 @@ return 'clicked';
             """
             )
 
-        if clicked == "clicked" or clicked == "no-button":
+        if clicked == "clicked":
             if log_callback:
                 log_callback(f"[*] 已填写验证码并提交: {code}")
+            wait_for_post_code_transition(
+                page,
+                email,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
+            return code
+        if clicked == "no-button":
+            if log_callback:
+                log_callback("[Debug] 验证码提交按钮未出现，等待前端自动提交结果...")
             wait_for_post_code_transition(
                 page,
                 email,

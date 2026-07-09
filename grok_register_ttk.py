@@ -2472,6 +2472,8 @@ def wait_for_post_code_transition(
 ):
     deadline = time.time() + timeout
     last_state = "not-started"
+    error_page_retries = 0
+    max_error_page_retries = 2
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         state = page.run_js(
@@ -2485,16 +2487,54 @@ function visible(node) {
 }
 function resourceSummary() {
     try {
-        const names = performance.getEntriesByType('resource').map((entry) => String(entry && entry.name || ''));
+        const resources = performance.getEntriesByType('resource');
+        const names = resources.map((entry) => String(entry && entry.name || ''));
+        const interesting = resources.filter((entry) => {
+            const name = String(entry && entry.name || '');
+            return name.includes('VerifyEmailValidationCode') ||
+                name.includes('ValidatePassword') ||
+                /\/sign-up(?:\?|$)/.test(name) ||
+                name.includes('/auth_mgmt.');
+        }).slice(-8).map((entry) => {
+            const name = String(entry && entry.name || '');
+            let kind = 'other';
+            if (name.includes('VerifyEmailValidationCode')) kind = 'verify-email';
+            else if (name.includes('ValidatePassword')) kind = 'validate-password';
+            else if (/\/sign-up(?:\?|$)/.test(name)) kind = 'sign-up';
+            else if (name.includes('/auth_mgmt.')) kind = 'auth-mgmt';
+            return {
+                kind,
+                responseStatus: Number(entry.responseStatus || 0),
+                transferSize: Number(entry.transferSize || 0),
+                encodedBodySize: Number(entry.encodedBodySize || 0),
+                duration: Math.round(Number(entry.duration || 0)),
+            };
+        });
         return {
             verifyEmailSeen: names.some((name) => name.includes('VerifyEmailValidationCode')),
             validatePasswordSeen: names.some((name) => name.includes('ValidatePassword')),
             signupSeen: names.some((name) => /\/sign-up(?:\?|$)/.test(name)),
             authMgmtCount: names.filter((name) => name.includes('/auth_mgmt.')).length,
+            matches: interesting,
         };
     } catch (e) {
         return {error: String(e && e.message || e).slice(0, 120)};
     }
+}
+function retryTarget() {
+    const clickables = Array.from(document.querySelectorAll('button, [role="button"], a[href]')).filter(visible);
+    const target = clickables.find((node) => {
+        const text = String(node.innerText || node.textContent || node.getAttribute('aria-label') || '')
+            .replace(/\s+/g, '').toLowerCase();
+        return text.includes('retry') || text.includes('重试') || text.includes('再试');
+    });
+    if (!target) return null;
+    const rect = target.getBoundingClientRect();
+    return {
+        centerX: Math.round(rect.left + rect.width / 2),
+        centerY: Math.round(rect.top + rect.height / 2),
+        text: String(target.innerText || target.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+    };
 }
 const bodyText = String(document.body?.innerText || document.body?.textContent || '').replace(/\s+/g, ' ').trim();
 const compact = bodyText.toLowerCase().replace(/\s+/g, '');
@@ -2503,7 +2543,7 @@ const hasProfile = !!document.querySelector('input[name="givenName"], input[auto
     && !!document.querySelector('input[name="password"], input[type="password"]');
 if (hasProfile) return 'profile-form';
 if (compact.includes('anerroroccurred') || compact.includes('therewasanerrorloadingthispage')) {
-    return {state: 'post-code-error-page', bodySnippet: bodyText.slice(0, 240), resourceSummary: resourceSummary()};
+    return {state: 'post-code-error-page', bodySnippet: bodyText.slice(0, 240), resourceSummary: resourceSummary(), retryTarget: retryTarget()};
 }
 const hasEmailInput = !!Array.from(document.querySelectorAll('input[type="email"], input[name="email"], input[autocomplete="email"]')).find(visible);
 if (hasEmailInput) return {state: 'post-code-email-step', bodySnippet: bodyText.slice(0, 240)};
@@ -2521,6 +2561,42 @@ return 'post-code-waiting';
             snippet = str(state.get("bodySnippet") or "")
             if name == "post-code-error-page":
                 resource_summary = state.get("resourceSummary")
+                retry_target = state.get("retryTarget")
+                if (
+                    error_page_retries < max_error_page_retries
+                    and isinstance(resource_summary, dict)
+                    and resource_summary.get("verifyEmailSeen")
+                    and isinstance(retry_target, dict)
+                    and retry_target.get("centerX") is not None
+                    and retry_target.get("centerY") is not None
+                ):
+                    error_page_retries += 1
+                    try:
+                        _dispatch_cdp_click(
+                            page,
+                            int(retry_target.get("centerX")),
+                            int(retry_target.get("centerY")),
+                            include_keyboard=False,
+                        )
+                        retry_target["nativeClicked"] = True
+                    except Exception as retry_exc:
+                        retry_target["nativeClickError"] = str(retry_exc)[:160]
+                    if log_callback:
+                        log_callback(
+                            f"[*] 验证码校验后错误页，点击 Retry 恢复 ({error_page_retries}/{max_error_page_retries})"
+                        )
+                        log_callback(
+                            "[Debug] 验证码后错误页恢复状态: "
+                            + json.dumps(
+                                {
+                                    "retryTarget": retry_target,
+                                    "resourceSummary": resource_summary,
+                                },
+                                ensure_ascii=False,
+                            )[:1000]
+                        )
+                    sleep_with_cancel(2, cancel_callback)
+                    continue
                 detail = ""
                 if resource_summary:
                     detail = "；资源摘要: " + json.dumps(resource_summary, ensure_ascii=False)[:500]

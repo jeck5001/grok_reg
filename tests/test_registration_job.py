@@ -431,6 +431,42 @@ def test_wait_for_post_code_transition_includes_error_resource_diagnostics():
     assert "verifyEmailSeen" in str(exc.value)
 
 
+def test_wait_for_post_code_transition_retries_error_page_after_verify(monkeypatch):
+    states = iter(
+        [
+            {
+                "state": "post-code-error-page",
+                "bodySnippet": "An error occurred Retry",
+                "resourceSummary": {"verifyEmailSeen": True},
+                "retryTarget": {"centerX": 11, "centerY": 22, "text": "Retry"},
+            },
+            "profile-form",
+        ]
+    )
+
+    class FakePage:
+        def __init__(self):
+            self.cdp_calls = []
+
+        def run_js(self, script):
+            return next(states)
+
+        def run_cdp(self, method, **params):
+            self.cdp_calls.append((method, params))
+
+    page = FakePage()
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+
+    assert reg.wait_for_post_code_transition(page, "user@example.com", timeout=5) == "profile-form"
+    assert any(
+        method == "Input.dispatchMouseEvent"
+        and params.get("type") == "mousePressed"
+        and params.get("x") == 11
+        and params.get("y") == 22
+        for method, params in page.cdp_calls
+    )
+
+
 def test_fill_code_waits_for_frontend_state_after_otp_input():
     source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
 

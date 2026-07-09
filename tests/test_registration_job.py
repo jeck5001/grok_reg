@@ -1103,6 +1103,62 @@ def test_profile_submit_script_supports_role_button_and_aria_labels():
     assert 'action = "diagnose"' in diagnose_script
 
 
+def test_profile_submit_script_retries_xai_error_page():
+    script = reg.build_profile_submit_script("retry_error")
+
+    assert "There was an error loading this page" in script
+    assert "An error occurred" in script
+    assert "profile-error-retry-target" in script
+    assert "profile-error-page-no-retry" in script
+
+
+def test_fill_profile_retries_xai_error_page_before_submit(monkeypatch):
+    logs = []
+    cdp_events = []
+
+    class FakePage:
+        def __init__(self):
+            self.error_retry_attempted = False
+
+        def run_js(self, script, *args):
+            if 'action = "diagnose"' in script:
+                return '{"turnstile": {}}'
+            if 'action = "retry_error"' in script:
+                if not self.error_retry_attempted:
+                    self.error_retry_attempted = True
+                    return {
+                        "state": "profile-error-retry-target",
+                        "centerX": 111,
+                        "centerY": 222,
+                        "text": "Retry",
+                    }
+                return "profile-error-page-not-detected"
+            if 'action = "submit"' in script:
+                return "submitted"
+            return "profile-filled"
+
+        def run_cdp(self, method, **kwargs):
+            cdp_events.append((method, kwargs))
+
+    page = FakePage()
+    monkeypatch.setattr(reg, "_get_page", lambda: page)
+    monkeypatch.setattr(reg, "refresh_active_page", lambda: page)
+    monkeypatch.setattr(reg, "build_profile", lambda: ("Ada", "Lovelace", "secret"))
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+
+    profile = reg.fill_profile_and_submit(timeout=5, log_callback=logs.append)
+
+    assert profile == {"given_name": "Ada", "family_name": "Lovelace", "password": "secret"}
+    assert any("最终注册页错误页，点击 Retry 重试 (1/4)" in line for line in logs)
+    assert any(
+        method == "Input.dispatchMouseEvent"
+        and kwargs.get("type") == "mouseReleased"
+        and kwargs.get("x") == 111
+        and kwargs.get("y") == 222
+        for method, kwargs in cdp_events
+    )
+
+
 def test_wait_for_sso_cookie_final_page_can_submit_without_visible_turnstile():
     source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
     content_script = Path("turnstilePatch/content.js").read_text(encoding="utf-8")

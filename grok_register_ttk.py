@@ -1943,7 +1943,7 @@ return JSON.stringify({
 
 
 def build_profile_submit_script(action):
-    if action not in {"check", "submit", "trigger", "diagnose"}:
+    if action not in {"check", "submit", "trigger", "diagnose", "retry_error"}:
         raise ValueError(f"Unsupported profile submit action: {action}")
     keywords = json.dumps(list(PROFILE_SUBMIT_KEYWORDS), ensure_ascii=False)
     action_json = json.dumps(action)
@@ -2085,6 +2085,44 @@ if (action === 'diagnose') {{
         inputs,
         bodySnippet: nodeText(document.body).slice(0, 300),
     }});
+}}
+if (action === 'retry_error') {{
+    const bodyText = nodeText(document.body);
+    const compactBody = bodyText.toLowerCase().replace(/\\s+/g, '');
+    const errorHints = [
+        'An error occurred',
+        'There was an error loading this page',
+        '请验证你使用的网址是否正确',
+    ];
+    const isErrorPage = compactBody.includes('anerroroccurred')
+        || compactBody.includes('therewasanerrorloadingthispage')
+        || compactBody.includes('errorloadingthispage');
+    if (!isErrorPage) return 'profile-error-page-not-detected';
+    const retryBtn = Array.from(document.querySelectorAll('button, [role="button"], input[type="button"], a[href]'))
+        .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true')
+        .find((node) => {{
+            const text = normalizedText(node);
+            return text.includes('retry') || text.includes('重试') || text.includes('reload');
+        }});
+    if (!retryBtn) {{
+        return {{
+            state: 'profile-error-page-no-retry',
+            title: document.title,
+            hints: errorHints,
+            bodySnippet: bodyText.slice(0, 240),
+        }};
+    }}
+    retryBtn.focus();
+    const rect = retryBtn.getBoundingClientRect();
+    try {{ retryBtn.click(); }} catch (e) {{}}
+    return {{
+        state: 'profile-error-retry-target',
+        centerX: Math.round(rect.left + rect.width / 2),
+        centerY: Math.round(rect.top + rect.height / 2),
+        text: nodeText(retryBtn).slice(0, 80),
+        title: document.title,
+        bodySnippet: bodyText.slice(0, 240),
+    }};
 }}
 const cf = cloudflareState();
 if (action === 'trigger') {{
@@ -4036,9 +4074,56 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     wait_cf_since = None
     last_cf_retry_at = 0.0
     cf_wait_log_state = {}
+    error_page_retries = 0
+    max_error_page_retries = 4
+    last_error_page_retry_at = 0.0
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
+        now = time.time()
+        if now - last_error_page_retry_at >= 2.0:
+            try:
+                error_state = page.run_js(build_profile_submit_script("retry_error"))
+            except Exception as error_retry_exc:
+                error_state = f"profile-error-check-failed:{error_retry_exc}"
+
+            if isinstance(error_state, dict) and str(error_state.get("state") or "") in {
+                "profile-error-retry-target",
+                "profile-error-page-no-retry",
+            }:
+                if error_state.get("state") == "profile-error-retry-target":
+                    error_page_retries += 1
+                    if error_page_retries > max_error_page_retries:
+                        raise Exception(
+                            f"xAI 最终注册页连续返回错误页，已重试 {max_error_page_retries} 次仍未恢复"
+                        )
+                    if error_state.get("centerX") is not None and error_state.get("centerY") is not None:
+                        try:
+                            _dispatch_cdp_click(
+                                page,
+                                int(error_state.get("centerX")),
+                                int(error_state.get("centerY")),
+                                include_keyboard=False,
+                            )
+                            error_state["nativeClicked"] = True
+                        except Exception as native_exc:
+                            error_state["nativeClickError"] = str(native_exc)[:160]
+                    if log_callback:
+                        log_callback(
+                            f"[*] 最终注册页错误页，点击 Retry 重试 ({error_page_retries}/{max_error_page_retries})"
+                        )
+                        log_callback(f"[Debug] 最终注册页错误页状态: {json.dumps(error_state, ensure_ascii=False)}")
+                    last_error_page_retry_at = now
+                    sleep_with_cancel(2, cancel_callback)
+                    try:
+                        refresh_active_page()
+                        page = _get_page()
+                    except Exception:
+                        pass
+                    continue
+                if error_state.get("state") == "profile-error-page-no-retry":
+                    raise Exception(f"xAI 最终注册页错误页且未找到 Retry 按钮: {error_state.get('bodySnippet', '')}")
+
         # 资料已填过，且表单已从页面消失 => 提交已被隐形 Turnstile 驱动成功，页面已推进
         if form_filled_once:
             try:

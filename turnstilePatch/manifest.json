@@ -11,5 +11,6 @@
             "all_frames": true
         }
     ],
-    "permissions": ["activeTab"]
+    "permissions": ["activeTab"],
+    "web_accessible_resources": ["pageHook.js"]
 }

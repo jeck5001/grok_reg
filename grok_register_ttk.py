@@ -1977,6 +1977,23 @@ function cloudflareState() {{
 }}
 function turnstileDetail() {{
     const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+    const captured = (() => {{
+        try {{
+            const raw = window.__grokTurnstile || {{}};
+            return {{
+                hookInstalled: !!window.__grokTurnstileHookInstalled,
+                renderCount: raw.renderCount || 0,
+                executeCount: raw.executeCount || 0,
+                callbackCount: raw.callbackCount || 0,
+                lastTokenLen: String(raw.lastToken || '').trim().length,
+                lastExecuteArgs: raw.lastExecuteArgs || [],
+                widgets: Array.isArray(raw.widgets) ? raw.widgets.slice(-5) : [],
+                errors: Array.isArray(raw.errors) ? raw.errors.slice(-5) : [],
+            }};
+        }} catch (e) {{
+            return {{ error: String(e && e.message || e).slice(0, 160) }};
+        }}
+    }})();
     const widgets = Array.from(document.querySelectorAll('div.cf-turnstile, [data-sitekey]')).map((n) => ({{
         sitekey: n.getAttribute('data-sitekey') || '',
         theme: n.getAttribute('data-theme') || '',
@@ -1997,6 +2014,7 @@ function turnstileDetail() {{
         hasInput: !!cfInput,
         inputLen: String((cfInput && cfInput.value) || '').trim().length,
         turnstileApi: (typeof window.turnstile !== 'undefined'),
+        captured,
         widgets,
         iframes,
         webdriver: navigator.webdriver,
@@ -2040,15 +2058,31 @@ if (action === 'trigger') {{
     // xAI 已改为“提交时才触发”的隐形 Turnstile：脚本已加载但不预渲染组件，
     // 需主动执行并放行点击，让网站前端自行驱动 challenge 生成 token。
     let executed = false;
+    const executedWidgets = [];
     try {{
         if (window.turnstile && typeof window.turnstile.execute === 'function') {{
-            try {{ window.turnstile.execute(); executed = true; }} catch (e) {{}}
+            const capturedWidgets = Array.isArray(window.__grokTurnstile && window.__grokTurnstile.widgets)
+                ? window.__grokTurnstile.widgets
+                : [];
+            for (const widget of capturedWidgets) {{
+                const id = widget && widget.id;
+                if (id !== undefined && id !== null && id !== '') {{
+                    try {{
+                        window.turnstile.execute(id);
+                        executed = true;
+                        executedWidgets.push(String(id));
+                    }} catch (e) {{}}
+                }}
+            }}
+            if (!executed) {{
+                try {{ window.turnstile.execute(); executed = true; }} catch (e) {{}}
+            }}
         }}
     }} catch (e) {{}}
     const submitBtn = pickSubmitButton();
     if (!submitBtn) return 'trigger-no-submit';
     submitProfileForm(submitBtn);
-    return 'trigger-clicked:' + (executed ? '1' : '0');
+    return 'trigger-clicked:' + (executed ? '1' : '0') + ':' + executedWidgets.join(',');
 }}
 const submitBtn = pickSubmitButton();
 if (!submitBtn) return 'no-submit-button';
@@ -4176,6 +4210,23 @@ if (cfPresent) {
     const hasVisibleChallenge = !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey]');
     if (!solved && hasVisibleChallenge) return 'final-page-wait-cf:' + token.length;
 }
+const executedWidgets = [];
+try {
+    if (window.turnstile && typeof window.turnstile.execute === 'function') {
+        const capturedWidgets = Array.isArray(window.__grokTurnstile && window.__grokTurnstile.widgets)
+            ? window.__grokTurnstile.widgets
+            : [];
+        for (const widget of capturedWidgets) {
+            const id = widget && widget.id;
+            if (id !== undefined && id !== null && id !== '') {
+                try {
+                    window.turnstile.execute(id);
+                    executedWidgets.push(String(id));
+                } catch (e) {}
+            }
+        }
+    }
+} catch (e) {}
 
 const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
     return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
@@ -4194,6 +4245,23 @@ return {
     centerY: Math.round(rect.top + rect.height / 2),
     text: compactText(submitBtn).slice(0, 80),
     tokenLen: String((cfInput && cfInput.value) || '').trim().length,
+    captured: (() => {
+        try {
+            const raw = window.__grokTurnstile || {};
+            return {
+                hookInstalled: !!window.__grokTurnstileHookInstalled,
+                renderCount: raw.renderCount || 0,
+                executeCount: raw.executeCount || 0,
+                callbackCount: raw.callbackCount || 0,
+                lastTokenLen: String(raw.lastToken || '').trim().length,
+                executedWidgets,
+                widgets: Array.isArray(raw.widgets) ? raw.widgets.slice(-5) : [],
+                errors: Array.isArray(raw.errors) ? raw.errors.slice(-5) : [],
+            };
+        } catch (e) {
+            return { error: String(e && e.message || e).slice(0, 160), executedWidgets };
+        }
+    })(),
 };
                     """
                 )

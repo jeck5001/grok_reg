@@ -1105,14 +1105,22 @@ def test_profile_submit_script_supports_role_button_and_aria_labels():
 
 def test_wait_for_sso_cookie_final_page_can_submit_without_visible_turnstile():
     source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
+    content_script = Path("turnstilePatch/content.js").read_text(encoding="utf-8")
+    page_hook = Path("turnstilePatch/pageHook.js").read_text(encoding="utf-8")
+    manifest = Path("turnstilePatch/manifest.json").read_text(encoding="utf-8")
 
     assert "final-page-submit-target" in source
     assert "_dispatch_cdp_click(page, x, y, include_keyboard=False)" in source
+    assert "executedWidgets" in source
+    assert "__grokTurnstile" in source
     assert "completeyoursignup" in source
     assert "completesignup" in source
     assert "not-final-page:" in source
     assert "最后最终页状态" in source
     assert "const hasVisibleChallenge = !!document.querySelector('iframe[src*=\"turnstile\"], div.cf-turnstile, [data-sitekey]');" in source
+    assert 'chrome.runtime.getURL("pageHook.js")' in content_script
+    assert "window.__grokTurnstile" in page_hook
+    assert '"web_accessible_resources": ["pageHook.js"]' in manifest
 
 
 def test_wait_for_sso_cookie_uses_native_click_for_final_page(monkeypatch):
@@ -1126,6 +1134,7 @@ def test_wait_for_sso_cookie_uses_native_click_for_final_page(monkeypatch):
                 "centerY": 654,
                 "text": "completesignup",
                 "tokenLen": 0,
+                "captured": {"hookInstalled": True, "widgets": [{"id": "widget-1"}]},
             }
 
         def run_cdp(self, method, **kwargs):

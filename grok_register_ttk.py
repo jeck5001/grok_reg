@@ -2556,6 +2556,7 @@ function resourceSummary() {
             signupSeen: names.some((name) => /\/sign-up(?:\?|$)/.test(name)),
             authMgmtCount: names.filter((name) => name.includes('/auth_mgmt.')).length,
             matches: interesting,
+            verifyEmailNet: (window.__grokNet && window.__grokNet.verifyEmail) || [],
         };
     } catch (e) {
         return {error: String(e && e.message || e).slice(0, 120)};
@@ -2633,7 +2634,7 @@ return 'post-code-waiting';
                                     "resourceSummary": resource_summary,
                                 },
                                 ensure_ascii=False,
-                            )[:1000]
+                            )[:2500]
                         )
                     sleep_with_cancel(2, cancel_callback)
                     continue

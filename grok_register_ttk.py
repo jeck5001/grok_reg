@@ -2012,6 +2012,28 @@ function cloudflareState() {{
     if (token.length >= 80) return 'solved';
     return 'wait-cloudflare:' + token.length;
 }}
+function hasResource(fragment) {{
+    try {{
+        return performance.getEntriesByType('resource').some((entry) => {{
+            return String(entry && entry.name || '').includes(fragment);
+        }});
+    }} catch (e) {{
+        return false;
+    }}
+}}
+function triggerPasswordValidation() {{
+    const passwordInput = document.querySelector('input[data-testid="password"], input[name="password"], input[type="password"], input[autocomplete="new-password"]');
+    if (!passwordInput) return false;
+    try {{
+        passwordInput.focus();
+        passwordInput.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: '', inputType: 'insertText' }}));
+        passwordInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        passwordInput.blur();
+        return true;
+    }} catch (e) {{
+        return false;
+    }}
+}}
 function turnstileDetail() {{
     const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
     const captured = (() => {{
@@ -2057,6 +2079,19 @@ function turnstileDetail() {{
         webdriver: navigator.webdriver,
     }};
 }}
+function networkDetail() {{
+    const resources = (() => {{
+        try {{
+            return performance.getEntriesByType('resource').map((entry) => String(entry && entry.name || ''));
+        }} catch (e) {{
+            return [];
+        }}
+    }})();
+    return {{
+        validatePasswordSeen: resources.some((name) => name.includes('ValidatePassword')),
+        signUpSeen: resources.some((name) => name.includes('/sign-up')),
+    }};
+}}
 if (action === 'diagnose') {{
     const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a[href]'))
         .filter(isVisible)
@@ -2084,6 +2119,7 @@ if (action === 'diagnose') {{
         title: document.title,
         cf: cloudflareState(),
         turnstile: turnstileDetail(),
+        network: networkDetail(),
         hasSubmitButton: !!pickSubmitButton(),
         buttons,
         inputs,
@@ -2200,6 +2236,10 @@ if (action === 'trigger') {{
 }}
 const submitBtn = pickSubmitButton();
 if (!submitBtn) return 'no-submit-button';
+if (!hasResource('ValidatePassword')) {{
+    triggerPasswordValidation();
+    return 'wait-password-validation';
+}}
 if (cf.startsWith('wait-cloudflare')) {{
     const detail = turnstileDetail();
     const hasVisibleChallenge = (detail.widgets && detail.widgets.length > 0) || (detail.iframes && detail.iframes.length > 0);
@@ -4372,6 +4412,11 @@ return 'profile-filled';
             if log_callback:
                 log_callback(f"[*] 已填写注册资料并提交: {given_name} {family_name}")
             return {"given_name": given_name, "family_name": family_name, "password": password}
+        if submit_state == "wait-password-validation":
+            if log_callback and should_log_cloudflare_wait(cf_wait_log_state, "password-validation", "0"):
+                log_callback("[*] 等待 xAI 密码校验完成后再提交...")
+            sleep_with_cancel(0.8, cancel_callback)
+            continue
         wait_cf_since = None
         if submit_state == "no-submit-button" and log_callback:
             log_callback("[Debug] 未找到提交按钮，继续等待页面稳定...")

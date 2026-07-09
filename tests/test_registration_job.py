@@ -1166,6 +1166,14 @@ def test_profile_submit_script_recovers_signup_entry_page():
     assert "profile-entry-page-not-detected" in script
 
 
+def test_profile_submit_script_waits_for_password_validation_before_submit():
+    script = reg.build_profile_submit_script("submit")
+
+    assert "ValidatePassword" in script
+    assert "wait-password-validation" in script
+    assert "performance.getEntriesByType('resource')" in script
+
+
 def test_fill_profile_retries_xai_error_page_before_submit(monkeypatch):
     logs = []
     cdp_events = []
@@ -1260,6 +1268,38 @@ def test_fill_profile_recovers_signup_entry_page_before_submit(monkeypatch):
         and kwargs.get("y") == 444
         for method, kwargs in cdp_events
     )
+
+
+def test_fill_profile_waits_for_password_validation_before_submit(monkeypatch):
+    logs = []
+    submit_attempts = [0]
+
+    class FakePage:
+        def run_js(self, script, *args):
+            if 'action = "diagnose"' in script:
+                return '{"turnstile": {}}'
+            if 'action = "retry_error"' in script:
+                return "profile-error-page-not-detected"
+            if 'action = "recover_entry"' in script:
+                return "profile-entry-page-not-detected"
+            if 'action = "submit"' in script:
+                submit_attempts[0] += 1
+                if submit_attempts[0] == 1:
+                    return "wait-password-validation"
+                return "submitted"
+            return "profile-filled"
+
+    page = FakePage()
+    monkeypatch.setattr(reg, "_get_page", lambda: page)
+    monkeypatch.setattr(reg, "refresh_active_page", lambda: page)
+    monkeypatch.setattr(reg, "build_profile", lambda: ("Ada", "Lovelace", "secret"))
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+
+    profile = reg.fill_profile_and_submit(timeout=5, log_callback=logs.append)
+
+    assert profile == {"given_name": "Ada", "family_name": "Lovelace", "password": "secret"}
+    assert submit_attempts[0] == 2
+    assert any("等待 xAI 密码校验完成" in line for line in logs)
 
 
 def test_wait_for_sso_cookie_final_page_can_submit_without_visible_turnstile():

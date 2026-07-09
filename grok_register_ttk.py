@@ -1411,6 +1411,34 @@ return {
 """
 
 
+def _dispatch_cdp_click(page, x, y, include_keyboard=True):
+    page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
+    page.run_cdp(
+        "Input.dispatchMouseEvent",
+        type="mousePressed",
+        x=x,
+        y=y,
+        button="left",
+        clickCount=1,
+    )
+    page.run_cdp(
+        "Input.dispatchMouseEvent",
+        type="mouseReleased",
+        x=x,
+        y=y,
+        button="left",
+        clickCount=1,
+    )
+    if include_keyboard:
+        try:
+            page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="Enter", code="Enter", windowsVirtualKeyCode=13)
+            page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key="Enter", code="Enter", windowsVirtualKeyCode=13)
+            page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key=" ", code="Space", windowsVirtualKeyCode=32)
+            page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key=" ", code="Space", windowsVirtualKeyCode=32)
+        except Exception:
+            pass
+
+
 def _click_xai_oauth_consent_if_present(page):
     try:
         result = page.run_js(build_xai_oauth_consent_click_script())
@@ -1418,30 +1446,7 @@ def _click_xai_oauth_consent_if_present(page):
             x = int(result.get("centerX"))
             y = int(result.get("centerY"))
             try:
-                page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
-                page.run_cdp(
-                    "Input.dispatchMouseEvent",
-                    type="mousePressed",
-                    x=x,
-                    y=y,
-                    button="left",
-                    clickCount=1,
-                )
-                page.run_cdp(
-                    "Input.dispatchMouseEvent",
-                    type="mouseReleased",
-                    x=x,
-                    y=y,
-                    button="left",
-                    clickCount=1,
-                )
-                try:
-                    page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="Enter", code="Enter", windowsVirtualKeyCode=13)
-                    page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key="Enter", code="Enter", windowsVirtualKeyCode=13)
-                    page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key=" ", code="Space", windowsVirtualKeyCode=32)
-                    page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key=" ", code="Space", windowsVirtualKeyCode=32)
-                except Exception:
-                    pass
+                _dispatch_cdp_click(page, x, y)
                 result["nativeClicked"] = True
             except Exception as exc:
                 result["nativeClickError"] = str(exc)[:160]
@@ -4181,18 +4186,35 @@ const submitBtn = buttons.find((node) => {
 });
 if (!submitBtn) return 'final-page-no-submit';
 submitBtn.focus();
-const form = submitBtn.form || submitBtn.closest('form');
-if (form && typeof form.requestSubmit === 'function') {
-    try { form.requestSubmit(submitBtn); return 'final-page-request-submit'; } catch (e) {}
-}
-submitBtn.click();
-return 'final-page-clicked-submit';
+const rect = submitBtn.getBoundingClientRect();
+try { submitBtn.click(); } catch (e) {}
+return {
+    state: 'final-page-submit-target',
+    centerX: Math.round(rect.left + rect.width / 2),
+    centerY: Math.round(rect.top + rect.height / 2),
+    text: compactText(submitBtn).slice(0, 80),
+    tokenLen: String((cfInput && cfInput.value) || '').trim().length,
+};
                     """
                 )
                 last_submit_retry = now
                 if isinstance(retried, str):
                     last_final_retry_state = retried
-                if log_callback and retried in ("final-page-no-submit", "final-page-clicked-submit", "final-page-request-submit"):
+                if isinstance(retried, dict):
+                    last_final_retry_state = str(retried.get("state") or "final-page-dict")
+                    if retried.get("centerX") is not None and retried.get("centerY") is not None:
+                        try:
+                            x = int(retried.get("centerX"))
+                            y = int(retried.get("centerY"))
+                            _dispatch_cdp_click(page, x, y, include_keyboard=False)
+                            retried["nativeClicked"] = True
+                            last_final_retry_state = f"{last_final_retry_state}:native-click:{x},{y}"
+                        except Exception as native_exc:
+                            retried["nativeClickError"] = str(native_exc)[:160]
+                            last_final_retry_state = f"{last_final_retry_state}:native-failed"
+                    if log_callback:
+                        log_callback(f"[Debug] 最终页状态: {json.dumps(retried, ensure_ascii=False)}")
+                if log_callback and retried in ("final-page-no-submit", "final-page-clicked-submit"):
                     log_callback(f"[Debug] 最终页状态: {retried}")
                 if log_callback and isinstance(retried, str) and retried.startswith("final-page-wait-cf"):
                     token_len = retried.split(":", 1)[1] if ":" in retried else "0"

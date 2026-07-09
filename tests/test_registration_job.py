@@ -1106,12 +1106,52 @@ def test_profile_submit_script_supports_role_button_and_aria_labels():
 def test_wait_for_sso_cookie_final_page_can_submit_without_visible_turnstile():
     source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
 
-    assert "final-page-request-submit" in source
+    assert "final-page-submit-target" in source
+    assert "_dispatch_cdp_click(page, x, y, include_keyboard=False)" in source
     assert "completeyoursignup" in source
     assert "completesignup" in source
     assert "not-final-page:" in source
     assert "最后最终页状态" in source
     assert "const hasVisibleChallenge = !!document.querySelector('iframe[src*=\"turnstile\"], div.cf-turnstile, [data-sitekey]');" in source
+
+
+def test_wait_for_sso_cookie_uses_native_click_for_final_page(monkeypatch):
+    events = []
+
+    class FakePage:
+        def run_js(self, script):
+            return {
+                "state": "final-page-submit-target",
+                "centerX": 321,
+                "centerY": 654,
+                "text": "completesignup",
+                "tokenLen": 0,
+            }
+
+        def run_cdp(self, method, **kwargs):
+            events.append((method, kwargs))
+
+        def cookies(self, all_domains=True, all_info=True):
+            clicked = any(
+                method == "Input.dispatchMouseEvent" and kwargs.get("type") == "mouseReleased"
+                for method, kwargs in events
+            )
+            if clicked:
+                return [{"name": "sso", "value": "sso-token"}]
+            return []
+
+    page = FakePage()
+    monkeypatch.setattr(reg, "refresh_active_page", lambda: page)
+    monkeypatch.setattr(reg, "_get_page", lambda: page)
+
+    assert reg.wait_for_sso_cookie(timeout=1) == "sso-token"
+    assert [item[0] for item in events[:3]] == [
+        "Input.dispatchMouseEvent",
+        "Input.dispatchMouseEvent",
+        "Input.dispatchMouseEvent",
+    ]
+    assert events[0][1]["x"] == 321
+    assert events[0][1]["y"] == 654
 
 
 def test_yyds_code_polling_triggers_resend_callback(monkeypatch):

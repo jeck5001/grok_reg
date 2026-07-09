@@ -150,7 +150,7 @@ def test_registration_job_retries_when_profile_session_returns_to_signup(monkeyp
     assert status["status"] == "completed"
     assert status["success_count"] == 1
     assert status["fail_count"] == 0
-    assert any("最终注册页会话丢失，自动换邮箱重试" in line for line in job.logs())
+    assert any("注册会话丢失，自动换邮箱重试" in line for line in job.logs())
     assert "second@example.com----secret----sso-token----refresh-token" in tmp_path.joinpath(
         status["output_file"]
     ).read_text(encoding="utf-8")
@@ -385,6 +385,38 @@ def test_wait_for_email_verification_step_detects_rejected_domain(monkeypatch):
         reg.wait_for_email_verification_step(FakePage(), "user@duckmail.sbs", timeout=0.1)
 
     assert exc.value.domain == "duckmail.sbs"
+
+
+def test_wait_for_post_code_transition_returns_when_profile_form_appears(monkeypatch):
+    states = iter(["waiting", "profile-form"])
+
+    class FakePage:
+        def run_js(self, script):
+            assert "post-code-profile-form" in script
+            return next(states)
+
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+
+    assert reg.wait_for_post_code_transition(FakePage(), "user@example.com", timeout=5) == "profile-form"
+
+
+def test_wait_for_post_code_transition_retries_email_on_error_page():
+    class FakePage:
+        def run_js(self, script):
+            return {
+                "state": "post-code-error-page",
+                "bodySnippet": "An error occurred There was an error loading this page.",
+            }
+
+    with pytest.raises(reg.ProfileSessionLost, match="验证码提交后 xAI 返回错误页"):
+        reg.wait_for_post_code_transition(FakePage(), "user@example.com", timeout=5)
+
+
+def test_fill_code_waits_for_frontend_state_after_otp_input():
+    source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
+
+    assert "验证码已填入，等待前端状态同步" in source
+    assert "sleep_with_cancel(0.6, cancel_callback)" in source
 
 
 def test_registration_job_retries_when_email_domain_is_rejected(monkeypatch, tmp_path):

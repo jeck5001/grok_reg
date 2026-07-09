@@ -2300,6 +2300,57 @@ def wait_for_email_verification_step(
     raise Exception("邮箱已提交，但未进入验证码页面，x.ai 可能未发送验证码")
 
 
+def wait_for_post_code_transition(
+    page, email, timeout=45, log_callback=None, cancel_callback=None
+):
+    deadline = time.time() + timeout
+    last_state = "not-started"
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        state = page.run_js(
+            r"""
+function visible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+const bodyText = String(document.body?.innerText || document.body?.textContent || '').replace(/\s+/g, ' ').trim();
+const compact = bodyText.toLowerCase().replace(/\s+/g, '');
+const hasProfile = !!document.querySelector('input[name="givenName"], input[autocomplete="given-name"]')
+    && !!document.querySelector('input[name="familyName"], input[autocomplete="family-name"]')
+    && !!document.querySelector('input[name="password"], input[type="password"]');
+if (hasProfile) return 'profile-form';
+if (compact.includes('anerroroccurred') || compact.includes('therewasanerrorloadingthispage')) {
+    return {state: 'post-code-error-page', bodySnippet: bodyText.slice(0, 240)};
+}
+const hasEmailInput = !!Array.from(document.querySelectorAll('input[type="email"], input[name="email"], input[autocomplete="email"]')).find(visible);
+if (hasEmailInput) return {state: 'post-code-email-step', bodySnippet: bodyText.slice(0, 240)};
+const hasEntry = compact.includes('createyouraccount') || compact.includes('signupwithemail');
+if (hasEntry) return {state: 'post-code-entry-page', bodySnippet: bodyText.slice(0, 240)};
+return 'post-code-waiting';
+// post-code-profile-form
+            """
+        )
+        last_state = state
+        if state == "profile-form":
+            return "profile-form"
+        if isinstance(state, dict):
+            name = str(state.get("state") or "")
+            snippet = str(state.get("bodySnippet") or "")
+            if name == "post-code-error-page":
+                raise ProfileSessionLost(f"验证码提交后 xAI 返回错误页: {snippet}")
+            if name == "post-code-email-step":
+                raise ProfileSessionLost(f"验证码提交后退回邮箱输入页，验证码会话已失效: {snippet}")
+            if name == "post-code-entry-page":
+                raise ProfileSessionLost(f"验证码提交后退回注册入口，验证码会话已失效: {snippet}")
+        sleep_with_cancel(0.8, cancel_callback)
+    if log_callback:
+        log_callback(f"[Debug] 验证码提交后未进入资料页，最后状态: {last_state}")
+    raise ProfileSessionLost("验证码提交后未进入资料页，验证码会话可能已失效")
+
+
 def _parse_positive_int(value, default, minimum=1, maximum=None):
     try:
         parsed = int(value)
@@ -2489,7 +2540,7 @@ class RegistrationJob:
                 break
             except ProfileSessionLost as profile_exc:
                 if mail_try < max_mail_retry:
-                    logf(f"[!] 最终注册页会话丢失，自动换邮箱重试: {profile_exc}")
+                    logf(f"[!] 注册会话丢失，自动换邮箱重试: {profile_exc}")
                     restart_browser(log_callback=logf)
                     sleep_with_cancel(1, self.should_stop)
                     continue
@@ -3994,6 +4045,9 @@ return 'not-ready';
                 log_callback(f"[Debug] 验证码填写失败: {filled}")
             sleep_with_cancel(0.5, cancel_callback)
             continue
+        if log_callback:
+            log_callback("[Debug] 验证码已填入，等待前端状态同步...")
+        sleep_with_cancel(0.6, cancel_callback)
 
         clicked = page.run_js(
             r"""
@@ -4031,7 +4085,12 @@ return 'clicked';
         if clicked == "clicked" or clicked == "no-button":
             if log_callback:
                 log_callback(f"[*] 已填写验证码并提交: {code}")
-            sleep_with_cancel(1.5, cancel_callback)
+            wait_for_post_code_transition(
+                page,
+                email,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
             return code
 
         sleep_with_cancel(0.5, cancel_callback)

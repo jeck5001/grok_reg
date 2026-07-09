@@ -1905,7 +1905,7 @@ return JSON.stringify({
 
 
 def build_profile_submit_script(action):
-    if action not in {"check", "submit", "diagnose"}:
+    if action not in {"check", "submit", "trigger", "diagnose"}:
         raise ValueError(f"Unsupported profile submit action: {action}")
     keywords = json.dumps(list(PROFILE_SUBMIT_KEYWORDS), ensure_ascii=False)
     action_json = json.dumps(action)
@@ -2015,6 +2015,21 @@ if (action === 'diagnose') {{
     }});
 }}
 const cf = cloudflareState();
+if (action === 'trigger') {{
+    // xAI 已改为“提交时才触发”的隐形 Turnstile：脚本已加载但不预渲染组件，
+    // 需主动执行并放行点击，让网站前端自行驱动 challenge 生成 token。
+    let executed = false;
+    try {{
+        if (window.turnstile && typeof window.turnstile.execute === 'function') {{
+            try {{ window.turnstile.execute(); executed = true; }} catch (e) {{}}
+        }}
+    }} catch (e) {{}}
+    const submitBtn = pickSubmitButton();
+    if (!submitBtn) return 'trigger-no-submit';
+    submitBtn.focus();
+    submitBtn.click();
+    return 'trigger-clicked:' + (executed ? '1' : '0');
+}}
 if (cf.startsWith('wait-cloudflare')) return cf;
 const submitBtn = pickSubmitButton();
 if (!submitBtn) return 'no-submit-button';
@@ -3922,6 +3937,24 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
+        # 资料已填过，且表单已从页面消失 => 提交已被隐形 Turnstile 驱动成功，页面已推进
+        if form_filled_once:
+            try:
+                progressed = page.run_js(
+                    """
+try {
+  const pwd = document.querySelector('input[name="password"], input[type="password"]');
+  const given = document.querySelector('input[name="givenName"], input[autocomplete="given-name"]');
+  return (!pwd && !given) ? 'gone' : 'present';
+} catch (e) { return 'present'; }
+                    """
+                )
+            except Exception:
+                progressed = "present"
+            if progressed == "gone":
+                if log_callback:
+                    log_callback(f"[*] 注册资料已提交，页面已跳转: {given_name} {family_name}")
+                return {"given_name": given_name, "family_name": family_name, "password": password}
         if not form_filled_once:
             filled = page.run_js(
                 """
@@ -3996,32 +4029,17 @@ return 'profile-filled';
                 now = time.time()
                 if wait_cf_since is None:
                     wait_cf_since = now
-                # 卡住后自动二次复用 Turnstile 组件
+                # 卡住后主动触发 Turnstile（提交时才验证的隐形模式）
                 if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
                     if log_callback:
-                        log_callback("[*] Cloudflare 验证卡住，开始二次复用 Turnstile...")
+                        log_callback("[*] Cloudflare 验证卡住，主动触发 Turnstile 并点击提交...")
                     try:
-                        token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
-                        if token:
-                            synced = page.run_js(
-                                """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                                """,
-                                token,
-                            )
-                            if log_callback:
-                                log_callback(f"[*] Turnstile 二次复用完成，回填长度={synced}")
+                        trig = page.run_js(build_profile_submit_script("trigger"))
+                        if log_callback:
+                            log_callback(f"[Debug] Turnstile 主动触发结果: {trig}")
                     except Exception as cf_exc:
                         if log_callback:
-                            log_callback(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
+                            log_callback(f"[Debug] Turnstile 主动触发失败: {cf_exc}")
                     last_cf_retry_at = now
                 sleep_with_cancel(0.8, cancel_callback)
                 continue
@@ -4047,29 +4065,14 @@ return String(cfInput.value || '').trim().length;
                 wait_cf_since = now
             if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
                 if log_callback:
-                    log_callback("[*] 提交前仍卡住，自动再次复用 Turnstile...")
+                    log_callback("[*] 提交前仍卡住，主动触发 Turnstile 并点击提交...")
                 try:
-                    token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
-                    if token:
-                        synced = page.run_js(
-                            """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                            """,
-                            token,
-                        )
-                        if log_callback:
-                            log_callback(f"[*] Turnstile 二次复用完成，回填长度={synced}")
+                    trig = page.run_js(build_profile_submit_script("trigger"))
+                    if log_callback:
+                        log_callback(f"[Debug] Turnstile 主动触发结果: {trig}")
                 except Exception as cf_exc:
                     if log_callback:
-                        log_callback(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
+                        log_callback(f"[Debug] Turnstile 主动触发失败: {cf_exc}")
                 last_cf_retry_at = now
             sleep_with_cancel(0.8, cancel_callback)
             continue
@@ -4156,29 +4159,39 @@ return 'final-page-clicked-submit';
                     log_callback(f"[Debug] 最终页状态: final-page-wait-cf, token长度={token_len}")
                     if now - last_cf_retry_at >= 10:
                         if log_callback:
-                            log_callback("[*] 最终页 Cloudflare 卡住，自动二次复用 Turnstile...")
+                            log_callback("[*] 最终页 Cloudflare 卡住，主动触发 Turnstile 并点击提交...")
                         try:
-                            token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
-                            if token:
-                                synced = page.run_js(
-                                    """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                                    """,
-                                    token,
-                                )
-                                if log_callback:
-                                    log_callback(f"[*] 最终页 Turnstile 二次复用完成，回填长度={synced}")
+                            trig = page.run_js(
+                                r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+let executed = false;
+try {
+    if (window.turnstile && typeof window.turnstile.execute === 'function') {
+        try { window.turnstile.execute(); executed = true; } catch (e) {}
+    }
+} catch (e) {}
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
+    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+});
+const submitBtn = buttons.find((node) => {
+    const t = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
+    return t.includes('完成注册') || t.includes('创建账户') || t.includes('sign up') || t.includes('createaccount');
+});
+if (submitBtn) { submitBtn.focus(); submitBtn.click(); }
+return 'final-trigger:' + (executed ? '1' : '0') + ':' + (submitBtn ? 'clicked' : 'no-btn');
+                                """
+                            )
+                            if log_callback:
+                                log_callback(f"[Debug] 最终页 Turnstile 主动触发结果: {trig}")
                         except Exception as cf_exc:
                             if log_callback:
-                                log_callback(f"[Debug] 最终页 Turnstile 二次复用失败: {cf_exc}")
+                                log_callback(f"[Debug] 最终页 Turnstile 主动触发失败: {cf_exc}")
                         last_cf_retry_at = now
 
             cookies = page.cookies(all_domains=True, all_info=True) or []

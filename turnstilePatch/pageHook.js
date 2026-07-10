@@ -50,6 +50,22 @@
                             return originalCallback.apply(this, arguments);
                         }
                     };
+                    ["error-callback", "expired-callback", "timeout-callback"].forEach(function (name) {
+                        var originalTerminalCallback = opts[name];
+                        wrappedOptions[name] = function () {
+                            try {
+                                var detail = Array.prototype.map.call(arguments, function (item) {
+                                    return String(item || "");
+                                }).join("|");
+                                recordError(name, detail || "triggered");
+                            } catch (e) {
+                                recordError(name, e);
+                            }
+                            if (typeof originalTerminalCallback === "function") {
+                                return originalTerminalCallback.apply(this, arguments);
+                            }
+                        };
+                    });
                     var id = originalRender(container, wrappedOptions);
                     try {
                         window.__grokTurnstile.renderCount += 1;

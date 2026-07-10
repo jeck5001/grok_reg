@@ -1487,6 +1487,16 @@ def test_final_page_executes_each_turnstile_widget_only_once():
     assert "final-page-wait-cf" in source
 
 
+def test_turnstile_hook_records_terminal_challenge_callbacks():
+    source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
+    page_hook = Path("turnstilePatch/pageHook.js").read_text(encoding="utf-8")
+
+    assert '"error-callback"' in page_hook
+    assert '"expired-callback"' in page_hook
+    assert '"timeout-callback"' in page_hook
+    assert "errors: Array.isArray(rawHook.errors)" in source
+
+
 def test_wait_for_sso_cookie_uses_native_click_for_final_page(monkeypatch):
     events = []
 

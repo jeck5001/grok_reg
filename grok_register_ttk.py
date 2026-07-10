@@ -4947,6 +4947,7 @@ if (cfPresent) {
                 executeCount: rawHook.executeCount || 0,
                 callbackCount: rawHook.callbackCount || 0,
                 executedWidgetIds: executedWidgetIds.slice(-5),
+                errors: Array.isArray(rawHook.errors) ? rawHook.errors.slice(-5) : [],
             },
         };
     }

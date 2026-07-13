@@ -1638,12 +1638,14 @@ def test_yyds_code_polling_triggers_resend_callback(monkeypatch):
     assert resend_calls
 
 
-def test_docker_runs_visible_chromium_under_xvfb_by_default():
+def test_docker_starts_web_server_directly_and_keeps_xvfb_for_registration():
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     compose = Path("docker-compose.yml").read_text(encoding="utf-8")
 
     assert 'GROK_REG_HEADLESS=0' in dockerfile
-    assert 'xvfb-run' in dockerfile
+    assert '        xvfb \\' in dockerfile
+    assert 'CMD ["uvicorn", "web_app:app", "--host", "0.0.0.0", "--port", "8787"]' in dockerfile
+    assert 'xvfb-run' not in dockerfile
     assert 'GROK_REG_HEADLESS: "0"' in compose
 
 

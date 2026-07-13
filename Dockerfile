@@ -35,4 +35,4 @@ RUN mkdir -p /app/data
 
 EXPOSE 8787
 
-CMD ["xvfb-run", "-a", "-s", "-screen 0 1365x900x24", "uvicorn", "web_app:app", "--host", "0.0.0.0", "--port", "8787"]
+CMD ["uvicorn", "web_app:app", "--host", "0.0.0.0", "--port", "8787"]

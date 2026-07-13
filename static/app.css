@@ -717,6 +717,18 @@ td {
   min-width: 150px;
 }
 
+.status-column {
+  max-width: 132px;
+  width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+td.status-column[title] {
+  cursor: help;
+}
+
 td.empty {
   color: var(--muted);
   text-align: center;

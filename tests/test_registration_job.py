@@ -67,6 +67,35 @@ def test_validate_registration_config_limits_cpa_push_workers():
     assert settings["cpa_push_workers"] == 10
 
 
+def test_validate_registration_config_normalizes_risk_controls():
+    settings = reg.validate_registration_config(
+        {
+            "email_provider": "duckmail",
+            "thread_start_interval": "99",
+            "account_interval_seconds": "-3",
+            "account_interval_jitter_seconds": "999",
+            "stop_on_consecutive_blocks": "80",
+            "enable_nsfw": "false",
+        }
+    )
+
+    assert settings["thread_start_interval"] == 60.0
+    assert settings["account_interval_seconds"] == 0.0
+    assert settings["account_interval_jitter_seconds"] == 300.0
+    assert settings["stop_on_consecutive_blocks"] == 50
+    assert settings["enable_nsfw"] is False
+
+
+def test_is_account_blocked_error_detects_xai_blocked_payload():
+    assert reg.is_account_blocked_error(
+        'xAI OAuth refresh HTTP 400: {"error":"invalid_grant","error_description":"User account is blocked"}'
+    )
+    assert reg.is_account_blocked_error("失败：账号已封禁")
+    assert not reg.is_account_blocked_error(
+        '{"error":"invalid_grant","error_description":"Refresh token has been revoked"}'
+    )
+
+
 def test_load_config_resets_defaults_when_data_directory_has_no_config(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(
@@ -425,6 +454,40 @@ def test_registration_job_stop_request_sets_stopped_status(monkeypatch, tmp_path
 
     assert status["status"] == "stopped"
     assert status["stop_requested"] is True
+
+
+def test_registration_job_stops_after_consecutive_account_blocks(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "stop_browser", lambda: None)
+    monkeypatch.setattr(reg, "restart_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+
+    def blocked_registration(self, idx, total, logf):
+        raise Exception(
+            'xAI OAuth refresh HTTP 400: {"error":"invalid_grant","error_description":"User account is blocked"}'
+        )
+
+    monkeypatch.setattr(reg.RegistrationJob, "_run_single_registration", blocked_registration)
+
+    job = reg.RegistrationJob(
+        {
+            "email_provider": "duckmail",
+            "register_count": 6,
+            "register_threads": 1,
+            "account_interval_seconds": 0,
+            "account_interval_jitter_seconds": 0,
+            "stop_on_consecutive_blocks": 3,
+        }
+    )
+    job.start()
+    status = wait_for_job(job)
+
+    assert status["status"] == "failed"
+    assert status["fail_count"] == 3
+    assert status["block_stop_triggered"] is True
+    assert status["consecutive_blocks"] == 3
+    assert any("连续 3 个账号出现封禁信号" in line for line in job.logs())
 
 
 def test_optional_tkinter_import_handles_missing_shared_library():

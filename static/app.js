@@ -42,11 +42,12 @@ const ACCOUNT_COLUMNS = [
   { key: "source", label: "来源文件", className: "source-column" },
   { key: "index", label: "序号" },
   { key: "password", label: "密码" },
-  { key: "health", label: "健康状态" },
-  { key: "grok2api", label: "grok2api" },
-  { key: "sub2api", label: "sub2api" },
-  { key: "cpa", label: "CPA" },
+  { key: "health", label: "健康状态", className: "status-column" },
+  { key: "grok2api", label: "grok2api", className: "status-column" },
+  { key: "sub2api", label: "sub2api", className: "status-column" },
+  { key: "cpa", label: "CPA", className: "status-column" },
 ];
+const STATUS_COLUMN_KEYS = new Set(["health", "grok2api", "sub2api", "cpa"]);
 const DEFAULT_ACCOUNT_TABLE_PREFS = {
   visibleColumns: ACCOUNT_COLUMNS.map((column) => column.key),
   pageSize: 20,
@@ -98,6 +99,10 @@ function formPayload() {
   data.cpa_auto_push_remote = form.elements.cpa_auto_push_remote.checked;
   data.register_count = Number(data.register_count || 1);
   data.register_threads = Number(data.register_threads || 1);
+  data.thread_start_interval = Number(data.thread_start_interval || 2);
+  data.account_interval_seconds = Number(data.account_interval_seconds || 12);
+  data.account_interval_jitter_seconds = Number(data.account_interval_jitter_seconds || 8);
+  data.stop_on_consecutive_blocks = Number(data.stop_on_consecutive_blocks || 3);
   data.sub2api_concurrency = Number(data.sub2api_concurrency || 3);
   data.sub2api_priority = Number(data.sub2api_priority || 50);
   data.cpa_push_workers = Number(data.cpa_push_workers || 3);
@@ -302,6 +307,40 @@ function accountCellValue(account, key, rowNumber) {
     cpa: cpaStatus,
   };
   return values[key] ?? "";
+}
+
+function summarizeFailureStatus(text) {
+  const lower = String(text || "").toLowerCase();
+  if (lower.includes("user account is blocked") || lower.includes("account is blocked")) {
+    return "失败：账号已封禁";
+  }
+  if (lower.includes("revoked")) return "失败：令牌已撤销";
+  if (lower.includes("invalid_grant")) return "失败：令牌无效";
+  if (lower.includes("缺少 refresh") || lower.includes("缺少refresh")) return "失败：缺少 Refresh";
+  if (lower.includes("retry_with_sso_failed")) return "失败：SSO 重试失败";
+  if (lower.includes("http 401") || lower.includes("unauthorized")) return "失败：HTTP 401";
+  if (lower.includes("http 403") || lower.includes("forbidden")) return "失败：HTTP 403";
+  if (lower.includes("http 404")) return "失败：HTTP 404";
+  if (lower.includes("http 429")) return "失败：请求过多";
+  if (lower.includes("http 502") || lower.includes("http 503") || lower.includes("http 504")) {
+    return "失败：服务异常";
+  }
+  if (lower.includes("http 400")) return "失败：HTTP 400";
+  if (lower.includes("timeout") || lower.includes("超时")) return "失败：超时";
+  return "失败";
+}
+
+function formatAccountStatusDisplay(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return { display: "", title: "", tone: "" };
+  if (text === "已推送" || text === "可用") return { display: text, title: "", tone: "ok" };
+  if (text === "推送中" || text === "检查中") return { display: text, title: "", tone: "running" };
+  if (text === "失效" || text === "资料不完整") return { display: text, title: "", tone: "failed" };
+  if (text.startsWith("失败") || text === "推送失败") {
+    return { display: summarizeFailureStatus(text), title: text, tone: "failed" };
+  }
+  if (text.length > 24) return { display: `${text.slice(0, 22)}…`, title: text, tone: "" };
+  return { display: text, title: "", tone: "" };
 }
 
 function dashboardMetricValue(element, value) {
@@ -540,14 +579,23 @@ function renderAccounts() {
         continue;
       }
       const value = accountCellValue(account, column.key, rowNumber);
-      cell.textContent = String(value ?? "");
+      const rawText = String(value ?? "");
+      if (STATUS_COLUMN_KEYS.has(column.key)) {
+        const formatted = formatAccountStatusDisplay(rawText);
+        cell.textContent = formatted.display;
+        if (formatted.title) cell.title = formatted.title;
+        if (formatted.tone === "ok") cell.classList.add("push-ok");
+        if (formatted.tone === "running") cell.classList.add("push-running");
+        if (formatted.tone === "failed") cell.classList.add("push-failed");
+      } else {
+        cell.textContent = rawText;
+        if (rawText === "已推送" || rawText === "可用") cell.classList.add("push-ok");
+        if (rawText === "推送中" || rawText === "检查中") cell.classList.add("push-running");
+        if (rawText.startsWith("失败") || rawText === "失效" || rawText === "资料不完整") {
+          cell.classList.add("push-failed");
+        }
+      }
       if (column.className) cell.classList.add(column.className);
-      if (value === "已推送") cell.classList.add("push-ok");
-      if (value === "可用") cell.classList.add("push-ok");
-      if (value === "推送中") cell.classList.add("push-running");
-      if (value === "检查中") cell.classList.add("push-running");
-      if (String(value).startsWith("失败")) cell.classList.add("push-failed");
-      if (value === "失效" || value === "资料不完整") cell.classList.add("push-failed");
       row.appendChild(cell);
     }
     accountsBody.appendChild(row);

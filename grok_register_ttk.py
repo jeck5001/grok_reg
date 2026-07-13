@@ -80,7 +80,8 @@ DEFAULT_CONFIG = {
     "cloudflare_path_token": "/token",
     "cloudflare_path_messages": "/messages",
     "proxy": "http://127.0.0.1:7890",
-    "enable_nsfw": True,
+    # 注册成功后立刻改 NSFW/生日等特征，容易被当成机器号；默认关闭，需要时再开。
+    "enable_nsfw": False,
     "register_count": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     "grok2api_auto_add_local": True,
@@ -103,7 +104,13 @@ DEFAULT_CONFIG = {
     "cpa_management_key": "",
     "cpa_push_workers": 3,
     "register_threads": 1,
-    "thread_start_interval": 0.8,
+    # 线程启动错开，避免同一秒内多开浏览器打到同一出口。
+    "thread_start_interval": 2.0,
+    # 同线程相邻账号间隔 + 抖动，降低“工厂流水线”节奏。
+    "account_interval_seconds": 12,
+    "account_interval_jitter_seconds": 8,
+    # 连续检测到账号封禁时熔断，避免同 IP/代理继续批量送死。
+    "stop_on_consecutive_blocks": 3,
     "show_tutorial_on_start": True,
     "cloudmail_url": "",
     "cloudmail_admin_email": "",
@@ -514,6 +521,17 @@ def _sub2api_error_text(exc, step=""):
 def is_refresh_token_revoked_error(error_text):
     text = str(error_text or "").lower()
     return "invalid_grant" in text or "revoked" in text or "refresh token has been revoked" in text
+
+
+def is_account_blocked_error(error_text):
+    text = str(error_text or "").lower()
+    return (
+        "user account is blocked" in text
+        or "account is blocked" in text
+        or "account has been blocked" in text
+        or "账号已封禁" in text
+        or "账号被封" in text
+    )
 
 
 def is_xai_refresh_token_client_error(exc):
@@ -3164,6 +3182,24 @@ def validate_registration_config(settings):
     normalized["register_threads"] = _parse_positive_int(
         normalized.get("register_threads"), 1, minimum=1, maximum=10
     )
+    try:
+        start_interval = float(normalized.get("thread_start_interval", 2.0))
+    except Exception:
+        start_interval = 2.0
+    normalized["thread_start_interval"] = max(0.0, min(start_interval, 60.0))
+    try:
+        account_interval = float(normalized.get("account_interval_seconds", 12))
+    except Exception:
+        account_interval = 12.0
+    normalized["account_interval_seconds"] = max(0.0, min(account_interval, 600.0))
+    try:
+        account_jitter = float(normalized.get("account_interval_jitter_seconds", 8))
+    except Exception:
+        account_jitter = 8.0
+    normalized["account_interval_jitter_seconds"] = max(0.0, min(account_jitter, 300.0))
+    normalized["stop_on_consecutive_blocks"] = _parse_positive_int(
+        normalized.get("stop_on_consecutive_blocks"), 3, minimum=0, maximum=50
+    )
     normalized["sub2api_concurrency"] = _parse_positive_int(
         normalized.get("sub2api_concurrency"), 3, minimum=0, maximum=1000
     )
@@ -3236,6 +3272,8 @@ class RegistrationJob:
         self.results = []
         self.stop_requested = False
         self.fatal_error = False
+        self.consecutive_blocks = 0
+        self.block_stop_triggered = False
         self.created_at = datetime.datetime.now().isoformat(timespec="seconds")
         self.started_at = None
         self.finished_at = None
@@ -3281,6 +3319,8 @@ class RegistrationJob:
         with self.stats_lock:
             success_count = self.success_count
             fail_count = self.fail_count
+            consecutive_blocks = self.consecutive_blocks
+            block_stop_triggered = self.block_stop_triggered
         return {
             "id": self.id,
             "status": self.status_value,
@@ -3288,12 +3328,54 @@ class RegistrationJob:
             "fail_count": fail_count,
             "register_count": self.settings.get("register_count", 1),
             "register_threads": self.settings.get("register_threads", 1),
+            "consecutive_blocks": consecutive_blocks,
+            "block_stop_triggered": block_stop_triggered,
             "stop_requested": self.stop_requested,
             "output_file": self.output_file,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
         }
+
+    def _note_registration_outcome(self, success, error_text="", logf=None):
+        threshold = int(self.settings.get("stop_on_consecutive_blocks", 3) or 0)
+        with self.stats_lock:
+            if success:
+                self.consecutive_blocks = 0
+                return False
+            blocked = is_account_blocked_error(error_text)
+            if blocked:
+                self.consecutive_blocks += 1
+            else:
+                self.consecutive_blocks = 0
+            hit_threshold = bool(threshold and blocked and self.consecutive_blocks >= threshold)
+            if hit_threshold:
+                self.block_stop_triggered = True
+                self.fatal_error = True
+                self.stop_requested = True
+                consecutive = self.consecutive_blocks
+            else:
+                consecutive = self.consecutive_blocks
+        if hit_threshold and logf:
+            logf(
+                f"[!] 连续 {consecutive} 个账号出现封禁信号，触发熔断停止剩余任务。"
+                "请更换代理/出口 IP 或降低并发后重试。"
+            )
+        elif blocked and logf and threshold:
+            logf(f"[!] 检测到账号封禁信号（连续 {consecutive}/{threshold}）")
+        return hit_threshold
+
+    def _account_pause_seconds(self):
+        base = float(self.settings.get("account_interval_seconds", 12) or 0)
+        jitter = float(self.settings.get("account_interval_jitter_seconds", 8) or 0)
+        base = max(0.0, base)
+        jitter = max(0.0, jitter)
+        if base <= 0 and jitter <= 0:
+            return 0.0
+        delay = base
+        if jitter > 0:
+            delay += random.uniform(0.0, jitter)
+        return max(0.0, delay)
 
     def _run_single_registration(self, idx, total, logf):
         email = ""
@@ -3416,6 +3498,7 @@ class RegistrationJob:
         }
         add_token_to_grok2api_pools(sso, email=email, log_callback=logf)
         auto_push_registered_account(account, self.settings, log_callback=logf)
+        self._note_registration_outcome(True, logf=logf)
         logf(f"[+] 注册成功: {email}")
 
     def _worker_loop(self, worker_id, total, task_queue):
@@ -3445,10 +3528,16 @@ class RegistrationJob:
                 except Exception as exc:
                     with self.stats_lock:
                         self.fail_count += 1
+                    self._note_registration_outcome(False, str(exc), logf=logf)
                     logf(f"[-] 注册失败: {exc}")
                 finally:
                     should_stop_after_task = self.should_stop()
-                    if not should_stop_after_task:
+                    has_more_tasks = (not task_queue.empty()) and (not should_stop_after_task)
+                    if has_more_tasks:
+                        pause_seconds = self._account_pause_seconds()
+                        if pause_seconds > 0:
+                            logf(f"[*] 账号间隔等待 {pause_seconds:.1f}s，降低批量节奏")
+                            sleep_with_cancel(pause_seconds, self.should_stop)
                         restart_browser(log_callback=logf)
                         sleep_with_cancel(1, self.should_stop)
                 if should_stop_after_task:
@@ -3467,12 +3556,20 @@ class RegistrationJob:
         for i in range(1, count + 1):
             task_queue.put(i)
         workers = []
+        account_interval = float(self.settings.get("account_interval_seconds", 12) or 0)
+        account_jitter = float(self.settings.get("account_interval_jitter_seconds", 8) or 0)
+        block_threshold = int(self.settings.get("stop_on_consecutive_blocks", 3) or 0)
         self.log(f"[*] 配置已保存，开始执行。目标数量: {count}，并发线程: {worker_count}")
+        self.log(
+            f"[*] 风控节奏: 账号间隔 {account_interval:.1f}s ±{account_jitter:.1f}s，"
+            f"连续封禁熔断 {block_threshold or '关闭'}，"
+            f"注册后 NSFW={'开' if self.settings.get('enable_nsfw') else '关'}"
+        )
         self.log(f"[*] 成功账号将实时保存到: {os.path.join(get_data_dir(), self.output_file)}")
         try:
-            start_interval = float(self.settings.get("thread_start_interval", 0.8))
+            start_interval = float(self.settings.get("thread_start_interval", 2.0))
         except Exception:
-            start_interval = 0.8
+            start_interval = 2.0
         start_interval = max(0.0, start_interval)
 
         try:

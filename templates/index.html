@@ -122,15 +122,32 @@
                   并发线程
                   <input name="register_threads" type="number" min="1" max="10" value="1" />
                 </label>
+                <label>
+                  线程启动间隔(秒)
+                  <input name="thread_start_interval" type="number" min="0" max="60" step="0.1" value="2" />
+                </label>
+                <label>
+                  账号间隔(秒)
+                  <input name="account_interval_seconds" type="number" min="0" max="600" step="1" value="12" />
+                </label>
+                <label>
+                  间隔抖动(秒)
+                  <input name="account_interval_jitter_seconds" type="number" min="0" max="300" step="1" value="8" />
+                </label>
+                <label>
+                  连续封禁熔断
+                  <input name="stop_on_consecutive_blocks" type="number" min="0" max="50" step="1" value="3" title="连续出现账号封禁信号时停止任务，0 表示关闭" />
+                </label>
                 <label class="wide">
                   代理
                   <input name="proxy" placeholder="Docker 内会把 127.0.0.1 自动映射到 NAS 主机，如 http://127.0.0.1:7890" />
                 </label>
                 <label class="check">
                   <input name="enable_nsfw" type="checkbox" />
-                  注册后开启 NSFW
+                  注册后开启 NSFW（建议关闭，降低封号风险）
                 </label>
               </div>
+              <p class="hint">建议：并发先 1，代理用干净住宅 IP，账号间隔 10–20 秒；连续封禁时自动熔断，避免同出口继续送死。</p>
             </section>
 
             <section class="config-section" data-config-section="邮箱服务">

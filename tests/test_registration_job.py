@@ -1779,6 +1779,7 @@ def test_export_and_push_cpa_credential_writes_management_auth_file(monkeypatch,
         captured["url"] = url
         captured["headers"] = kwargs["headers"]
         captured["multipart"] = kwargs["multipart"]
+        captured["proxies"] = kwargs["proxies"]
         return FakeResponse()
 
     monkeypatch.setattr(reg, "http_post", fake_post)
@@ -1806,6 +1807,7 @@ def test_export_and_push_cpa_credential_writes_management_auth_file(monkeypatch,
     assert result["ok"] is True
     assert captured["url"] == "https://cpa.example.test/v0/management/auth-files"
     assert captured["headers"]["Authorization"] == "Bearer management-secret"
+    assert captured["proxies"] == {}
     assert captured["multipart"].parts == [
         {
             "name": "file",

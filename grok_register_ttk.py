@@ -1955,6 +1955,7 @@ def export_and_push_cpa_credential(email, refresh_token, settings=None, log_call
             headers={"Authorization": f"Bearer {management_key}"},
             multipart=multipart,
             timeout=30,
+            proxies={},
         )
         response.raise_for_status()
         result["uploaded"] = True

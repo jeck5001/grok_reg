@@ -1939,7 +1939,10 @@ def test_import_accounts_to_cpa_reacquires_refresh_token_with_sso_after_http_400
     class RefreshTokenError(Exception):
         def __init__(self):
             super().__init__("HTTP Error 400: ")
-            self.response = type("Response", (), {"status_code": 400, "text": ""})()
+            self.code = 400
+
+        def read(self):
+            return b'{"error":"invalid_grant","error_description":"Refresh token has been revoked"}'
 
     def fake_export(email, refresh_token, settings, log_callback=None):
         calls.append(refresh_token)

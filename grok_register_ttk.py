@@ -485,8 +485,20 @@ def account_health_status_text(status):
 
 def _sub2api_error_text(exc, step=""):
     response = getattr(exc, "response", None)
-    status_code = getattr(response, "status_code", None)
+    status_code = (
+        getattr(response, "status_code", None)
+        or getattr(exc, "status_code", None)
+        or getattr(exc, "code", None)
+    )
     text = getattr(response, "text", "") if response is not None else ""
+    if not text:
+        reader = getattr(exc, "read", None)
+        if callable(reader):
+            try:
+                body = reader()
+                text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body or "")
+            except Exception:
+                text = ""
     message = str(exc)
     if status_code:
         message = f"{step + ' ' if step else ''}HTTP {status_code}: {text or message}"
@@ -502,9 +514,13 @@ def is_refresh_token_revoked_error(error_text):
 
 def is_xai_refresh_token_client_error(exc):
     response = getattr(exc, "response", None)
-    status_code = getattr(response, "status_code", None)
+    status_code = (
+        getattr(response, "status_code", None)
+        or getattr(exc, "status_code", None)
+        or getattr(exc, "code", None)
+    )
     text = _sub2api_error_text(exc).lower()
-    return status_code == 400 or "http 400" in text or is_refresh_token_revoked_error(text)
+    return str(status_code) == "400" or "http 400" in text or "http error 400" in text or is_refresh_token_revoked_error(text)
 
 
 def attach_account_status(account, statuses=None):

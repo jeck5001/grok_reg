@@ -1,3 +1,5 @@
+import base64
+import json
 import time
 from pathlib import Path
 
@@ -56,6 +58,20 @@ def test_validate_registration_config_keeps_auto_push_switches():
     assert settings["sub2api_auto_import_remote"] is True
 
 
+def test_load_config_resets_defaults_when_data_directory_has_no_config(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        reg,
+        "config",
+        {**reg.DEFAULT_CONFIG, "cpa_auto_push_remote": True, "cpa_management_key": "stale-key"},
+    )
+
+    settings = reg.load_config()
+
+    assert settings["cpa_auto_push_remote"] is False
+    assert settings["cpa_management_key"] == ""
+
+
 def test_registration_job_runs_successfully(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))
@@ -109,6 +125,45 @@ def test_registration_job_runs_successfully(monkeypatch, tmp_path):
         encoding="utf-8"
     )
     assert any("注册成功" in line for line in job.logs())
+
+
+def test_registration_job_pushes_cpa_after_refresh_token_when_enabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(reg, "open_signup_page", lambda **kwargs: None)
+    monkeypatch.setattr(reg, "fill_email_and_submit", lambda **kwargs: ("user@example.com", "mail-token"))
+    monkeypatch.setattr(reg, "fill_code_and_submit", lambda *args, **kwargs: "123456")
+    monkeypatch.setattr(
+        reg,
+        "fill_profile_and_submit",
+        lambda **kwargs: {"given_name": "Ada", "family_name": "Lovelace", "password": "secret"},
+    )
+    monkeypatch.setattr(reg, "wait_for_sso_cookie", lambda **kwargs: "sso-token")
+    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda *args, **kwargs: "refresh-token")
+    monkeypatch.setattr(reg, "add_token_to_grok2api_pools", lambda *args, **kwargs: None)
+    monkeypatch.setattr(reg, "auto_push_registered_account", lambda *args, **kwargs: None)
+    pushed = []
+    monkeypatch.setattr(
+        reg,
+        "export_and_push_cpa_credential",
+        lambda email, refresh_token, settings, log_callback=None: pushed.append(
+            (email, refresh_token, settings)
+        )
+        or {"ok": True, "uploaded": True},
+    )
+
+    job = reg.RegistrationJob(
+        {
+            "email_provider": "duckmail",
+            "register_count": 1,
+            "register_threads": 1,
+            "cpa_auto_push_remote": True,
+            "cpa_management_base": "https://cpa.example.test",
+            "cpa_management_key": "management-secret",
+        }
+    )
+    job._run_single_registration(1, 1, lambda message: None)
+
+    assert pushed == [("user@example.com", "refresh-token", job.settings)]
 
 
 def test_registration_job_retries_when_profile_session_returns_to_signup(monkeypatch, tmp_path):
@@ -1497,6 +1552,29 @@ def test_turnstile_hook_records_terminal_challenge_callbacks():
     assert "errors: Array.isArray(rawHook.errors)" in source
 
 
+def test_turnstile_challenge_target_uses_a_real_cdp_click():
+    events = []
+
+    class FakePage:
+        def run_js(self, script):
+            assert "turnstile-challenge-target" in script
+            return {"state": "turnstile-challenge-target", "x": 111, "y": 222}
+
+        def run_cdp(self, method, **params):
+            events.append((method, params))
+
+    result = reg._click_turnstile_challenge_if_visible(FakePage())
+
+    assert result["nativeClicked"] is True
+    assert any(
+        method == "Input.dispatchMouseEvent"
+        and params.get("type") == "mousePressed"
+        and params.get("x") == 111
+        and params.get("y") == 222
+        for method, params in events
+    )
+
+
 def test_wait_for_sso_cookie_uses_native_click_for_final_page(monkeypatch):
     events = []
 
@@ -1653,6 +1731,113 @@ def test_turnstile_page_hook_installs_with_cdp(monkeypatch):
     assert events[1][1]["expression"] == "window.__grokTurnstileHookInstalled = true;"
 
 
+def test_export_and_push_cpa_credential_writes_management_auth_file(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 201
+        text = '{"status":"ok"}'
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["headers"] = kwargs["headers"]
+        captured["filename"] = kwargs["files"]["file"][0]
+        return FakeResponse()
+
+    monkeypatch.setattr(reg, "http_post", fake_post)
+    monkeypatch.setattr(
+        reg,
+        "exchange_xai_refresh_token",
+        lambda token, settings=None: {
+            "access_token": "access-token",
+            "refresh_token": "rotated-refresh-token",
+        },
+    )
+
+    result = reg.export_and_push_cpa_credential(
+        "user@example.com",
+        "refresh-token",
+        {
+            "cpa_auth_dir": str(tmp_path),
+            "cpa_auto_push_remote": True,
+            "cpa_management_base": "https://cpa.example.test/v0/management",
+            "cpa_management_key": "management-secret",
+        },
+    )
+
+    assert result["ok"] is True
+    assert captured["url"] == "https://cpa.example.test/v0/management/auth-files"
+    assert captured["headers"]["Authorization"] == "Bearer management-secret"
+    assert captured["filename"] == "xai-user@example.com.json"
+    payload = json.loads(tmp_path.joinpath(captured["filename"]).read_text(encoding="utf-8"))
+    assert payload["type"] == "xai"
+    assert payload["refresh_token"] == "rotated-refresh-token"
+
+
+def test_export_and_push_cpa_credential_keeps_local_file_when_upload_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        reg,
+        "exchange_xai_refresh_token",
+        lambda token, settings=None: {
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+        },
+    )
+    monkeypatch.setattr(
+        reg,
+        "http_post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("network down")),
+    )
+
+    result = reg.export_and_push_cpa_credential(
+        "user@example.com",
+        "refresh-token",
+        {
+            "cpa_auth_dir": str(tmp_path),
+            "cpa_auto_push_remote": True,
+            "cpa_management_base": "https://cpa.example.test",
+            "cpa_management_key": "management-secret",
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["upload_error"] == "network down"
+    assert tmp_path.joinpath("xai-user@example.com.json").is_file()
+
+
+def test_export_and_push_cpa_credential_derives_xai_metadata_from_access_token(monkeypatch, tmp_path):
+    def encode_segment(value):
+        raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    access_token = ".".join(
+        [
+            encode_segment({"alg": "none"}),
+            encode_segment({"sub": "account-123", "iat": 1_700_000_000, "exp": 1_700_000_100}),
+            "signature",
+        ]
+    )
+    monkeypatch.setattr(
+        reg,
+        "exchange_xai_refresh_token",
+        lambda token, settings=None: {"access_token": access_token, "refresh_token": "refresh-token"},
+    )
+
+    result = reg.export_and_push_cpa_credential(
+        "user@example.com",
+        "refresh-token",
+        {"cpa_auth_dir": str(tmp_path)},
+    )
+
+    payload = json.loads(Path(result["path"]).read_text(encoding="utf-8"))
+    assert payload["sub"] == "account-123"
+    assert payload["expires_in"] == 100
+    assert payload["expired"] == "2023-11-14T22:15:00Z"
+
+
 def test_docker_visible_browser_keeps_linux_startup_flags(monkeypatch):
     class FakeOptions:
         def __init__(self):
@@ -1804,8 +1989,11 @@ def test_web_console_exposes_auto_push_switches():
 
     assert 'name="grok2api_auto_add_remote"' in html
     assert 'name="sub2api_auto_import_remote"' in html
+    assert 'name="cpa_auto_push_remote"' in html
+    assert 'name="cpa_management_key"' in html
     assert "data.grok2api_auto_add_remote" in js
     assert "data.sub2api_auto_import_remote" in js
+    assert "data.cpa_auto_push_remote" in js
 
 
 def test_web_console_exposes_account_table_controls():

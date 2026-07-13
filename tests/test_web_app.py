@@ -101,6 +101,29 @@ def test_sub2api_config_round_trip_masks_sensitive_values(monkeypatch, tmp_path)
     assert "admin-secret" in saved
 
 
+def test_cpa_management_config_round_trip_masks_management_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    from web_app import app
+
+    client = TestClient(app)
+    response = client.put(
+        "/api/config",
+        json={
+            "email_provider": "duckmail",
+            "cpa_auto_push_remote": True,
+            "cpa_management_base": "https://cpa.example.test",
+            "cpa_management_key": "management-secret",
+            "register_count": 1,
+            "register_threads": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["cpa_management_key"] == "********"
+    saved = tmp_path.joinpath("config.json").read_text(encoding="utf-8")
+    assert "management-secret" in saved
+
+
 def test_accounts_endpoint_lists_registered_accounts(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(

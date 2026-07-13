@@ -2,7 +2,8 @@
 
 ## Goal
 
-After a registration job successfully exports an `xai-*.json` CPA credential,
+After a registration job obtains its xAI OAuth refresh token, exchange it for
+an access token, write a CPA-compatible `xai-*.json` credential, and
 optionally upload that credential to a remote CLI Proxy API / CPA instance.
 The registration result remains successful when the remote upload fails.
 
@@ -31,14 +32,17 @@ toggle is enabled and both base and key are non-empty.
 
 ## Data Flow
 
-1. The existing CPA mint process writes the local `xai-*.json` file.
-2. The export wrapper calls a dedicated upload helper when remote push is
-   configured.
-3. The helper validates the local file, normalizes the API URL, sends a
-   multipart upload using the Management API key, and records the status.
-4. Successful pushes are logged with the target host and credential filename.
+1. The existing registration OAuth flow obtains a refresh token.
+2. A refresh-token grant obtains a current access token and builds a
+   CPA-compatible xAI credential with the existing client constants.
+3. The credential is atomically written as `xai-<email>.json` in the data
+   directory's CPA credential folder.
+4. The upload helper runs when remote push is configured, validates the local
+   file, normalizes the API URL, sends a multipart upload using the Management
+   API key, and records the status.
+5. Successful pushes are logged with the target host and credential filename.
    Keys and credential contents never appear in logs.
-5. Failed pushes add `upload_error` to the export result and log the HTTP or
+6. Failed pushes add `upload_error` to the export result and log the HTTP or
    network failure. They do not fail registration or discard the local file.
 
 ## Error Handling

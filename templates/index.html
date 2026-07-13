@@ -279,6 +279,31 @@
                 </label>
               </div>
             </section>
+
+            <section class="config-section" data-config-section="CPA">
+              <div class="section-copy">
+                <p class="section-kicker">CPA</p>
+                <h2>Management API 凭证推送</h2>
+              </div>
+              <div class="config-grid">
+                <label class="wide">
+                  CPA 管理地址
+                  <input name="cpa_management_base" placeholder="https://cpa.example.com 或 https://cpa.example.com/v0/management" />
+                </label>
+                <label>
+                  CPA 管理密钥
+                  <input name="cpa_management_key" type="password" autocomplete="off" />
+                </label>
+                <label>
+                  本地凭证目录
+                  <input name="cpa_auth_dir" placeholder="cpa_auths" />
+                </label>
+                <label class="check wide">
+                  <input name="cpa_auto_push_remote" type="checkbox" />
+                  注册成功后生成并自动推送 CPA xAI 凭证
+                </label>
+              </div>
+            </section>
           </form>
 
           <aside class="control-panel">

@@ -15,6 +15,7 @@ SENSITIVE_KEYS = {
     "cloudmail_password",
     "grok2api_remote_app_key",
     "sub2api_admin_token",
+    "cpa_management_key",
     "yyds_api_key",
     "yyds_jwt",
 }

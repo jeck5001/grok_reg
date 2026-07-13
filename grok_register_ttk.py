@@ -16,6 +16,7 @@ import struct
 import random
 import re
 import string
+import tempfile
 import json
 import uuid
 import subprocess
@@ -94,6 +95,10 @@ DEFAULT_CONFIG = {
     "sub2api_group_ids": "",
     "sub2api_concurrency": 3,
     "sub2api_priority": 50,
+    "cpa_auth_dir": "cpa_auths",
+    "cpa_auto_push_remote": False,
+    "cpa_management_base": "",
+    "cpa_management_key": "",
     "register_threads": 1,
     "thread_start_interval": 0.8,
     "show_tutorial_on_start": True,
@@ -108,6 +113,14 @@ XAI_GROK_OAUTH_TOKEN_URL = "https://auth.x.ai/oauth2/token"
 XAI_GROK_OAUTH_SCOPE = "openid profile email offline_access grok-cli:access api:access"
 XAI_GROK_OAUTH_REDIRECT_URI = "http://127.0.0.1:56121/callback"
 XAI_GROK_API_BASE_URL = "https://api.x.ai/v1"
+CPA_DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+CPA_CLIENT_HEADERS = {
+    "x-grok-client-version": "0.2.93",
+    "x-xai-token-auth": "xai-grok-cli",
+    "x-authenticateresponse": "authenticate-response",
+    "x-grok-client-identifier": "grok-shell",
+    "User-Agent": "grok-shell/0.2.93 (linux; x86_64)",
+}
 
 config = DEFAULT_CONFIG.copy()
 _cf_domain_index = 0
@@ -139,6 +152,7 @@ class ProfileSessionLost(Exception):
 
 def load_config():
     global config
+    config = DEFAULT_CONFIG.copy()
     config_file = get_config_file()
     if os.path.exists(config_file):
         try:
@@ -1478,6 +1492,59 @@ def _dispatch_cdp_text(page, text):
     page.run_cdp("Input.insertText", text=str(text or ""))
 
 
+def _click_turnstile_challenge_if_visible(page):
+    target = page.run_js(
+        r"""
+// turnstile-challenge-target
+function visible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+}
+const frames = [];
+function visit(root) {
+    if (!root || !root.querySelectorAll) return;
+    for (const node of Array.from(root.querySelectorAll('*'))) {
+        if (node.shadowRoot) visit(node.shadowRoot);
+        if (String(node.tagName || '').toLowerCase() !== 'iframe') continue;
+        const marker = [
+            node.getAttribute('src'),
+            node.getAttribute('title'),
+            node.getAttribute('name'),
+            node.id,
+            node.className,
+        ].join(' ').toLowerCase();
+        if (marker.includes('challenge') || marker.includes('turnstile')) frames.push(node);
+    }
+}
+visit(document);
+const targetFrame = frames.find(visible);
+if (!targetFrame) return { state: 'turnstile-challenge-not-found', count: frames.length };
+const rect = targetFrame.getBoundingClientRect();
+return {
+    state: 'turnstile-challenge-target',
+    x: Math.round(rect.left + Math.min(Math.max(24, rect.width * 0.15), 42)),
+    y: Math.round(rect.top + rect.height / 2),
+    width: Math.round(rect.width),
+    height: Math.round(rect.height),
+    src: String(targetFrame.getAttribute('src') || '').slice(0, 160),
+};
+        """
+    )
+    if not isinstance(target, dict) or target.get("state") != "turnstile-challenge-target":
+        return target
+    if target.get("x") is None or target.get("y") is None:
+        return {"state": "turnstile-challenge-missing-center", **target}
+    _dispatch_cdp_click(
+        page,
+        int(target.get("x")),
+        int(target.get("y")),
+        include_keyboard=False,
+    )
+    return {**target, "nativeClicked": True}
+
+
 def _dispatch_cdp_keypress(page, ch):
     """派发真实按键事件（keyDown 带 text + keyUp），驱动 input-otp 等依赖
     keydown/onChange 的受控组件；insertText 会绕过这些处理器导致值不同步。"""
@@ -1677,6 +1744,123 @@ def exchange_xai_refresh_token(refresh_token, settings=None):
     if not isinstance(data, dict) or not str(data.get("access_token") or "").strip():
         raise Exception(f"xAI OAuth refresh 返回缺少 access_token: {str(data)[:300]}")
     return data
+
+
+def normalize_cpa_management_auth_files_url(base):
+    value = str(base or "").strip().rstrip("/")
+    if not value:
+        raise ValueError("CPA 管理地址不能为空")
+    if not re.match(r"^https?://", value, re.IGNORECASE):
+        value = f"http://{value}"
+    value = re.sub(r"/v0/management(?:/auth-files)?$", "", value, flags=re.IGNORECASE)
+    return f"{value}/v0/management/auth-files"
+
+
+def _cpa_credential_file_name(email):
+    safe_email = re.sub(r"[^A-Za-z0-9@._-]", "-", str(email or "").strip()).strip("-")
+    if not safe_email:
+        raise ValueError("CPA 凭证缺少邮箱")
+    return f"xai-{safe_email}.json"
+
+
+def _cpa_access_token_metadata(access_token):
+    try:
+        parts = str(access_token or "").split(".")
+        if len(parts) < 2:
+            raise ValueError("not a JWT")
+        payload_segment = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload_segment))
+        expires_at = int(claims["exp"])
+        issued_at = int(claims.get("iat") or expires_at - 21600)
+        expired = datetime.datetime.fromtimestamp(
+            expires_at, tz=datetime.timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return expired, max(expires_at - issued_at, 0), str(
+            claims.get("sub") or claims.get("principal_id") or ""
+        ).strip()
+    except Exception:
+        return "", 21600, ""
+
+
+def _write_cpa_credential(auth_dir, filename, payload):
+    os.makedirs(auth_dir, exist_ok=True)
+    path = os.path.join(auth_dir, filename)
+    fd, temp_path = tempfile.mkstemp(prefix=".xai-", suffix=".tmp", dir=auth_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, path)
+        os.chmod(path, 0o600)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+    return path
+
+
+def export_and_push_cpa_credential(email, refresh_token, settings=None, log_callback=None):
+    resolved_settings = {**config, **dict(settings or {})}
+    log = log_callback or (lambda message: None)
+    token_data = exchange_xai_refresh_token(refresh_token, settings=resolved_settings)
+    access_token = str(token_data.get("access_token") or "").strip()
+    resolved_refresh_token = str(token_data.get("refresh_token") or refresh_token or "").strip()
+    if not access_token or not resolved_refresh_token:
+        raise ValueError("xAI OAuth 返回缺少 CPA 凭证所需 token")
+
+    expired, token_expires_in, subject = _cpa_access_token_metadata(access_token)
+    auth_dir = str(resolved_settings.get("cpa_auth_dir") or "cpa_auths").strip()
+    if not os.path.isabs(auth_dir):
+        auth_dir = os.path.join(get_data_dir(), auth_dir)
+    filename = _cpa_credential_file_name(email)
+    payload = {
+        "type": "xai",
+        "access_token": access_token,
+        "refresh_token": resolved_refresh_token,
+        "token_type": str(token_data.get("token_type") or "Bearer"),
+        "expires_in": int(token_data.get("expires_in") or token_expires_in),
+        "expired": expired,
+        "last_refresh": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "email": str(email or "").strip(),
+        "sub": subject,
+        "base_url": str(resolved_settings.get("cpa_base_url") or CPA_DEFAULT_BASE_URL).rstrip("/"),
+        "redirect_uri": XAI_GROK_OAUTH_REDIRECT_URI,
+        "token_endpoint": XAI_GROK_OAUTH_TOKEN_URL,
+        "auth_kind": "oauth",
+        "headers": dict(CPA_CLIENT_HEADERS),
+    }
+    if token_data.get("id_token"):
+        payload["id_token"] = str(token_data["id_token"])
+    local_path = _write_cpa_credential(auth_dir, filename, payload)
+    result = {"ok": True, "path": local_path, "filename": filename}
+
+    if not resolved_settings.get("cpa_auto_push_remote"):
+        return result
+
+    management_base = str(resolved_settings.get("cpa_management_base") or "").strip()
+    management_key = str(resolved_settings.get("cpa_management_key") or "").strip()
+    if not management_base or not management_key:
+        result["upload_error"] = "CPA 自动推送缺少管理地址或管理密钥"
+        return result
+
+    try:
+        with open(local_path, "rb") as credential:
+            response = http_post(
+                normalize_cpa_management_auth_files_url(management_base),
+                headers={"Authorization": f"Bearer {management_key}"},
+                files={"file": (filename, credential, "application/json")},
+                timeout=30,
+            )
+        response.raise_for_status()
+        result["uploaded"] = True
+        result["upload_status"] = getattr(response, "status_code", None)
+        log(f"[cpa] 已推送凭证到 CPA: {filename}")
+    except Exception as exc:
+        result["upload_error"] = str(exc)[:500]
+        log(f"[cpa] 推送 CPA 凭证失败: {result['upload_error']}")
+    return result
 
 
 def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_callback=None):
@@ -2685,6 +2869,15 @@ def validate_registration_config(settings):
         normalized["enable_nsfw"] = bool(normalized.get("enable_nsfw"))
     normalized["grok2api_auto_add_remote"] = bool(normalized.get("grok2api_auto_add_remote"))
     normalized["sub2api_auto_import_remote"] = bool(normalized.get("sub2api_auto_import_remote"))
+    if isinstance(normalized.get("cpa_auto_push_remote"), str):
+        normalized["cpa_auto_push_remote"] = normalized["cpa_auto_push_remote"].strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    else:
+        normalized["cpa_auto_push_remote"] = bool(normalized.get("cpa_auto_push_remote"))
 
     raw_paths = normalized.pop("cloudflare_paths", "")
     if raw_paths:
@@ -2712,6 +2905,11 @@ def validate_registration_config(settings):
             raise ValueError("CloudMail 模式需要先填写 CloudMail 管理员邮箱")
         if not str(normalized.get("cloudmail_password") or "").strip():
             raise ValueError("CloudMail 模式需要先填写 CloudMail 管理员密码")
+    if normalized["cpa_auto_push_remote"]:
+        if not str(normalized.get("cpa_management_base") or "").strip():
+            raise ValueError("CPA 自动推送需要先填写 CPA 管理地址")
+        if not str(normalized.get("cpa_management_key") or "").strip():
+            raise ValueError("CPA 自动推送需要先填写 CPA 管理密钥")
     return normalized
 
 
@@ -2861,6 +3059,18 @@ class RegistrationJob:
         refresh_token = fetch_xai_oauth_refresh_token(
             sso, log_callback=logf, cancel_callback=self.should_stop
         )
+        if self.settings.get("cpa_auto_push_remote"):
+            logf("[*] 8. 推送 CPA 凭证")
+            try:
+                cpa_result = export_and_push_cpa_credential(
+                    email, refresh_token, self.settings, log_callback=logf
+                )
+                if cpa_result.get("upload_error"):
+                    logf(f"[!] CPA 凭证推送失败，已保留本地文件: {cpa_result['upload_error']}")
+                elif cpa_result.get("uploaded"):
+                    logf(f"[+] CPA 凭证已推送: {cpa_result.get('filename', '')}")
+            except Exception as cpa_exc:
+                logf(f"[!] CPA 凭证生成或推送失败，继续注册流程: {cpa_exc}")
         with self.stats_lock:
             source_line_no = self.success_count + 1
             self.results.append(
@@ -4994,6 +5204,14 @@ return {
                     last_final_retry_state = retried
                 if isinstance(retried, dict):
                     last_final_retry_state = str(retried.get("state") or "final-page-dict")
+                    if (
+                        last_final_retry_state == "final-page-wait-cf"
+                        and retried.get("executedWidgets")
+                    ):
+                        try:
+                            retried["challengeClick"] = _click_turnstile_challenge_if_visible(page)
+                        except Exception as challenge_exc:
+                            retried["challengeClickError"] = str(challenge_exc)[:160]
                     if retried.get("centerX") is not None and retried.get("centerY") is not None:
                         try:
                             x = int(retried.get("centerX"))

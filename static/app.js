@@ -10,6 +10,7 @@ const refreshAccountsBtn = document.querySelector("#refreshAccountsBtn");
 const checkHealthBtn = document.querySelector("#checkHealthBtn");
 const importGrok2apiBtn = document.querySelector("#importGrok2apiBtn");
 const importSub2apiBtn = document.querySelector("#importSub2apiBtn");
+const importCpaBtn = document.querySelector("#importCpaBtn");
 const dashboardStatusText = document.querySelector("#dashboardStatusText");
 const dashboardRunNote = document.querySelector("#dashboardRunNote");
 const dashboardTotalAccounts = document.querySelector("#dashboardTotalAccounts");
@@ -31,7 +32,7 @@ const tabButtons = Array.from(document.querySelectorAll("[data-tab-target]"));
 const tabPanels = Array.from(document.querySelectorAll("[data-tab-panel]"));
 
 const ACCOUNT_TABLE_PREFS_KEY = "grok-reg.accounts.table";
-const ACCOUNT_TABLE_PREFS_VERSION = 2;
+const ACCOUNT_TABLE_PREFS_VERSION = 3;
 const ACCOUNT_COLUMNS = [
   { key: "select", label: "选择", locked: true },
   { key: "email", label: "邮箱", className: "email-column" },
@@ -43,6 +44,7 @@ const ACCOUNT_COLUMNS = [
   { key: "health", label: "健康状态" },
   { key: "grok2api", label: "grok2api" },
   { key: "sub2api", label: "sub2api" },
+  { key: "cpa", label: "CPA" },
 ];
 const DEFAULT_ACCOUNT_TABLE_PREFS = {
   visibleColumns: ACCOUNT_COLUMNS.map((column) => column.key),
@@ -60,8 +62,10 @@ let selectedAccountIdsSet = new Set();
 let accountHealthStatus = {};
 let accountPushStatus = {};
 let accountGrok2apiPushStatus = {};
+let accountCpaPushStatus = {};
 let pushingToSub2api = false;
 let pushingToGrok2api = false;
+let pushingToCpa = false;
 
 function setMessage(text) {
   message.textContent = text || "";
@@ -197,8 +201,11 @@ function loadAccountTablePrefs() {
           .map((key) => (key === "line" ? "index" : key))
           .filter((key) => allowedColumns.has(key))
       : DEFAULT_ACCOUNT_TABLE_PREFS.visibleColumns;
-    if (Number(saved.version || 1) < ACCOUNT_TABLE_PREFS_VERSION && !visibleColumns.includes("health")) {
+    if (Number(saved.version || 1) < 2 && !visibleColumns.includes("health")) {
       visibleColumns.push("health");
+    }
+    if (Number(saved.version || 1) < 3 && !visibleColumns.includes("cpa")) {
+      visibleColumns.push("cpa");
     }
     const pageSize = [10, 20, 50, 100].includes(Number(saved.pageSize))
       ? Number(saved.pageSize)
@@ -276,6 +283,8 @@ function accountCellValue(account, key, rowNumber) {
   const grok2apiStatus = accountGrok2apiPushStatus[account.id] || persistedGrok2apiStatus;
   const persistedSub2apiStatus = account.sub2api_status_text || (account.sub2api_status === "pushed" ? "已推送" : "未推送");
   const sub2apiStatus = accountPushStatus[account.id] || persistedSub2apiStatus;
+  const persistedCpaStatus = account.cpa_status_text || (account.cpa_status === "pushed" ? "已推送" : "未推送");
+  const cpaStatus = accountCpaPushStatus[account.id] || persistedCpaStatus;
   const persistedHealthStatus = account.health_status_text || "未检查";
   const healthStatus = accountHealthStatus[account.id] || persistedHealthStatus;
   const values = {
@@ -288,6 +297,7 @@ function accountCellValue(account, key, rowNumber) {
     health: healthStatus,
     grok2api: grok2apiStatus,
     sub2api: sub2apiStatus,
+    cpa: cpaStatus,
   };
   return values[key] ?? "";
 }
@@ -516,7 +526,7 @@ function renderAccounts() {
         checkbox.type = "checkbox";
         checkbox.value = account.id;
         checkbox.checked = selectedAccountIdsSet.has(account.id);
-        checkbox.title = account.has_refresh_token ? "" : "可推送到 grok2api；缺少 Refresh Token 时不能推送到 sub2api";
+        checkbox.title = account.has_refresh_token ? "" : "可推送到 grok2api；缺少 Refresh Token 时不能推送到 sub2api 或 CPA";
         checkbox.addEventListener("change", () => {
           if (checkbox.checked) selectedAccountIdsSet.add(account.id);
           else selectedAccountIdsSet.delete(account.id);
@@ -685,6 +695,51 @@ async function importSelectedToGrok2api() {
   }
 }
 
+async function importSelectedToCpa() {
+  const accountIds = selectedAccountIds();
+  if (!accountIds.length) {
+    setMessage("请选择账号再推送到 CPA");
+    return;
+  }
+  pushingToCpa = true;
+  importCpaBtn.disabled = true;
+  importCpaBtn.textContent = `推送中 ${accountIds.length} 个...`;
+  accountIds.forEach((id) => {
+    accountCpaPushStatus[id] = "推送中";
+  });
+  renderAccounts();
+  setMessage(`开始推送到 CPA：${accountIds.length} 个账号`);
+  try {
+    const result = await requestJson("/api/accounts/import/cpa", {
+      method: "POST",
+      body: JSON.stringify({ ...formPayload(), account_ids: accountIds }),
+    });
+    if (Array.isArray(result.accounts)) {
+      const returned = new Map(result.accounts.map((account) => [account.id, account]));
+      accounts = accounts.map((account) => returned.get(account.id) || account);
+      accountIds.forEach((id) => {
+        const account = returned.get(id);
+        accountCpaPushStatus[id] = account?.cpa_status_text || (account?.cpa_status === "pushed" ? "已推送" : "未推送");
+      });
+    } else {
+      accountIds.forEach((id) => {
+        accountCpaPushStatus[id] = result.status === "partial_failed" ? "失败：请刷新查看详情" : "已推送";
+      });
+    }
+    setMessage(`${result.message || `已推送到 CPA：${result.total} 个账号`}。${result.warning || ""}`);
+  } catch (error) {
+    accountIds.forEach((id) => {
+      accountCpaPushStatus[id] = `失败：${error.message}`;
+    });
+    setMessage(`推送 CPA 失败：${error.message}`);
+  } finally {
+    pushingToCpa = false;
+    importCpaBtn.disabled = false;
+    importCpaBtn.textContent = "推送到 CPA";
+    renderAccounts();
+  }
+}
+
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(() => {
@@ -749,6 +804,10 @@ importSub2apiBtn.addEventListener("click", () => {
 
 importGrok2apiBtn.addEventListener("click", () => {
   importSelectedToGrok2api().catch((error) => setMessage(error.message));
+});
+
+importCpaBtn.addEventListener("click", () => {
+  importSelectedToCpa().catch((error) => setMessage(error.message));
 });
 
 tabButtons.forEach((button) => {

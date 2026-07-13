@@ -525,6 +525,15 @@ def attach_account_status(account, statuses=None):
         account["grok2api_response"] = record.get("grok2api_response")
     if record.get("grok2api_error"):
         account["grok2api_error"] = record.get("grok2api_error")
+    cpa_status = str(record.get("cpa_status") or "not_pushed").strip() or "not_pushed"
+    account["cpa_status"] = cpa_status
+    account["cpa_status_text"] = str(record.get("cpa_status_text") or account_status_text(cpa_status))
+    if record.get("cpa_pushed_at"):
+        account["cpa_pushed_at"] = record.get("cpa_pushed_at")
+    if "cpa_response" in record:
+        account["cpa_response"] = record.get("cpa_response")
+    if record.get("cpa_error"):
+        account["cpa_error"] = record.get("cpa_error")
     health_status = str(record.get("health_status") or "unknown").strip() or "unknown"
     account["health_status"] = health_status
     account["health_status_text"] = str(record.get("health_status_text") or account_health_status_text(health_status))
@@ -671,6 +680,56 @@ def persist_grok2api_push_status(accounts, result):
                     "grok2api_status_text": "已推送",
                     "grok2api_pushed_at": now,
                     "grok2api_response": item.get("response", item),
+                    "email": account.get("email", ""),
+                    "source_file": account.get("source_file", ""),
+                    "line_no": account.get("line_no", ""),
+                }
+            )
+        statuses[account_id] = record
+    save_account_statuses(statuses)
+    return statuses
+
+
+def persist_cpa_push_status(accounts, result):
+    statuses = load_account_statuses()
+    items = result.get("items") if isinstance(result, dict) else []
+    if not isinstance(items, list):
+        items = []
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    for index, account in enumerate(accounts or []):
+        account_id = str(account.get("id") or "").strip()
+        if not account_id:
+            continue
+        record = statuses.get(account_id)
+        if not isinstance(record, dict):
+            record = {}
+        item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
+        item_status = str(item.get("status") or "pushed").strip().lower()
+        if item_status == "failed":
+            record.pop("cpa_pushed_at", None)
+            record.pop("cpa_response", None)
+            record.update(
+                {
+                    "cpa_status": "failed",
+                    "cpa_status_text": f"失败：{str(item.get('error') or '')[:220]}",
+                    "cpa_failed_at": now,
+                    "cpa_error": str(item.get("error") or ""),
+                    "cpa_step": str(item.get("step") or ""),
+                    "email": account.get("email", ""),
+                    "source_file": account.get("source_file", ""),
+                    "line_no": account.get("line_no", ""),
+                }
+            )
+        else:
+            record.pop("cpa_failed_at", None)
+            record.pop("cpa_error", None)
+            record.pop("cpa_step", None)
+            record.update(
+                {
+                    "cpa_status": "pushed",
+                    "cpa_status_text": "已推送",
+                    "cpa_pushed_at": now,
+                    "cpa_response": item.get("response", item),
                     "email": account.get("email", ""),
                     "source_file": account.get("source_file", ""),
                     "line_no": account.get("line_no", ""),
@@ -1834,7 +1893,12 @@ def export_and_push_cpa_credential(email, refresh_token, settings=None, log_call
     if token_data.get("id_token"):
         payload["id_token"] = str(token_data["id_token"])
     local_path = _write_cpa_credential(auth_dir, filename, payload)
-    result = {"ok": True, "path": local_path, "filename": filename}
+    result = {
+        "ok": True,
+        "path": local_path,
+        "filename": filename,
+        "refresh_token": resolved_refresh_token,
+    }
 
     if not resolved_settings.get("cpa_auto_push_remote"):
         return result
@@ -1861,6 +1925,83 @@ def export_and_push_cpa_credential(email, refresh_token, settings=None, log_call
         result["upload_error"] = str(exc)[:500]
         log(f"[cpa] 推送 CPA 凭证失败: {result['upload_error']}")
     return result
+
+
+def import_accounts_to_cpa(accounts, settings=None, log_callback=None):
+    resolved_settings = {**config, **dict(settings or {})}
+    management_base = str(resolved_settings.get("cpa_management_base") or "").strip()
+    management_key = str(resolved_settings.get("cpa_management_key") or "").strip()
+    if not management_base or not management_key:
+        raise ValueError("推送到 CPA 需要先填写 CPA 管理地址和管理密钥")
+    resolved_settings["cpa_auto_push_remote"] = True
+
+    items = []
+    for account in accounts or []:
+        email = str(account.get("email") or account.get("id") or "").strip()
+        refresh_token = str(account.get("refresh_token") or "").strip()
+        if not refresh_token:
+            items.append(
+                {
+                    "email": email,
+                    "status": "failed",
+                    "step": "credential",
+                    "error": "缺少 refresh_token",
+                }
+            )
+            continue
+        try:
+            result = export_and_push_cpa_credential(
+                email,
+                refresh_token,
+                resolved_settings,
+                log_callback=log_callback,
+            )
+            rotated_refresh_token = str(result.get("refresh_token") or "").strip()
+            if rotated_refresh_token and rotated_refresh_token != refresh_token:
+                replace_registered_account_refresh_token(account, rotated_refresh_token)
+            upload_error = str(result.get("upload_error") or "").strip()
+            if upload_error or not result.get("uploaded"):
+                items.append(
+                    {
+                        "email": email,
+                        "status": "failed",
+                        "step": "upload",
+                        "error": upload_error or "CPA 未确认上传成功",
+                    }
+                )
+                continue
+            items.append(
+                {
+                    "email": email,
+                    "status": "pushed",
+                    "response": {
+                        "filename": result.get("filename", ""),
+                        "uploaded": True,
+                        "upload_status": result.get("upload_status"),
+                    },
+                }
+            )
+        except Exception as exc:
+            items.append(
+                {
+                    "email": email,
+                    "status": "failed",
+                    "step": "credential",
+                    "error": str(exc)[:1000],
+                }
+            )
+
+    success_count = len([item for item in items if item.get("status") == "pushed"])
+    failed_count = len(items) - success_count
+    if log_callback:
+        log_callback(f"[+] CPA 推送完成: 成功 {success_count} / 失败 {failed_count}")
+    return {
+        "imported": failed_count == 0,
+        "total": success_count,
+        "failed": failed_count,
+        "items": items,
+        "warning": "CPA 推送使用账号保存的第四段 Refresh Token。",
+    }
 
 
 def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_callback=None):
@@ -3065,6 +3206,9 @@ class RegistrationJob:
                 cpa_result = export_and_push_cpa_credential(
                     email, refresh_token, self.settings, log_callback=logf
                 )
+                rotated_refresh_token = str(cpa_result.get("refresh_token") or "").strip()
+                if rotated_refresh_token:
+                    refresh_token = rotated_refresh_token
                 if cpa_result.get("upload_error"):
                     logf(f"[!] CPA 凭证推送失败，已保留本地文件: {cpa_result['upload_error']}")
                 elif cpa_result.get("uploaded"):

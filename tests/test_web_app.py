@@ -264,6 +264,59 @@ def test_import_selected_accounts_persists_sub2api_failure_status(monkeypatch, t
     assert "refresh-token HTTP 502" in refreshed["sub2api_error"]
 
 
+def test_import_selected_accounts_to_cpa_uses_only_selected_accounts_and_persists_status(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260713_120000_job.txt").write_text(
+        "first@example.com----Pass----sso-token-1----refresh-token-1\n"
+        "second@example.com----Pass----sso-token-2----refresh-token-2\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_import(accounts, settings, log_callback=None):
+        calls.append((accounts, settings))
+        return {
+            "imported": True,
+            "total": 1,
+            "failed": 0,
+            "items": [
+                {
+                    "email": accounts[0]["email"],
+                    "status": "pushed",
+                    "response": {"filename": "xai-second@example.com.json", "upload_status": 201},
+                }
+            ],
+        }
+
+    monkeypatch.setattr(reg, "import_accounts_to_cpa", fake_import)
+    from web_app import app
+
+    client = TestClient(app)
+    accounts = client.get("/api/accounts").json()["accounts"]
+    selected = next(account for account in accounts if account["email"] == "second@example.com")
+    response = client.post(
+        "/api/accounts/import/cpa",
+        json={
+            "account_ids": [selected["id"]],
+            "cpa_management_base": "https://cpa.example.test",
+            "cpa_management_key": "management-secret",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "pushed"
+    assert response.json()["total"] == 1
+    assert [account["email"] for account in calls[0][0]] == ["second@example.com"]
+    assert calls[0][1]["cpa_management_key"] == "management-secret"
+    assert "sso" not in response.json()["accounts"][0]
+    refreshed = client.get("/api/accounts").json()["accounts"]
+    second = next(account for account in refreshed if account["id"] == selected["id"])
+    first = next(account for account in refreshed if account["id"] != selected["id"])
+    assert second["cpa_status"] == "pushed"
+    assert second["cpa_response"]["upload_status"] == 201
+    assert first["cpa_status"] == "not_pushed"
+
+
 def test_check_selected_accounts_health_persists_status(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(

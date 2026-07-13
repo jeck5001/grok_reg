@@ -151,6 +151,35 @@ def import_accounts_to_grok2api(payload: dict):
     }
 
 
+@app.post("/api/accounts/import/cpa")
+def import_accounts_to_cpa(payload: dict):
+    settings = merge_sensitive_values(payload)
+    account_ids = payload.get("account_ids") or []
+    accounts = reg.find_registered_accounts(account_ids)
+    if not accounts:
+        raise HTTPException(status_code=404, detail="未找到选中的账号")
+    try:
+        result = reg.import_accounts_to_cpa(accounts, settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"推送 CPA 失败: {exc}")
+    reg.persist_cpa_push_status(accounts, result)
+    accounts = reg.find_registered_accounts(account_ids)
+    total = int(result.get("total") or 0)
+    failed = int(result.get("failed") or 0)
+    status = "partial_failed" if failed else "pushed"
+    message = f"已推送到 CPA：{total} 个账号"
+    if failed:
+        message = f"CPA 推送完成：成功 {total} 个，失败 {failed} 个"
+    return {
+        **result,
+        "status": status,
+        "message": message,
+        "accounts": [public_account(account) for account in accounts],
+    }
+
+
 @app.post("/api/accounts/check-health")
 def check_accounts_health(payload: dict):
     settings = merge_sensitive_values(payload)

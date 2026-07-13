@@ -1772,6 +1772,7 @@ def test_export_and_push_cpa_credential_writes_management_auth_file(monkeypatch,
     assert captured["url"] == "https://cpa.example.test/v0/management/auth-files"
     assert captured["headers"]["Authorization"] == "Bearer management-secret"
     assert captured["filename"] == "xai-user@example.com.json"
+    assert result["refresh_token"] == "rotated-refresh-token"
     payload = json.loads(tmp_path.joinpath(captured["filename"]).read_text(encoding="utf-8"))
     assert payload["type"] == "xai"
     assert payload["refresh_token"] == "rotated-refresh-token"
@@ -1836,6 +1837,157 @@ def test_export_and_push_cpa_credential_derives_xai_metadata_from_access_token(m
     assert payload["sub"] == "account-123"
     assert payload["expires_in"] == 100
     assert payload["expired"] == "2023-11-14T22:15:00Z"
+
+
+def test_import_accounts_to_cpa_pushes_each_selected_account(monkeypatch):
+    calls = []
+
+    def fake_export(email, refresh_token, settings, log_callback=None):
+        calls.append((email, refresh_token, settings))
+        return {"ok": True, "uploaded": True, "filename": f"xai-{email}.json", "upload_status": 201}
+
+    monkeypatch.setattr(reg, "export_and_push_cpa_credential", fake_export)
+    accounts = [
+        {"email": "user1@example.com", "refresh_token": "refresh-token-1"},
+        {"email": "user2@example.com", "refresh_token": "refresh-token-2"},
+    ]
+
+    result = reg.import_accounts_to_cpa(
+        accounts,
+        {
+            "cpa_auto_push_remote": False,
+            "cpa_management_base": "https://cpa.example.test",
+            "cpa_management_key": "management-secret",
+        },
+    )
+
+    assert result["imported"] is True
+    assert result["total"] == 2
+    assert result["failed"] == 0
+    assert [call[:2] for call in calls] == [
+        ("user1@example.com", "refresh-token-1"),
+        ("user2@example.com", "refresh-token-2"),
+    ]
+    assert all(call[2]["cpa_auto_push_remote"] is True for call in calls)
+
+
+def test_import_accounts_to_cpa_keeps_pushing_after_an_account_failure(monkeypatch):
+    calls = []
+
+    def fake_export(email, refresh_token, settings, log_callback=None):
+        calls.append(email)
+        if email == "broken@example.com":
+            return {"ok": True, "upload_error": "CPA unavailable"}
+        return {"ok": True, "uploaded": True, "filename": f"xai-{email}.json"}
+
+    monkeypatch.setattr(reg, "export_and_push_cpa_credential", fake_export)
+
+    result = reg.import_accounts_to_cpa(
+        [
+            {"email": "broken@example.com", "refresh_token": "refresh-token-1"},
+            {"email": "missing@example.com", "refresh_token": ""},
+            {"email": "working@example.com", "refresh_token": "refresh-token-3"},
+        ],
+        {
+            "cpa_management_base": "https://cpa.example.test",
+            "cpa_management_key": "management-secret",
+        },
+    )
+
+    assert calls == ["broken@example.com", "working@example.com"]
+    assert result["imported"] is False
+    assert result["total"] == 1
+    assert result["failed"] == 2
+    assert result["items"][0]["error"] == "CPA unavailable"
+    assert result["items"][1]["error"] == "缺少 refresh_token"
+    assert result["items"][2]["status"] == "pushed"
+
+
+def test_import_accounts_to_cpa_persists_a_rotated_refresh_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    source = tmp_path.joinpath("accounts_20260713_120000_job.txt")
+    source.write_text(
+        "user@example.com----Pass----sso-token----old-refresh-token\n",
+        encoding="utf-8",
+    )
+    account = reg.list_registered_accounts()[0]
+    monkeypatch.setattr(
+        reg,
+        "export_and_push_cpa_credential",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "uploaded": True,
+            "filename": "xai-user@example.com.json",
+            "refresh_token": "rotated-refresh-token",
+        },
+    )
+
+    result = reg.import_accounts_to_cpa(
+        [account],
+        {
+            "cpa_management_base": "https://cpa.example.test",
+            "cpa_management_key": "management-secret",
+        },
+    )
+
+    assert result["total"] == 1
+    assert account["refresh_token"] == "rotated-refresh-token"
+    assert source.read_text(encoding="utf-8").endswith("----rotated-refresh-token\n")
+
+
+def test_persist_cpa_push_status_is_visible_in_registered_accounts(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260713_120000_job.txt").write_text(
+        "user@example.com----Pass----sso-token----refresh-token\n",
+        encoding="utf-8",
+    )
+    account = reg.list_registered_accounts()[0]
+
+    reg.persist_cpa_push_status(
+        [account],
+        {
+            "items": [
+                {
+                    "email": account["email"],
+                    "status": "pushed",
+                    "response": {"filename": "xai-user@example.com.json", "upload_status": 201},
+                }
+            ]
+        },
+    )
+
+    refreshed = reg.list_registered_accounts()[0]
+    assert refreshed["cpa_status"] == "pushed"
+    assert refreshed["cpa_status_text"] == "已推送"
+    assert refreshed["cpa_response"]["upload_status"] == 201
+
+    reg.persist_cpa_push_status(
+        [account],
+        {"items": [{"email": account["email"], "status": "failed", "error": "CPA unavailable"}]},
+    )
+
+    failed = reg.list_registered_accounts()[0]
+    failed_record = reg.load_account_statuses()[account["id"]]
+    assert failed["cpa_status"] == "failed"
+    assert "cpa_response" not in failed
+    assert "cpa_pushed_at" not in failed
+    assert "cpa_response" not in failed_record
+    assert "cpa_pushed_at" not in failed_record
+
+    reg.persist_cpa_push_status(
+        [account],
+        {"items": [{"email": account["email"], "status": "pushed", "response": {"upload_status": 201}}]},
+    )
+
+    repushed = reg.list_registered_accounts()[0]
+    repushed_record = reg.load_account_statuses()[account["id"]]
+    assert repushed["cpa_status"] == "pushed"
+    assert "cpa_error" not in repushed
+    assert "cpa_step" not in repushed
+    assert "cpa_failed_at" not in repushed
+    assert "cpa_error" not in repushed_record
+    assert "cpa_step" not in repushed_record
+    assert "cpa_failed_at" not in repushed_record
 
 
 def test_docker_visible_browser_keeps_linux_startup_flags(monkeypatch):
@@ -1981,6 +2133,18 @@ def test_web_console_exposes_account_health_check_action():
     assert "accountHealthStatus" in js
     assert "/api/accounts/check-health" in js
     assert "健康检查" in js
+
+
+def test_web_console_exposes_selected_account_cpa_push_action():
+    html = Path("templates/index.html").read_text(encoding="utf-8")
+    js = Path("static/app.js").read_text(encoding="utf-8")
+
+    assert 'id="importCpaBtn"' in html
+    assert 'label: "CPA"' in js
+    assert "accountCpaPushStatus" in js
+    assert "/api/accounts/import/cpa" in js
+    assert "importSelectedToCpa" in js
+    assert 'async function importSelectedToCpa() {\n  const accountIds = selectedAccountIds();' in js
 
 
 def test_web_console_exposes_auto_push_switches():

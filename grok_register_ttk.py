@@ -1601,18 +1601,23 @@ def turnstile_page_hook_source():
 
 
 def install_light_stealth_script(page, log_callback=None):
-    """只做轻量 stealth，绝不补丁 window.turnstile（避免破坏 flexible 模式）。"""
+    """轻量 stealth + WebGL/Canvas 反指纹，绝不补丁 window.turnstile（避免破坏 flexible 模式）。"""
     if not page:
         return False
     source = r"""
 (() => {
+  // 1. 隐藏 navigator.webdriver
   try {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
   } catch (e) {}
+
+  // 2. chrome.runtime
   try {
     if (!window.chrome) window.chrome = {};
     if (!window.chrome.runtime) window.chrome.runtime = {};
   } catch (e) {}
+
+  // 3. permissions.query
   try {
     const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
     if (originalQuery) {
@@ -1623,17 +1628,85 @@ def install_light_stealth_script(page, log_callback=None):
       );
     }
   } catch (e) {}
+
+  // 4. languages
   try {
     Object.defineProperty(navigator, 'languages', {
       get: () => ['en-US', 'en'],
       configurable: true,
     });
   } catch (e) {}
+
+  // 5. platform —— 根据 UA 动态推导，不再硬编码 Linux x86_64
   try {
-    Object.defineProperty(navigator, 'platform', {
-      get: () => 'Linux x86_64',
-      configurable: true,
-    });
+    const ua = navigator.userAgent || '';
+    let p = 'Linux x86_64';
+    if (/Windows/.test(ua)) p = 'Win32';
+    else if (/Macintosh/.test(ua)) p = 'MacIntel';
+    Object.defineProperty(navigator, 'platform', { get: () => p, configurable: true });
+  } catch (e) {}
+
+  // 6. WebGL vendor/renderer 伪装 —— 仅当检测到 SwiftShader / llvmpipe 等软件渲染时替换
+  try {
+    const FAKE_WGL_VENDOR = 'Google Inc. (Intel)';
+    const FAKE_WGL_RENDERER = 'ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)';
+
+    const isSoftwareRenderer = (() => {
+      try {
+        const c = document.createElement('canvas');
+        const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+        if (!gl) return false;
+        const ext = gl.getExtension('WEBGL_debug_renderer_info');
+        if (!ext) return false;
+        const r = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || '';
+        return /swiftshader|llvmpipe|softpipe|software.*rasterizer|mesa.*swrast/i.test(r);
+      } catch (e) { return false; }
+    })();
+
+    if (isSoftwareRenderer) {
+      const hookGetParam = (proto) => {
+        if (!proto || !proto.getParameter) return;
+        const orig = proto.getParameter;
+        proto.getParameter = function(param) {
+          // UNMASKED_VENDOR_WEBGL = 37445, UNMASKED_RENDERER_WEBGL = 37446
+          if (param === 37445) return FAKE_WGL_VENDOR;
+          if (param === 37446) return FAKE_WGL_RENDERER;
+          return orig.call(this, param);
+        };
+      };
+      try { hookGetParam(WebGLRenderingContext.prototype); } catch (e) {}
+      try { hookGetParam(WebGL2RenderingContext.prototype); } catch (e) {}
+    }
+  } catch (e) {}
+
+  // 7. Canvas 指纹噪声 —— 对 toDataURL/toBlob 注入微量确定性噪声
+  try {
+    const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+    const origToBlob = HTMLCanvasElement.prototype.toBlob;
+    // 基于域名生成确定性偏移，同一站点每次都一样
+    const _noiseOff = ((window.location.hostname || '').length * 7 + 3) % 5 + 1;
+
+    function _canvasInjectNoise(canvas) {
+      try {
+        const ctx = canvas.getContext('2d');
+        if (!ctx || canvas.width < 1 || canvas.height < 1) return;
+        const img = ctx.getImageData(0, 0, 1, 1);
+        // 对 alpha 通道加微小确定性偏移（人眼不可见，指纹哈希不同）
+        img.data[3] = (img.data[3] + _noiseOff) & 0xFF;
+        ctx.putImageData(img, 0, 0);
+      } catch (e) {}
+    }
+
+    HTMLCanvasElement.prototype.toDataURL = function() {
+      _canvasInjectNoise(this);
+      return origToDataURL.apply(this, arguments);
+    };
+    if (origToBlob) {
+      HTMLCanvasElement.prototype.toBlob = function() {
+        _canvasInjectNoise(this);
+        return origToBlob.apply(this, arguments);
+      };
+    }
   } catch (e) {}
 })();
 """
@@ -1650,7 +1723,7 @@ def install_light_stealth_script(page, log_callback=None):
     except Exception:
         pass
     if ok and log_callback:
-        log_callback("[Debug] 已安装轻量 stealth（不补丁 turnstile API）")
+        log_callback("[Debug] 已安装增强 stealth（WebGL 伪装 + Canvas 噪声，不补丁 turnstile API）")
     return ok
 
 

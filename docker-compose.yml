@@ -10,6 +10,7 @@ services:
       GROK_REG_IN_DOCKER: "1"
       GROK_REG_HEADLESS: "0"
       CHROME_BIN: /usr/bin/chromium
+      TZ: Asia/Shanghai
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

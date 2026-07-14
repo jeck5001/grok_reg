@@ -5,7 +5,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     GROK_REG_DATA_DIR=/app/data \
     GROK_REG_IN_DOCKER=1 \
     GROK_REG_HEADLESS=0 \
-    CHROME_BIN=/usr/bin/chromium
+    CHROME_BIN=/usr/bin/chromium \
+    TZ=Asia/Shanghai
 
 WORKDIR /app
 
@@ -25,6 +26,7 @@ RUN apt-get update \
         libu2f-udev \
         xauth \
         xvfb \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

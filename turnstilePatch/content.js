@@ -55,10 +55,15 @@
         Object.defineProperty(navigator, "platform", { get: function () { return p; }, configurable: true });
         if (fakeUa !== ua) {
             Object.defineProperty(navigator, "userAgent", { get: function () { return fakeUa; }, configurable: true });
+            var fakeAppVer = fakeUa.replace("Mozilla/", "");
+            try {
+                Object.defineProperty(navigator, "appVersion", { get: function () { return fakeAppVer; }, configurable: true });
+            } catch (e) {}
         }
     } catch (e) {}
 
     // 6. WebGL vendor/renderer —— 始终 hook getParameter，调用时判断是否需要伪装
+    //    vendor 和 renderer 必须同时替换，否则 Google+Intel 组合比纯 SwiftShader 更可疑
     try {
         var FAKE_WGL_VENDOR = "Google Inc. (Intel)";
         var FAKE_WGL_RENDERER = "ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)";
@@ -69,8 +74,11 @@
             var orig = proto.getParameter;
             proto.getParameter = function (param) {
                 var result = orig.call(this, param);
-                if (param === 37445 && SW_RE.test(String(result))) return FAKE_WGL_VENDOR;
                 if (param === 37446 && SW_RE.test(String(result))) return FAKE_WGL_RENDERER;
+                if (param === 37445) {
+                    var realRenderer = orig.call(this, 37446);
+                    if (SW_RE.test(String(realRenderer))) return FAKE_WGL_VENDOR;
+                }
                 return result;
             };
         };

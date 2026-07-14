@@ -5,15 +5,21 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     GROK_REG_DATA_DIR=/app/data \
     GROK_REG_IN_DOCKER=1 \
     GROK_REG_HEADLESS=0 \
-    CHROME_BIN=/usr/bin/chromium \
+    CHROME_BIN=/usr/bin/google-chrome-stable \
     TZ=Asia/Shanghai
 
 WORKDIR /app
 
-RUN apt-get update \
+# 安装 Google Chrome（非 Chromium），消除 DRM/Widevine 等指纹差异
+RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
-        chromium \
+        google-chrome-stable \
         fonts-noto-cjk \
+        fonts-liberation \
+        fonts-dejavu-core \
+        fonts-noto-color-emoji \
         libasound2 \
         libatk-bridge2.0-0 \
         libgtk-3-0 \
@@ -27,6 +33,8 @@ RUN apt-get update \
         xauth \
         xvfb \
         tzdata \
+        wget \
+        gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

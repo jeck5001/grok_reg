@@ -1650,11 +1650,17 @@ def install_light_stealth_script(page, log_callback=None):
     Object.defineProperty(navigator, 'platform', { get: () => p, configurable: true });
     if (fakeUa !== ua) {
       Object.defineProperty(navigator, 'userAgent', { get: () => fakeUa, configurable: true });
+      // appVersion 也必须同步覆盖，否则 UA 和 appVersion 不一致是检测项
+      const fakeAppVer = fakeUa.replace('Mozilla/', '');
+      try {
+        Object.defineProperty(navigator, 'appVersion', { get: () => fakeAppVer, configurable: true });
+      } catch (e) {}
     }
   } catch (e) {}
 
   // 6. WebGL vendor/renderer —— 始终 hook getParameter，在调用时才判断是否需要伪装
   //    关键：不能先检测再 hook，因为 document_start 阶段检测可能因时序问题失败
+  //    关键2：vendor 和 renderer 必须同时替换，否则 Google+Intel 组合比纯 SwiftShader 更可疑
   try {
     const FAKE_WGL_VENDOR = 'Google Inc. (Intel)';
     const FAKE_WGL_RENDERER = 'ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)';
@@ -1665,10 +1671,14 @@ def install_light_stealth_script(page, log_callback=None):
       const orig = proto.getParameter;
       proto.getParameter = function(param) {
         const result = orig.call(this, param);
-        // UNMASKED_VENDOR_WEBGL = 37445
-        if (param === 37445 && SW_RE.test(String(result))) return FAKE_WGL_VENDOR;
         // UNMASKED_RENDERER_WEBGL = 37446
         if (param === 37446 && SW_RE.test(String(result))) return FAKE_WGL_RENDERER;
+        // UNMASKED_VENDOR_WEBGL = 37445 —— 当 renderer 是软件渲染时，vendor 也要替换
+        //    不能只检查 vendor 字符串是否含 swiftshader，因为 vendor 通常只是 "Google Inc. (Google)"
+        if (param === 37445) {
+          const realRenderer = orig.call(this, 37446);
+          if (SW_RE.test(String(realRenderer))) return FAKE_WGL_VENDOR;
+        }
         return result;
       };
     };

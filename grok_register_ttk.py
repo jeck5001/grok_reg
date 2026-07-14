@@ -1650,12 +1650,12 @@ def install_light_stealth_script(page, log_callback=None):
     Object.defineProperty(navigator, 'platform', { get: () => p, configurable: true });
     if (fakeUa !== ua) {
       Object.defineProperty(navigator, 'userAgent', { get: () => fakeUa, configurable: true });
-      // appVersion 也必须同步覆盖，否则 UA 和 appVersion 不一致是检测项
-      const fakeAppVer = fakeUa.replace('Mozilla/', '');
-      try {
-        Object.defineProperty(navigator, 'appVersion', { get: () => fakeAppVer, configurable: true });
-      } catch (e) {}
     }
+    // appVersion 始终与有效 UA 同步——CDP 覆盖 UA 时 appVersion 可能未自动更新
+    try {
+      const effectiveUa = fakeUa !== ua ? fakeUa : ua;
+      Object.defineProperty(navigator, 'appVersion', { get: () => effectiveUa.replace('Mozilla/', ''), configurable: true });
+    } catch (e) {}
   } catch (e) {}
 
   // 6. WebGL vendor/renderer —— 始终 hook getParameter，在调用时才判断是否需要伪装

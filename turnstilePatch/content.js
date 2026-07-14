@@ -55,11 +55,12 @@
         Object.defineProperty(navigator, "platform", { get: function () { return p; }, configurable: true });
         if (fakeUa !== ua) {
             Object.defineProperty(navigator, "userAgent", { get: function () { return fakeUa; }, configurable: true });
-            var fakeAppVer = fakeUa.replace("Mozilla/", "");
-            try {
-                Object.defineProperty(navigator, "appVersion", { get: function () { return fakeAppVer; }, configurable: true });
-            } catch (e) {}
         }
+        // appVersion 始终与有效 UA 同步——CDP 覆盖 UA 时 appVersion 可能未自动更新
+        try {
+            var effectiveUa = fakeUa !== ua ? fakeUa : ua;
+            Object.defineProperty(navigator, "appVersion", { get: function () { return effectiveUa.replace("Mozilla/", ""); }, configurable: true });
+        } catch (e) {}
     } catch (e) {}
 
     // 6. WebGL vendor/renderer —— 始终 hook getParameter，调用时判断是否需要伪装

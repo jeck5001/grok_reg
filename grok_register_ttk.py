@@ -111,6 +111,12 @@ DEFAULT_CONFIG = {
     "account_interval_jitter_seconds": 8,
     # 连续检测到账号封禁时熔断，避免同 IP/代理继续批量送死。
     "stop_on_consecutive_blocks": 3,
+    # Docker 下默认不要补丁 window.turnstile：手动能过时，API 补丁反而会干扰 flexible 模式。
+    "turnstile_patch_api": False,
+    # 默认不强制 execute；先完全交给 Cloudflare 被动评分。
+    "turnstile_force_execute": False,
+    # 资料页等 token 的最长时间（秒）
+    "turnstile_wait_seconds": 120,
     "show_tutorial_on_start": True,
     "cloudmail_url": "",
     "cloudmail_admin_email": "",
@@ -282,7 +288,8 @@ def ensure_virtual_display(log_callback=None):
             return False
 
         display = os.environ.get("GROK_REG_DISPLAY", ":99")
-        cmd = ["Xvfb", display, "-screen", "0", "1365x900x24", "-nolisten", "tcp"]
+        # 与浏览器窗口一致，避免虚拟屏过小触发异常布局/指纹。
+        cmd = ["Xvfb", display, "-screen", "0", "1920x1080x24", "-nolisten", "tcp"]
         _xvfb_process = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
@@ -290,7 +297,7 @@ def ensure_virtual_display(log_callback=None):
         )
         os.environ["DISPLAY"] = display
         if log_callback:
-            log_callback(f"[Debug] 已自动启动 Xvfb: DISPLAY={display}")
+            log_callback(f"[Debug] 已自动启动 Xvfb: DISPLAY={display} (1920x1080)")
         time.sleep(0.5)
         return True
 
@@ -1463,15 +1470,21 @@ def create_browser_options():
     if should_apply_container_chrome_flags():
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
-        # 不要 --disable-gpu：flexible Turnstile 会看 WebGL/Canvas；容器用 ANGLE/SwiftShader 更接近可用路径。
+        # 不要 --disable-gpu：flexible Turnstile 会看 WebGL/Canvas；容器用 ANGLE/SwiftShader。
         options.set_argument("--use-gl=angle")
         options.set_argument("--use-angle=swiftshader-webgl")
         options.set_argument("--enable-webgl")
+        options.set_argument("--enable-webgl2-compute-context")
         options.set_argument("--ignore-gpu-blocklist")
-        options.set_argument("--window-size", "1365,900")
+        options.set_argument("--enable-features=NetworkService,NetworkServiceInProcess")
+        # 更接近常见桌面分辨率，避免 1365x900 这种少见尺寸成为指纹。
+        options.set_argument("--window-size", "1920,1080")
+        options.set_argument("--window-position", "0,0")
         options.set_argument("--lang", "en-US")
-        # 不要写成 Accept-Language 的 q 值形式，部分 Chromium 会原样塞进 navigator.languages。
         options.set_argument("--accept-lang", "en-US,en")
+        options.set_argument("--disable-background-timer-throttling")
+        options.set_argument("--disable-renderer-backgrounding")
+        options.set_argument("--disable-backgrounding-occluded-windows")
     if should_run_headless():
         options.headless(True)
     return options
@@ -1581,6 +1594,83 @@ def turnstile_page_hook_source():
     except Exception:
         _turnstile_page_hook_source_cache = ""
     return _turnstile_page_hook_source_cache
+
+
+def install_light_stealth_script(page, log_callback=None):
+    """只做轻量 stealth，绝不补丁 window.turnstile（避免破坏 flexible 模式）。"""
+    if not page:
+        return False
+    source = r"""
+(() => {
+  try {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
+  } catch (e) {}
+  try {
+    if (!window.chrome) window.chrome = {};
+    if (!window.chrome.runtime) window.chrome.runtime = {};
+  } catch (e) {}
+  try {
+    const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+    if (originalQuery) {
+      window.navigator.permissions.query = (parameters) => (
+        parameters && parameters.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : originalQuery(parameters)
+      );
+    }
+  } catch (e) {}
+  try {
+    Object.defineProperty(navigator, 'languages', {
+      get: () => ['en-US', 'en'],
+      configurable: true,
+    });
+  } catch (e) {}
+  try {
+    Object.defineProperty(navigator, 'platform', {
+      get: () => 'Linux x86_64',
+      configurable: true,
+    });
+  } catch (e) {}
+})();
+"""
+    ok = False
+    try:
+        page.run_cdp("Page.addScriptToEvaluateOnNewDocument", source=source)
+        ok = True
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 轻量 stealth 预注入失败: {str(exc)[:160]}")
+    try:
+        page.run_cdp("Runtime.evaluate", expression=source)
+        ok = True
+    except Exception:
+        pass
+    if ok and log_callback:
+        log_callback("[Debug] 已安装轻量 stealth（不补丁 turnstile API）")
+    return ok
+
+
+def read_turnstile_token_len(page):
+    if not page:
+        return 0
+    try:
+        value = page.run_js(
+            r"""
+const input = document.querySelector('input[name="cf-turnstile-response"]');
+const direct = String((input && input.value) || '').trim();
+if (direct) return direct.length;
+try {
+  if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+    const resp = String(window.turnstile.getResponse() || '').trim();
+    if (resp) return resp.length;
+  }
+} catch (e) {}
+return 0;
+            """
+        )
+        return int(value or 0)
+    except Exception:
+        return 0
 
 
 def install_turnstile_page_hook(page, log_callback=None):
@@ -3350,6 +3440,17 @@ def validate_registration_config(settings):
     normalized["stop_on_consecutive_blocks"] = _parse_positive_int(
         normalized.get("stop_on_consecutive_blocks"), 3, minimum=0, maximum=50
     )
+    for bool_key in ("turnstile_patch_api", "turnstile_force_execute"):
+        raw_bool = normalized.get(bool_key)
+        if isinstance(raw_bool, str):
+            normalized[bool_key] = raw_bool.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            normalized[bool_key] = bool(raw_bool)
+    try:
+        wait_seconds = float(normalized.get("turnstile_wait_seconds", 120) or 120)
+    except Exception:
+        wait_seconds = 120.0
+    normalized["turnstile_wait_seconds"] = max(45.0, min(wait_seconds, 300.0))
     normalized["sub2api_concurrency"] = _parse_positive_int(
         normalized.get("sub2api_concurrency"), 3, minimum=0, maximum=1000
     )
@@ -4816,10 +4917,12 @@ def start_browser(log_callback=None):
                 page = tabs[-1] if tabs else browser.new_tab()
             _set_browser(browser)
             _set_page(page)
-            # 注意：不要在启动时注入 pageHook。
-            # 历史回归：OTP 通过后过早补丁 turnstile/路由，会让 xAI 停在
-            # "An error occurred / error loading this page"，永远进不了资料页。
-            # pageHook 只在 fill_profile_and_submit 进入资料页后再装。
+            # 启动时只装轻量 stealth，绝不补丁 turnstile API。
+            # pageHook（补丁 window.turnstile）默认关闭，手动能过时补丁反而容易干扰 flexible 模式。
+            try:
+                install_light_stealth_script(page, log_callback=log_callback)
+            except Exception:
+                pass
             if log_callback and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback:
@@ -4828,7 +4931,9 @@ def start_browser(log_callback=None):
                 extension_loaded = os.path.isdir(EXTENSION_PATH)
                 log_callback(
                     f"[Debug] 浏览器模式: {mode}，代理: {proxy or '直连'}，"
-                    f"Turnstile扩展路径: {'存在' if extension_loaded else '未找到'}"
+                    f"Turnstile扩展路径: {'存在' if extension_loaded else '未找到'}，"
+                    f"API补丁: {'开' if config.get('turnstile_patch_api') else '关'}，"
+                    f"强制execute: {'开' if config.get('turnstile_force_execute') else '关'}"
                 )
             probe_browser_stealth(page, log_callback=log_callback)
             if log_callback and attempt > 1:
@@ -5389,23 +5494,41 @@ def build_profile():
 def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None):
     page = _get_page()
     given_name, family_name, password = build_profile()
-    # Keep the registration and OTP router unmodified; Turnstile only exists on
-    # the profile step, so install the hook after xAI has reached that form.
-    install_turnstile_page_hook(page, log_callback=log_callback)
-    # 预热 Turnstile：先被动等待，不要一上来狂 execute（手动能过时说明被动评分更重要）。
+    patch_api = bool(config.get("turnstile_patch_api"))
+    force_execute = bool(config.get("turnstile_force_execute"))
+    try:
+        wait_limit = float(config.get("turnstile_wait_seconds", 120) or 120)
+    except Exception:
+        wait_limit = 120.0
+    wait_limit = max(45.0, min(wait_limit, 300.0))
+    # 默认不补丁 turnstile API。手动浏览器能过时，API hook 往往是负优化。
+    if patch_api:
+        install_turnstile_page_hook(page, log_callback=log_callback)
+        if log_callback:
+            log_callback("[Debug] 已按配置安装 turnstile API pageHook")
+    else:
+        install_light_stealth_script(page, log_callback=log_callback)
+    # 预热 Turnstile：完全交给 Cloudflare 被动评分，不要一上来 execute。
     if log_callback:
-        log_callback("[*] 预热 Turnstile（被动评分，暂不强制 execute）...")
+        log_callback(
+            f"[*] 预热 Turnstile（被动评分，API补丁={'开' if patch_api else '关'}，"
+            f"强制execute={'开' if force_execute else '关'}，最长等待 {wait_limit:.0f}s）..."
+        )
     humanize_page_activity(page, log_callback=log_callback, cancel_callback=cancel_callback)
-    sleep_with_cancel(3, cancel_callback)
+    sleep_with_cancel(5, cancel_callback)
     # 预热后先采集一次 Turnstile 结构，便于判断是 IP 信誉还是自动化指纹问题
     if log_callback:
         try:
             warm_diag = page.run_js(build_profile_submit_script("diagnose"))
             warm_obj = json.loads(warm_diag) if isinstance(warm_diag, str) else warm_diag
-            log_callback(f"[Debug] 预热后 Turnstile 状态: {json.dumps(warm_obj.get('turnstile', {}), ensure_ascii=False)}")
+            token_now = read_turnstile_token_len(page)
+            log_callback(
+                f"[Debug] 预热后 Turnstile 状态: {json.dumps(warm_obj.get('turnstile', {}), ensure_ascii=False)} "
+                f"tokenLen={token_now}"
+            )
         except Exception as warm_exc:
             log_callback(f"[Debug] 预热诊断失败: {warm_exc}")
-    deadline = time.time() + timeout
+    deadline = time.time() + max(timeout, wait_limit + 30)
     form_filled_once = False
     wait_cf_since = None
     last_cf_retry_at = 0.0
@@ -5598,26 +5721,28 @@ return 'profile-filled';
 
             if isinstance(filled, str) and filled.startswith("wait-cloudflare"):
                 form_filled_once = True
-                token_len = filled.split(":", 1)[1] if ":" in filled else "0"
+                token_len = str(read_turnstile_token_len(page) or (filled.split(":", 1)[1] if ":" in filled else "0"))
                 if log_callback and should_log_cloudflare_wait(cf_wait_log_state, "profile-fill", token_len):
                     log_callback(f"[*] 资料已填写，等待 Cloudflare 人机验证通过... 当前token长度={token_len}")
                 now = time.time()
                 if wait_cf_since is None:
                     wait_cf_since = now
-                # token 长时间为 0：先给被动评分窗口；仍为 0 再少量 trigger；再不行提前失败。
-                if now - wait_cf_since >= 70 and str(token_len) in {"0", ""}:
+                if int(float(token_len or 0)) >= 80:
+                    # token 已到，下一轮走提交
+                    sleep_with_cancel(0.3, cancel_callback)
+                    continue
+                if now - wait_cf_since >= wait_limit and str(token_len) in {"0", ""}:
                     raise Exception(
-                        "Cloudflare Turnstile 70s 内未签发 token（token长度=0）。"
-                        "同一代理若手动能过、脚本不过，通常是 Docker/自动化浏览器指纹被拒，"
-                        "不是验证码逻辑错误"
+                        f"Cloudflare Turnstile {wait_limit:.0f}s 内未签发 token（token长度=0）。"
+                        "同一代理若手动能过、脚本不过，通常是 Docker/自动化浏览器指纹被拒"
                     )
-                # 前 20 秒只做人机交互，不强制 execute（避免脚本味过重）
-                if now - last_humanize_at >= 4:
+                # 全程保持轻微交互；默认不 force execute
+                if now - last_humanize_at >= 5:
                     humanize_page_activity(page, log_callback=None, cancel_callback=cancel_callback)
                     last_humanize_at = now
-                if now - wait_cf_since >= 20 and now - last_cf_retry_at >= 12:
+                if force_execute and now - wait_cf_since >= 35 and now - last_cf_retry_at >= 15:
                     if log_callback:
-                        log_callback("[*] 被动等待后仍无 token，尝试有限次 Turnstile execute...")
+                        log_callback("[*] 已开启 turnstile_force_execute，尝试有限次 execute...")
                     try:
                         trig = page.run_js(build_profile_submit_script("trigger"))
                         if log_callback:
@@ -5645,22 +5770,27 @@ return 'profile-filled';
         submit_state = page.run_js(build_profile_submit_script("submit"))
 
         if isinstance(submit_state, str) and submit_state.startswith("wait-cloudflare"):
-            token_len = submit_state.split(":", 1)[1] if ":" in submit_state else "0"
+            token_len = str(read_turnstile_token_len(page) or (submit_state.split(":", 1)[1] if ":" in submit_state else "0"))
             if log_callback and should_log_cloudflare_wait(cf_wait_log_state, "profile-submit", token_len):
                 log_callback(f"[*] 等待 Cloudflare 人机验证通过后再提交... 当前token长度={token_len}")
             now = time.time()
             if wait_cf_since is None:
                 wait_cf_since = now
-            if now - wait_cf_since >= 70 and str(token_len) in {"0", ""}:
+            if int(float(token_len or 0)) >= 80:
+                sleep_with_cancel(0.3, cancel_callback)
+                continue
+            if now - wait_cf_since >= wait_limit and str(token_len) in {"0", ""}:
                 raise Exception(
-                    "Cloudflare Turnstile 70s 内未签发 token（token长度=0）。"
+                    f"Cloudflare Turnstile {wait_limit:.0f}s 内未签发 token（token长度=0）。"
                     "同一代理若手动能过、脚本不过，通常是 Docker/自动化浏览器指纹被拒"
                 )
-            if now - wait_cf_since >= 20 and now - last_cf_retry_at >= 12:
+            if now - last_humanize_at >= 5:
+                humanize_page_activity(page, log_callback=None, cancel_callback=cancel_callback)
+                last_humanize_at = now
+            if force_execute and now - wait_cf_since >= 35 and now - last_cf_retry_at >= 15:
                 if log_callback:
-                    log_callback("[*] 提交前仍无 token，尝试有限次 Turnstile execute...")
+                    log_callback("[*] 提交前仍无 token，且已开启 force_execute，尝试 execute...")
                 try:
-                    humanize_page_activity(page, log_callback=None, cancel_callback=cancel_callback)
                     trig = page.run_js(build_profile_submit_script("trigger"))
                     if log_callback:
                         log_callback(f"[Debug] Turnstile 主动触发结果: {trig}")

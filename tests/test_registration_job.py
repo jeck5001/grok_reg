@@ -1899,6 +1899,9 @@ def test_turnstile_hook_is_deferred_until_profile_form():
 
     assert "install_turnstile_page_hook(" not in source[browser_start:browser_end]
     assert "install_turnstile_page_hook(" not in source[signup_start:signup_end]
+    # 资料页按配置可选安装 API pageHook；默认路径是 light stealth
+    assert "install_light_stealth_script(page" in source[profile_start:profile_end]
+    assert "turnstile_patch_api" in source[profile_start:profile_end]
     assert "install_turnstile_page_hook(page" in source[profile_start:profile_end]
 
 

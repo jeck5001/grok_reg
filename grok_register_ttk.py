@@ -1711,44 +1711,40 @@ def install_light_stealth_script(page, log_callback=None):
     };
   } catch (e) {}
 
-  // 9. navigator.plugins 伪装 —— Docker Chromium 只有 5 个 PDF 插件，与桌面 Chrome 一致
-  //    但 Turnstile 可能检查 plugins 是否可枚举 / 是否被 Object.freeze 过
+  // 9. navigator.plugins 伪装 —— headless Chrome 的 plugins 为空数组是已知检测项
+  //    必须先缓存原始值，否则 getter 内访问 navigator.plugins 会无限递归
   try {
-    Object.defineProperty(navigator, 'plugins', {
-      get: () => {
-        // 用原生 plugins 对象，只确保不是空数组（headless 特征）
-        const real = navigator.plugins;
-        return (real && real.length > 0) ? real : [
-          Object.create(Plugin.prototype, {
-            name: { value: 'Chrome PDF Plugin', enumerable: true },
-            filename: { value: 'internal-pdf-viewer', enumerable: true },
-            description: { value: 'Portable Document Format', enumerable: true },
-            length: { value: 1 },
-          }),
-        ];
-      },
-      configurable: true,
-    });
+    const _origPlugins = navigator.plugins;
+    if (!_origPlugins || _origPlugins.length === 0) {
+      // 仅当原生 plugins 为空时才覆盖（headless 特征）
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => _origPlugins,
+        configurable: true,
+      });
+    }
   } catch (e) {}
 
   // 10. WebRTC 屏蔽 —— 容器内 WebRTC 会暴露内网 IP / 无 ICE 候选，是已知检测项
   try {
-    if (window.RTCPeerConnection) {
-      const origRTC = window.RTCPeerConnection;
-      window.RTCPeerConnection = function(config, constraints) {
-        // 强制只走 relay（走 TURN 服务器），不暴露本地 IP
-        const patchedConfig = Object.assign({}, config || {});
-        if (!patchedConfig.iceServers) {
-          patchedConfig.iceServers = [];
-        }
-        return new origRTC(patchedConfig, constraints);
-      };
-      window.RTCPeerConnection.prototype = origRTC.prototype;
+    if (window.RTCPeerConnection || window.webkitRTCPeerConnection) {
+      const _RTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+      const _origConnect = _RTC.prototype.connect;
+      // 劫持 setConfiguration 来强制 relay-only，而非替换整个构造函数（避免破坏 instanceof）
+      const _origSetConfig = _RTC.prototype.setConfiguration;
+      if (_origSetConfig) {
+        _RTC.prototype.setConfiguration = function(config) {
+          if (config && config.iceTransportPolicy === undefined) {
+            config.iceTransportPolicy = 'relay';
+          }
+          return _origSetConfig.call(this, config);
+        };
+      }
     }
+    // 屏蔽 getUserMedia / enumerateDevices 中的 videoinput（容器无摄像头）
     if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
-      const origEnum = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+      const _origEnum = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
       navigator.mediaDevices.enumerateDevices = function() {
-        return origEnum().then(devices => devices.filter(d => d.kind !== 'videoinput'));
+        return _origEnum().then(d => d.filter(x => x.kind !== 'videoinput'));
       };
     }
   } catch (e) {}

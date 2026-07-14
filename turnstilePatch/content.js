@@ -109,39 +109,36 @@
         };
     } catch (e) {}
 
-    // 9. navigator.plugins 伪装
+    // 9. navigator.plugins 伪装 —— headless Chrome 的 plugins 为空数组是已知检测项
+    //    必须先缓存原始值，否则 getter 内访问 navigator.plugins 会无限递归
     try {
-        Object.defineProperty(navigator, "plugins", {
-            get: function () {
-                var real = navigator.plugins;
-                return (real && real.length > 0) ? real : [
-                    Object.create(Plugin.prototype, {
-                        name: { value: "Chrome PDF Plugin", enumerable: true },
-                        filename: { value: "internal-pdf-viewer", enumerable: true },
-                        description: { value: "Portable Document Format", enumerable: true },
-                        length: { value: 1 },
-                    }),
-                ];
-            },
-            configurable: true,
-        });
+        var _origPlugins = navigator.plugins;
+        if (!_origPlugins || _origPlugins.length === 0) {
+            Object.defineProperty(navigator, "plugins", {
+                get: function () { return _origPlugins; },
+                configurable: true,
+            });
+        }
     } catch (e) {}
 
     // 10. WebRTC 屏蔽 —— 容器内 WebRTC 暴露内网 IP 是检测项
     try {
-        if (window.RTCPeerConnection) {
-            var origRTC = window.RTCPeerConnection;
-            window.RTCPeerConnection = function (config, constraints) {
-                var patchedConfig = Object.assign({}, config || {});
-                if (!patchedConfig.iceServers) patchedConfig.iceServers = [];
-                return new origRTC(patchedConfig, constraints);
-            };
-            window.RTCPeerConnection.prototype = origRTC.prototype;
+        if (window.RTCPeerConnection || window.webkitRTCPeerConnection) {
+            var _RTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+            var _origSetConfig = _RTC.prototype.setConfiguration;
+            if (_origSetConfig) {
+                _RTC.prototype.setConfiguration = function (config) {
+                    if (config && config.iceTransportPolicy === undefined) {
+                        config.iceTransportPolicy = "relay";
+                    }
+                    return _origSetConfig.call(this, config);
+                };
+            }
         }
         if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
             var origEnum = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
             navigator.mediaDevices.enumerateDevices = function () {
-                return origEnum().then(function (devices) { return devices.filter(function (d) { return d.kind !== "videoinput"; }); });
+                return origEnum().then(function (d) { return d.filter(function (x) { return x.kind !== "videoinput"; }); });
             };
         }
     } catch (e) {}

@@ -1506,6 +1506,15 @@ return {
   deviceMemory: navigator.deviceMemory || null,
   chrome: !!(window.chrome && window.chrome.runtime),
   plugins: navigator.plugins ? navigator.plugins.length : 0,
+  hasOwnPlatform: navigator.hasOwnProperty('platform'),
+  hasOwnUA: navigator.hasOwnProperty('userAgent'),
+  hasOwnWebdriver: navigator.hasOwnProperty('webdriver'),
+  userAgentData: navigator.userAgentData ? {
+    platform: navigator.userAgentData.platform,
+    brands: navigator.userAgentData.brands,
+  } : null,
+  maxTouchPoints: navigator.maxTouchPoints,
+  connection: navigator.connection ? navigator.connection.effectiveType : null,
   webgl: (function () {
     try {
       const c = document.createElement('canvas');
@@ -1516,6 +1525,7 @@ return {
         ok: true,
         vendor: gl.getParameter(ext ? ext.UNMASKED_VENDOR_WEBGL : gl.VENDOR),
         renderer: gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER),
+        extCount: (gl.getSupportedExtensions() || []).length,
       };
     } catch (e) {
       return {ok:false, error: String(e && e.message || e).slice(0, 120)};
@@ -1602,91 +1612,200 @@ def install_light_stealth_script(page, log_callback=None):
         return False
     source = r"""
 (() => {
-  // 1. 隐藏 navigator.webdriver
-  try {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
-  } catch (e) {}
+  const isTop = (window.top === window.self);
 
-  // 2. chrome.runtime —— Turnstile 检查 window.chrome.runtime 是否存在
+  // 1. navigator.webdriver —— --disable-blink-features=AutomationControlled 已处理为 false。
+  //    仅当仍为 true/undefined 时在原型上覆盖为 false。
+  //    关键：不在实例上覆盖，否则 navigator.hasOwnProperty('webdriver') 返回 true（真实 Chrome 为 false）。
   try {
-    if (!window.chrome) window.chrome = {};
-    if (!window.chrome.runtime) window.chrome.runtime = {};
-  } catch (e) {}
-
-  // 3. permissions.query —— notifications 路径异常是已知检测项
-  try {
-    const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
-    if (originalQuery) {
-      window.navigator.permissions.query = (parameters) => (
-        parameters && parameters.name === 'notifications'
-          ? Promise.resolve({ state: Notification.permission })
-          : originalQuery(parameters)
-      );
+    const wd = navigator.webdriver;
+    if (wd === true || wd === undefined) {
+      Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false, configurable: true, enumerable: true });
     }
   } catch (e) {}
 
-  // 4. languages
+  // 2. chrome 对象 —— 仅在顶层 frame 添加。
+  //    关键：真实 Chrome 中 chrome.runtime/csi/loadTimes 仅存在于主页面，跨域 iframe 中为 undefined。
+  //    旧代码在所有 frame 注入，Turnstile iframe 中检测到这些属性就知道是自动化环境。
   try {
-    Object.defineProperty(navigator, 'languages', {
-      get: () => ['en-US', 'en'],
-      configurable: true,
-    });
+    if (isTop) {
+      if (!window.chrome) window.chrome = {};
+      if (!window.chrome.runtime) window.chrome.runtime = {};
+      if (!window.chrome.csi) {
+        const _t = Date.now();
+        window.chrome.csi = function() { return { startE: _t - 2000, onloadT: _t - 500, pageT: 2000, tran: 15 }; };
+      }
+      if (!window.chrome.loadTimes) {
+        window.chrome.loadTimes = function() {
+          const now = Date.now() / 1000;
+          return {
+            commitLoadTime: now - 2, connectionInfo: 'h2',
+            finishDocumentLoadTime: now - 1, finishLoadTime: now - 0.5,
+            firstPaintAfterLoadTime: 0, firstPaintTime: now - 1.5,
+            navigationType: 'Other', npnNegotiatedProtocol: 'h2',
+            requestTime: now - 3, startLoadTime: now - 2.5,
+            wasAlternateProtocolAvailable: false, wasFetchedViaSPDY: true,
+            wasNpnNegotiated: true
+          };
+        };
+      }
+    }
   } catch (e) {}
 
-  // 5. platform + userAgent —— 根据 UA 动态推导，Linux UA 替换为 Windows 画像
+  // 3. permissions.query —— 在 Permissions.prototype 上覆盖（避免实例级检测）
+  try {
+    if (window.navigator.permissions && window.navigator.permissions.query) {
+      const origQuery = Permissions.prototype.query;
+      Object.defineProperty(Permissions.prototype, 'query', {
+        value: function(parameters) {
+          if (parameters && parameters.name === 'notifications') {
+            return Promise.resolve({ state: Notification.permission });
+          }
+          return origQuery.call(this, parameters);
+        },
+        configurable: true, writable: true,
+      });
+    }
+  } catch (e) {}
+
+  // 4. languages —— 在 Navigator.prototype 上覆盖
+  try {
+    Object.defineProperty(Navigator.prototype, 'languages', { get: () => ['en-US', 'en'], configurable: true, enumerable: true });
+  } catch (e) {}
+
+  // 5. platform + userAgent + appVersion —— 全部在 Navigator.prototype 上覆盖。
+  //    关键：实例级覆盖会被 navigator.hasOwnProperty('platform') 检测（真实 Chrome 为 false）。
   try {
     const ua = navigator.userAgent || '';
     let p = 'Linux x86_64';
     let fakeUa = ua;
-    if (/Windows/.test(ua)) {
-      p = 'Win32';
-    } else if (/Macintosh/.test(ua)) {
-      p = 'MacIntel';
-    } else if (/Linux/.test(ua)) {
-      // Linux UA 改为 Windows 画像（保持 Chrome 版本号一致）
-      p = 'Win32';
-      fakeUa = ua.replace('X11; Linux x86_64', 'Windows NT 10.0; Win64; x64');
-    }
-    Object.defineProperty(navigator, 'platform', { get: () => p, configurable: true });
+    if (/Windows/.test(ua)) { p = 'Win32'; }
+    else if (/Macintosh/.test(ua)) { p = 'MacIntel'; }
+    else if (/Linux/.test(ua)) { p = 'Win32'; fakeUa = ua.replace('X11; Linux x86_64', 'Windows NT 10.0; Win64; x64'); }
+    Object.defineProperty(Navigator.prototype, 'platform', { get: () => p, configurable: true, enumerable: true });
     if (fakeUa !== ua) {
-      Object.defineProperty(navigator, 'userAgent', { get: () => fakeUa, configurable: true });
+      Object.defineProperty(Navigator.prototype, 'userAgent', { get: () => fakeUa, configurable: true, enumerable: true });
     }
-    // appVersion 始终与有效 UA 同步——CDP 覆盖 UA 时 appVersion 可能未自动更新
-    try {
-      const effectiveUa = fakeUa !== ua ? fakeUa : ua;
-      Object.defineProperty(navigator, 'appVersion', { get: () => effectiveUa.replace('Mozilla/', ''), configurable: true });
-    } catch (e) {}
+    const effectiveUa = fakeUa !== ua ? fakeUa : ua;
+    Object.defineProperty(Navigator.prototype, 'appVersion', { get: () => effectiveUa.replace('Mozilla/', ''), configurable: true, enumerable: true });
   } catch (e) {}
 
-  // 6. WebGL vendor/renderer —— 始终 hook getParameter，在调用时才判断是否需要伪装
-  //    关键：不能先检测再 hook，因为 document_start 阶段检测可能因时序问题失败
-  //    关键2：vendor 和 renderer 必须同时替换，否则 Google+Intel 组合比纯 SwiftShader 更可疑
+  // 6. maxTouchPoints —— 桌面应为 0
+  try {
+    Object.defineProperty(Navigator.prototype, 'maxTouchPoints', { get: () => 0, configurable: true, enumerable: true });
+  } catch (e) {}
+
+  // 7. navigator.connection —— 容器中可能缺失
+  try {
+    if (!navigator.connection) {
+      Object.defineProperty(Navigator.prototype, 'connection', {
+        get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false }),
+        configurable: true, enumerable: true,
+      });
+    }
+  } catch (e) {}
+
+  // 8. navigator.userAgentData —— Docker Chrome 中 platform 为 "Linux"，需覆盖为 "Windows"
+  try {
+    if (navigator.userAgentData) {
+      const ua = navigator.userAgent || '';
+      const cm = ua.match(/Chrome\/(\d+)/);
+      const cv = cm ? cm[1] : '150';
+      const isWin = /Windows/.test(ua);
+      const fakeUAD = {
+        brands: [
+          { brand: 'Google Chrome', version: cv },
+          { brand: 'Chromium', version: cv },
+          { brand: 'Not_A Brand', version: '24' },
+        ],
+        mobile: false,
+        platform: isWin ? 'Windows' : 'macOS',
+        getHighEntropyValues: (hints) => Promise.resolve({
+          brands: [
+            { brand: 'Google Chrome', version: cv },
+            { brand: 'Chromium', version: cv },
+            { brand: 'Not_A Brand', version: '24' },
+          ],
+          mobile: false,
+          platform: isWin ? 'Windows' : 'macOS',
+          platformVersion: isWin ? '10.0.0' : '13.6.0',
+          architecture: 'x86',
+          bitness: '64',
+          model: '',
+          uaFullVersion: cv + '.0.0.0',
+          fullVersionList: [
+            { brand: 'Google Chrome', version: cv + '.0.0.0' },
+            { brand: 'Chromium', version: cv + '.0.0.0' },
+            { brand: 'Not_A Brand', version: '24.0.0.0' },
+          ],
+        }),
+        toJSON: () => ({
+          brands: [
+            { brand: 'Google Chrome', version: cv },
+            { brand: 'Chromium', version: cv },
+            { brand: 'Not_A Brand', version: '24' },
+          ],
+          mobile: false,
+          platform: isWin ? 'Windows' : 'macOS',
+        }),
+      };
+      Object.defineProperty(Navigator.prototype, 'userAgentData', { get: () => fakeUAD, configurable: true, enumerable: true });
+    }
+  } catch (e) {}
+
+  // 9. WebGL vendor/renderer/extensions —— 始终 hook，调用时判断。
+  //    关键：vendor+renderer 必须同时替换；getSupportedExtensions 也要替换（SwiftShader 扩展列表不同）
   try {
     const FAKE_WGL_VENDOR = 'Google Inc. (Intel)';
     const FAKE_WGL_RENDERER = 'ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)';
     const SW_RE = /swiftshader|llvmpipe|softpipe|software[\s_-]*rasterizer|mesa[\s_-]*swrast/i;
+    const FAKE_WGL1_EXTS = [
+      'ANGLE_instanced_arrays','EXT_blend_minmax','EXT_color_buffer_half_float',
+      'EXT_disjoint_timer_query','EXT_float_blend','EXT_frag_depth',
+      'EXT_shader_texture_lod','EXT_texture_compression_bptc',
+      'EXT_texture_compression_rgtc','EXT_texture_filter_anisotropic',
+      'EXT_sRGB','OES_element_index_uint','OES_fbo_render_mipmap',
+      'OES_standard_derivatives','OES_texture_float','OES_texture_float_linear',
+      'OES_texture_half_float','OES_texture_half_float_linear','OES_vertex_array_object',
+      'WEBGL_color_buffer_float','WEBGL_compressed_texture_s3tc',
+      'WEBGL_compressed_texture_s3tc_srgb','WEBGL_debug_renderer_info',
+      'WEBGL_debug_shaders','WEBGL_depth_texture','WEBGL_draw_buffers',
+      'WEBGL_lose_context','WEBGL_multi_draw'
+    ];
+    const FAKE_WGL2_EXTS = [
+      'EXT_color_buffer_float','EXT_color_buffer_half_float','EXT_disjoint_timer_query_webgl2',
+      'EXT_float_blend','EXT_texture_compression_bptc','EXT_texture_compression_rgtc',
+      'EXT_texture_filter_anisotropic','EXT_texture_norm16','KHR_parallel_shader_compile',
+      'OES_draw_buffers_indexed','OES_texture_float_linear','OVR_multiview2',
+      'WEBGL_compressed_texture_s3tc','WEBGL_compressed_texture_s3tc_srgb',
+      'WEBGL_debug_renderer_info','WEBGL_debug_shaders','WEBGL_lose_context',
+      'WEBGL_multi_draw','WEBGL_provoking_vertex'
+    ];
 
-    const hookGetParam = (proto) => {
+    const hookWebGL = (proto, fakeExts) => {
       if (!proto || !proto.getParameter) return;
-      const orig = proto.getParameter;
+      const origGetParam = proto.getParameter;
+      const origGetExts = proto.getSupportedExtensions;
+      const isSW = (gl) => { try { return SW_RE.test(String(origGetParam.call(gl, 37446))); } catch(e) { return false; } };
+
       proto.getParameter = function(param) {
-        const result = orig.call(this, param);
-        // UNMASKED_RENDERER_WEBGL = 37446
+        const result = origGetParam.call(this, param);
         if (param === 37446 && SW_RE.test(String(result))) return FAKE_WGL_RENDERER;
-        // UNMASKED_VENDOR_WEBGL = 37445 —— 当 renderer 是软件渲染时，vendor 也要替换
-        //    不能只检查 vendor 字符串是否含 swiftshader，因为 vendor 通常只是 "Google Inc. (Google)"
-        if (param === 37445) {
-          const realRenderer = orig.call(this, 37446);
-          if (SW_RE.test(String(realRenderer))) return FAKE_WGL_VENDOR;
-        }
+        if (param === 37445 && isSW(this)) return FAKE_WGL_VENDOR;
         return result;
       };
+      if (origGetExts) {
+        proto.getSupportedExtensions = function() {
+          if (isSW(this)) return fakeExts;
+          return origGetExts.call(this);
+        };
+      }
     };
-    try { hookGetParam(WebGLRenderingContext.prototype); } catch (e) {}
-    try { hookGetParam(WebGL2RenderingContext.prototype); } catch (e) {}
+    try { hookWebGL(WebGLRenderingContext.prototype, FAKE_WGL1_EXTS); } catch (e) {}
+    try { hookWebGL(WebGL2RenderingContext.prototype, FAKE_WGL2_EXTS); } catch (e) {}
   } catch (e) {}
 
-  // 7. Canvas 指纹噪声 —— 对 toDataURL/toBlob 注入微量确定性噪声
+  // 10. Canvas 指纹噪声 —— 对 toDataURL/toBlob 注入微量确定性噪声
   try {
     const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
     const origToBlob = HTMLCanvasElement.prototype.toBlob;
@@ -1714,13 +1833,12 @@ def install_light_stealth_script(page, log_callback=None):
     }
   } catch (e) {}
 
-  // 8. AudioContext 指纹噪声 —— Turnstile 会采样 AudioContext 输出做指纹
+  // 11. AudioContext 指纹噪声
   try {
     const origGetChannelData = AudioBuffer.prototype.getChannelData;
     AudioBuffer.prototype.getChannelData = function(channel) {
       const data = origGetChannelData.call(this, channel);
       if (data && data.length > 0) {
-        // 仅对第一个采样点加极微小确定性偏移，不影响听觉，但改变指纹哈希
         const off = ((this.length || 0) * 3 + 1) % 7 / 100000;
         data[0] = data[0] + off;
       }
@@ -1728,25 +1846,10 @@ def install_light_stealth_script(page, log_callback=None):
     };
   } catch (e) {}
 
-  // 9. navigator.plugins 伪装 —— headless Chrome 的 plugins 为空数组是已知检测项
-  //    必须先缓存原始值，否则 getter 内访问 navigator.plugins 会无限递归
-  try {
-    const _origPlugins = navigator.plugins;
-    if (!_origPlugins || _origPlugins.length === 0) {
-      // 仅当原生 plugins 为空时才覆盖（headless 特征）
-      Object.defineProperty(navigator, 'plugins', {
-        get: () => _origPlugins,
-        configurable: true,
-      });
-    }
-  } catch (e) {}
-
-  // 10. WebRTC 屏蔽 —— 容器内 WebRTC 会暴露内网 IP / 无 ICE 候选，是已知检测项
+  // 12. WebRTC 屏蔽 + enumerateDevices —— 在原型上覆盖
   try {
     if (window.RTCPeerConnection || window.webkitRTCPeerConnection) {
       const _RTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
-      const _origConnect = _RTC.prototype.connect;
-      // 劫持 setConfiguration 来强制 relay-only，而非替换整个构造函数（避免破坏 instanceof）
       const _origSetConfig = _RTC.prototype.setConfiguration;
       if (_origSetConfig) {
         _RTC.prototype.setConfiguration = function(config) {
@@ -1757,21 +1860,12 @@ def install_light_stealth_script(page, log_callback=None):
         };
       }
     }
-    // 屏蔽 getUserMedia / enumerateDevices 中的 videoinput（容器无摄像头）
     if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
-      const _origEnum = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
-      navigator.mediaDevices.enumerateDevices = function() {
-        return _origEnum().then(d => d.filter(x => x.kind !== 'videoinput'));
+      const _origEnum = MediaDevices.prototype.enumerateDevices;
+      MediaDevices.prototype.enumerateDevices = function() {
+        return _origEnum.call(this).then(d => d.filter(x => x.kind !== 'videoinput'));
       };
     }
-  } catch (e) {}
-
-  // 11. iframe contentWindow 检测 —— Turnstile 可能通过 iframe.contentWindow.chrome 判断
-  try {
-    const origCreateElement = document.createElement.bind(document);
-    // 不修改 createElement，但确保 shadow DOM 下的 chrome 对象完整
-    if (!window.chrome.csi) window.chrome.csi = function() { return {}; };
-    if (!window.chrome.loadTimes) window.chrome.loadTimes = function() { return { commitLoadTime: Date.now()/1000, startLoadTime: Date.now()/1000 }; };
   } catch (e) {}
 })();
 """
@@ -1788,7 +1882,7 @@ def install_light_stealth_script(page, log_callback=None):
     except Exception:
         pass
     if ok and log_callback:
-        log_callback("[Debug] 已安装增强 stealth（WebGL/Canvas/Audio/Plugins/WebRTC，不补丁 turnstile API）")
+        log_callback("[Debug] 已安装增强 stealth（原型级覆盖+帧隔离+userAgentData+WebGL扩展+Canvas/Audio/WebRTC）")
     return ok
 
 
@@ -5495,7 +5589,7 @@ def _set_page(value):
 
 
 def override_user_agent_for_docker(page, log_callback=None):
-    """Docker 中将 Linux UA 覆盖为 Windows UA（保持 Chrome 版本一致），同时覆盖 HTTP 头和 JS 层。"""
+    """Docker 中将 Linux UA 覆盖为 Windows UA（保持 Chrome 版本一致），同时覆盖 HTTP 头、JS 层和 userAgentData。"""
     if not page or not _env_truthy("GROK_REG_IN_DOCKER"):
         return
     try:
@@ -5506,10 +5600,34 @@ def override_user_agent_for_docker(page, log_callback=None):
         windows_ua = actual_ua.replace("X11; Linux x86_64", "Windows NT 10.0; Win64; x64")
         if windows_ua == actual_ua:
             return  # 不是 Linux UA，无需修改
-        # CDP 覆盖 HTTP 头中的 UA
-        page.run_cdp("Network.setUserAgentOverride", userAgent=windows_ua)
+        # 提取 Chrome 版本号用于 userAgentMetadata
+        import re
+        chrome_match = re.search(r'Chrome/(\d+)', windows_ua)
+        chrome_ver = chrome_match.group(1) if chrome_match else "150"
+        # CDP 覆盖 HTTP 头中的 UA + userAgentData（platform 改为 Windows）
+        page.run_cdp("Network.setUserAgentOverride", userAgent=windows_ua, platform="Windows",
+                      userAgentMetadata={
+                          "brands": [
+                              {"brand": "Google Chrome", "version": chrome_ver},
+                              {"brand": "Chromium", "version": chrome_ver},
+                              {"brand": "Not_A Brand", "version": "24"},
+                          ],
+                          "fullVersionList": [
+                              {"brand": "Google Chrome", "version": chrome_ver + ".0.0.0"},
+                              {"brand": "Chromium", "version": chrome_ver + ".0.0.0"},
+                              {"brand": "Not_A Brand", "version": "24.0.0.0"},
+                          ],
+                          "fullVersion": chrome_ver + ".0.0.0",
+                          "platform": "Windows",
+                          "platformVersion": "10.0.0",
+                          "architecture": "x86",
+                          "bitness": "64",
+                          "model": "",
+                          "mobile": False,
+                          "wow64": False,
+                      })
         if log_callback:
-            log_callback(f"[Debug] UA 已覆盖为 Windows: {windows_ua}")
+            log_callback(f"[Debug] UA+userAgentData 已覆盖为 Windows: {windows_ua}")
     except Exception as exc:
         if log_callback:
             log_callback(f"[Debug] UA 覆盖失败: {str(exc)[:160]}")

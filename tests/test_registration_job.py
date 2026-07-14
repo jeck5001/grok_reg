@@ -801,31 +801,42 @@ def test_yyds_pick_domain_skips_rejected_domains_and_rotates(monkeypatch):
     assert reg.yyds_pick_domain() == "second.example"
 
 
-def test_remember_rejected_email_domain_also_blocks_sibling_subdomains():
+def test_remember_rejected_email_domain_stores_exact_suffix_only(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     reg._rejected_email_domains.clear()
+    reg.load_rejected_email_domains(force=True)
     reg.remember_rejected_email_domain("007.hzeg.eu.org")
 
+    # 只记精确后缀，不自动拉黑父域/兄弟子域
     assert reg.is_email_domain_rejected("007.hzeg.eu.org")
-    assert reg.is_email_domain_rejected("10011.hzeg.eu.org")
-    assert reg.is_email_domain_rejected("hzeg.eu.org")
+    assert not reg.is_email_domain_rejected("10011.hzeg.eu.org")
+    assert not reg.is_email_domain_rejected("hzeg.eu.org")
+    assert not reg.is_email_domain_rejected("eu.org")
     assert not reg.is_email_domain_rejected("10161993.xyz")
+
+    # 只有当父域本身被拒并入库时，才拦截其子域
+    reg.remember_rejected_email_domain("hzeg.eu.org")
+    assert reg.is_email_domain_rejected("10011.hzeg.eu.org")
 
 
 def test_rejected_email_domains_are_persisted_and_reloaded(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     reg._rejected_email_domains.clear()
+    reg.load_rejected_email_domains(force=True)
     reg.remember_rejected_email_domain("100811.xyz")
 
     path = tmp_path / "rejected_email_domains.json"
     assert path.exists()
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert "100811.xyz" in payload["domains"]
+    assert payload["domains"] == ["100811.xyz"]
 
     # 模拟进程重启：清空内存后再加载
     reg._rejected_email_domains.clear()
+    reg.load_rejected_email_domains(force=True)
     assert reg.is_email_domain_rejected("a@100811.xyz")
+    # 父域被显式拉黑时，其子域也应拦截；但不会自动写入父域
     assert reg.is_email_domain_rejected("sub.100811.xyz")
-    assert "100811.xyz" in reg.list_rejected_email_domains()
+    assert reg.list_rejected_email_domains() == ["100811.xyz"]
 
 
 def test_extract_rejected_email_domain_supports_chinese_copy():
@@ -1791,6 +1802,54 @@ def test_turnstile_challenge_falls_back_to_cdp_when_js_misses(monkeypatch):
     assert result["nativeClicked"] is True
     assert result["via"] in {"cdp-iframe", "cdp-frame-owner", "cdp-ax"}
     assert any(method == "Input.dispatchMouseEvent" and params.get("type") == "mousePressed" for method, params in events)
+
+
+def test_turnstile_challenge_clicks_about_blank_frame_owner(monkeypatch):
+    events = []
+
+    class FakePage:
+        def run_js(self, script):
+            # 主文档看不到 iframe 节点（closed shadow 等）
+            return {"state": "turnstile-challenge-not-found", "allIframes": []}
+
+        def run_cdp(self, method, **params):
+            events.append((method, params))
+            if method == "Page.getFrameTree":
+                return {
+                    "frameTree": {
+                        "frame": {"id": "root", "url": "https://accounts.x.ai/sign-up"},
+                        "childFrames": [
+                            {"frame": {"id": "blank1", "url": "about:blank", "name": ""}},
+                            {"frame": {"id": "blank2", "url": "about:blank", "name": ""}},
+                        ],
+                    }
+                }
+            if method == "DOM.getDocument":
+                return {"root": {"nodeId": 1}}
+            if method == "DOM.querySelectorAll":
+                return {"nodeIds": []}
+            if method == "Accessibility.enable":
+                return {}
+            if method == "Accessibility.getFullAXTree":
+                return {"nodes": []}
+            if method == "DOM.getFrameOwner":
+                frame_id = params.get("frameId")
+                return {"nodeId": 11 if frame_id == "blank1" else 12, "backendNodeId": 21}
+            if method == "DOM.getBoxModel":
+                node_id = params.get("nodeId")
+                if node_id == 11:
+                    # checkbox-like bar
+                    return {"model": {"content": [120, 400, 420, 400, 420, 465, 120, 465]}}
+                # too tall / not checkbox-like
+                return {"model": {"content": [0, 0, 800, 0, 800, 600, 0, 600]}}
+            return {}
+
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda *args, **kwargs: None)
+    result = reg._click_turnstile_challenge_if_visible(FakePage())
+    assert result["nativeClicked"] is True
+    assert result["via"] == "cdp-frame-owner"
+    assert result["width"] == 300
+    assert any(method == "DOM.getFrameOwner" for method, _ in events)
 
 
 def test_wait_for_sso_cookie_uses_native_click_for_final_page(monkeypatch):

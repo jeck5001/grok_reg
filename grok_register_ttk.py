@@ -2006,16 +2006,35 @@ def _locate_turnstile_target_via_cdp(page):
             for child in node.get("childFrames") or []:
                 walk(child, depth + 1)
 
-        walk(tree.get("frameTree") or tree)
+        root_frame_id = None
+        frame_tree = tree.get("frameTree") or tree
+        if isinstance(frame_tree, dict) and isinstance(frame_tree.get("frame"), dict):
+            root_frame_id = frame_tree.get("frame", {}).get("id")
+        walk(frame_tree)
         diagnostics["frames"] = frames[:12]
         cloud_frames = [
             f for f in frames
             if any(k in str(f.get("url") or "").lower() for k in ("cloudflare", "turnstile", "cf-chl", "challenges."))
         ]
+        # Turnstile 在本地经常是 about:blank 子 frame（srcdoc/blob），URL 不含 cloudflare。
+        blank_frames = [
+            f for f in frames
+            if f.get("id") and f.get("id") != root_frame_id
+            and (
+                not str(f.get("url") or "").strip()
+                or str(f.get("url") or "").startswith("about:blank")
+                or str(f.get("url") or "").startswith("blob:")
+            )
+        ]
         diagnostics["cloudFrameCount"] = len(cloud_frames)
+        diagnostics["blankFrameCount"] = len(blank_frames)
+        candidate_frames = cloud_frames + blank_frames
     except Exception as exc:
         diagnostics["frameTreeError"] = str(exc)[:160]
         cloud_frames = []
+        blank_frames = []
+        candidate_frames = []
+        root_frame_id = None
 
     # 2) pierce DOM 找 iframe 节点 box
     try:
@@ -2130,10 +2149,10 @@ def _locate_turnstile_target_via_cdp(page):
     except Exception as exc:
         diagnostics["axError"] = str(exc)[:160]
 
-    # 4) 若有 cloudflare 子 frame，尝试用 DOM.getFrameOwner 拿 owner 元素 box
-    for frame in cloud_frames[:5]:
+    # 4) 对 cloudflare / about:blank 子 frame，用 DOM.getFrameOwner 拿宿主 iframe 的 box 并点击左侧
+    for frame in (candidate_frames or cloud_frames)[:12]:
         frame_id = frame.get("id")
-        if not frame_id:
+        if not frame_id or frame_id == root_frame_id:
             continue
         try:
             owner = page.run_cdp("DOM.getFrameOwner", frameId=frame_id) or {}
@@ -2156,6 +2175,15 @@ def _locate_turnstile_target_via_cdp(page):
             width, height = right - left, bottom - top
             if width <= 1 or height <= 1:
                 continue
+            url = str(frame.get("url") or "")
+            is_cf_url = any(k in url.lower() for k in ("cloudflare", "turnstile", "cf-chl", "challenges."))
+            # about:blank 宿主框常见尺寸：宽 240~520，高 50~90
+            checkbox_like = (180 <= width <= 560 and 36 <= height <= 120)
+            if not is_cf_url and not checkbox_like:
+                diagnostics.setdefault("skippedBlankOwners", []).append(
+                    {"url": url[:80], "w": int(width), "h": int(height)}
+                )
+                continue
             return {
                 "state": "turnstile-challenge-target",
                 "via": "cdp-frame-owner",
@@ -2163,7 +2191,7 @@ def _locate_turnstile_target_via_cdp(page):
                 "y": int(top + height / 2),
                 "width": int(width),
                 "height": int(height),
-                "src": str(frame.get("url") or "")[:160],
+                "src": url[:160],
                 "diagnostics": diagnostics,
             }
         except Exception:
@@ -4528,19 +4556,31 @@ def generate_username(length=10):
     return "".join(secrets.choice(chars) for _ in range(length))
 
 
-def rejected_email_domain_variants(domain):
-    normalized = str(domain or "").strip().lower().lstrip("@")
+def normalize_rejected_email_domain(domain):
+    """只规范化为精确邮箱后缀，不自动提升父域。
+
+    例：user@07210d00.dpdns.org -> 07210d00.dpdns.org
+    不会额外写入 dpdns.org / eu.org。
+    """
+    normalized = str(domain or "").strip().lower().lstrip("@.")
     if not normalized:
-        return set()
-    variants = {normalized}
-    parts = [part for part in normalized.split(".") if part]
-    # 子域被拒时连父域一起记，例如 007.hzeg.eu.org -> hzeg.eu.org
-    if len(parts) >= 3:
-        variants.add(".".join(parts[1:]))
-    # 邮箱地址进来时只取 @ 后域名
+        return ""
     if "@" in normalized:
-        variants |= rejected_email_domain_variants(normalized.split("@", 1)[1])
-    return {item for item in variants if item and "@" not in item}
+        normalized = normalized.split("@", 1)[1].strip().lower().lstrip(".")
+    # 去掉尾部点
+    normalized = normalized.strip(".")
+    if not normalized or "." not in normalized:
+        return ""
+    # 过滤明显不是域名的内容
+    if any(ch.isspace() for ch in normalized):
+        return ""
+    return normalized
+
+
+def rejected_email_domain_variants(domain):
+    """兼容旧调用：现在只返回精确域名集合。"""
+    exact = normalize_rejected_email_domain(domain)
+    return {exact} if exact else set()
 
 
 def load_rejected_email_domains(force=False):
@@ -4548,9 +4588,6 @@ def load_rejected_email_domains(force=False):
     global _rejected_email_domains
     path = get_rejected_email_domains_file()
     with _rejected_email_domains_lock:
-        if not force and _rejected_email_domains:
-            # 已有内存数据时也要合并磁盘，避免多任务漏载
-            pass
         loaded = set()
         if os.path.isfile(path):
             try:
@@ -4563,7 +4600,9 @@ def load_rejected_email_domains(force=False):
                 else:
                     items = []
                 for item in items:
-                    loaded |= rejected_email_domain_variants(item)
+                    exact = normalize_rejected_email_domain(item)
+                    if exact:
+                        loaded.add(exact)
             except Exception:
                 loaded = set()
         if force:
@@ -4600,14 +4639,14 @@ def save_rejected_email_domains():
 
 
 def remember_rejected_email_domain(domain):
-    """记录被 x.ai 拒收的邮箱后缀，并持久化到 data/rejected_email_domains.json。"""
+    """只记录被拒的精确后缀，不自动记父域。"""
     load_rejected_email_domains()
-    variants = rejected_email_domain_variants(domain)
-    if not variants:
+    exact = normalize_rejected_email_domain(domain)
+    if not exact:
         return set()
     with _rejected_email_domains_lock:
         before = set(_rejected_email_domains)
-        _rejected_email_domains.update(variants)
+        _rejected_email_domains.add(exact)
         changed = _rejected_email_domains != before
         snapshot = set(_rejected_email_domains)
     if changed:
@@ -4619,20 +4658,19 @@ def remember_rejected_email_domain(domain):
 
 
 def is_email_domain_rejected(domain):
+    """精确匹配黑名单。
+
+    - 存的是 07210d00.dpdns.org 时，只跳过这个后缀
+    - 若将来主域 dpdns.org 自己也被拒并写入，则 foo.dpdns.org 会因后缀命中而跳过
+    """
     load_rejected_email_domains()
-    normalized = str(domain or "").strip().lower().lstrip("@")
+    normalized = normalize_rejected_email_domain(domain)
     if not normalized:
         return False
-    if "@" in normalized:
-        normalized = normalized.split("@", 1)[1]
     with _rejected_email_domains_lock:
         if normalized in _rejected_email_domains:
             return True
-        parts = [part for part in normalized.split(".") if part]
-        for index in range(1, max(0, len(parts) - 1)):
-            parent = ".".join(parts[index:])
-            if parent in _rejected_email_domains:
-                return True
+        # 仅当黑名单里显式存在父域时，才拦截其子域
         for rejected in _rejected_email_domains:
             if normalized.endswith("." + rejected):
                 return True

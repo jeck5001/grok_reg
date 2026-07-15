@@ -134,6 +134,7 @@ DEFAULT_CONFIG = {
     "turnstile_sitekey": "0x4AAAAAAAhr9JGVDZbrZOo0",
     # 注册最终建号方式：auto|api|browser
     # auto：Docker 默认走 API create_account（与 grokcli-2api 同路径）；本机默认 browser
+    # auto|http|api|browser — docker 默认 http 纯协议；api=浏览器OTP+HTTP建号；browser=全浏览器
     "signup_mode": "auto",
     "show_tutorial_on_start": True,
     "cloudmail_url": "",
@@ -4382,10 +4383,10 @@ def validate_registration_config(settings):
         else:
             normalized[bool_key] = bool(raw_bool)
     signup_mode = str(normalized.get("signup_mode") or "auto").strip().lower()
-    if signup_mode not in {"auto", "api", "browser"}:
+    if signup_mode not in {"auto", "http", "api", "browser"}:
         signup_mode = "auto"
     env_mode = str(os.environ.get("GROK_REG_SIGNUP_MODE") or "").strip().lower()
-    if env_mode in {"auto", "api", "browser"}:
+    if env_mode in {"auto", "http", "api", "browser"}:
         signup_mode = env_mode
     normalized["signup_mode"] = signup_mode
     try:
@@ -4591,87 +4592,128 @@ class RegistrationJob:
         profile = None
         mail_ok = False
         max_mail_retry = 3
-        for mail_try in range(1, max_mail_retry + 1):
-            logf(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-            open_signup_page(log_callback=logf, cancel_callback=self.should_stop)
-            logf("[*] 2. 创建邮箱并提交")
-            try:
-                email, dev_token = fill_email_and_submit(
-                    log_callback=logf, cancel_callback=self.should_stop
-                )
-            except EmailDomainRejected as rejected:
-                remembered = remember_rejected_email_domain(rejected.domain)
-                if mail_try < max_mail_retry:
-                    logf(
-                        f"[!] 邮箱域名被 x.ai 拒收，已加入黑名单并换后缀重试: {rejected.domain}"
-                        f"（当前共 {len(remembered)} 个拒收域名）"
-                    )
-                    restart_browser(log_callback=logf)
-                    sleep_with_cancel(1, self.should_stop)
-                    continue
-                raise
-            logf(f"[*] 邮箱: {email}")
-            try:
-                with open(
-                    os.path.join(get_data_dir(), "mail_credentials.txt"),
-                    "a",
-                    encoding="utf-8",
-                ) as f:
-                    f.write(f"{email}\t{dev_token}\n")
-            except Exception:
-                pass
-            logf("[*] 3. 拉取验证码")
-            try:
-                code = fill_code_and_submit(
-                    email, dev_token, log_callback=logf, cancel_callback=self.should_stop
-                )
-                logf(f"[*] 验证码: {code}")
-                signup_mode = resolve_signup_mode()
-                if signup_mode == "api":
-                    logf("[*] 4. API 建号（Solver token + create_account，容器推荐）")
-                    sso_api, profile = register_via_api_after_otp(
-                        email,
-                        code,
-                        log_callback=logf,
-                        cancel_callback=self.should_stop,
-                    )
-                    # 把 sso 暂存到 profile，后续跳过 wait_for_sso
-                    profile = dict(profile or {})
-                    profile["sso"] = sso_api
-                    profile["signup_mode"] = "api"
-                else:
-                    logf("[*] 4. 填写资料（浏览器 SPA）")
-                    profile = fill_profile_and_submit(
+        signup_mode = resolve_signup_mode()
+
+        # 纯 HTTP：全程无浏览器
+        if signup_mode == "http":
+            for mail_try in range(1, max_mail_retry + 1):
+                try:
+                    logf(f"[*] 纯 HTTP 注册 (尝试 {mail_try}/{max_mail_retry})")
+                    sso_http, profile = register_via_pure_http(
                         log_callback=logf, cancel_callback=self.should_stop
                     )
                     profile = dict(profile or {})
-                    profile["signup_mode"] = "browser"
-                mail_ok = True
-                break
-            except ProfileSessionLost as profile_exc:
-                if mail_try < max_mail_retry:
-                    logf(f"[!] 注册会话丢失，自动换邮箱重试: {profile_exc}")
-                    restart_browser(log_callback=logf)
-                    sleep_with_cancel(1, self.should_stop)
-                    continue
-                raise
-            except Exception as mail_exc:
-                msg = str(mail_exc)
-                if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                    logf(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                    restart_browser(log_callback=logf)
-                    sleep_with_cancel(1, self.should_stop)
-                    continue
-                raise
-        if not mail_ok:
-            raise Exception("验证码阶段失败，已达到最大重试次数")
-        logf(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-        sso = str((profile or {}).get("sso") or "").strip()
-        if sso:
-            logf("[*] 5. 已通过 API create_account 获取 sso")
+                    profile["sso"] = sso_http
+                    profile["signup_mode"] = "http"
+                    email = str(profile.get("email") or "")
+                    mail_ok = True
+                    break
+                except EmailDomainRejected as rejected:
+                    remembered = remember_rejected_email_domain(
+                        getattr(rejected, "domain", None) or str(rejected)
+                    )
+                    if mail_try < max_mail_retry:
+                        logf(
+                            f"[!] 邮箱域名被拒，换后缀重试: {getattr(rejected, 'domain', rejected)}"
+                            f"（黑名单 {len(remembered)}）"
+                        )
+                        sleep_with_cancel(1, self.should_stop)
+                        continue
+                    raise
+                except Exception as mail_exc:
+                    msg = str(mail_exc)
+                    if ("未收到验证码" in msg or "验证码" in msg or "502" in msg or "503" in msg) and mail_try < max_mail_retry:
+                        logf(f"[!] HTTP 注册失败，换邮箱重试: {msg}")
+                        sleep_with_cancel(1, self.should_stop)
+                        continue
+                    raise
+            if not mail_ok:
+                raise Exception("HTTP 注册失败，已达最大重试次数")
+            logf(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+            sso = str((profile or {}).get("sso") or "").strip()
+            if not sso:
+                raise Exception("HTTP 注册未返回 sso")
+            logf("[*] 5. 已通过纯 HTTP 获取 sso")
         else:
-            logf("[*] 5. 等待 sso cookie")
-            sso = wait_for_sso_cookie(log_callback=logf, cancel_callback=self.should_stop)
+            for mail_try in range(1, max_mail_retry + 1):
+                logf(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
+                open_signup_page(log_callback=logf, cancel_callback=self.should_stop)
+                logf("[*] 2. 创建邮箱并提交")
+                try:
+                    email, dev_token = fill_email_and_submit(
+                        log_callback=logf, cancel_callback=self.should_stop
+                    )
+                except EmailDomainRejected as rejected:
+                    remembered = remember_rejected_email_domain(rejected.domain)
+                    if mail_try < max_mail_retry:
+                        logf(
+                            f"[!] 邮箱域名被 x.ai 拒收，已加入黑名单并换后缀重试: {rejected.domain}"
+                            f"（当前共 {len(remembered)} 个拒收域名）"
+                        )
+                        restart_browser(log_callback=logf)
+                        sleep_with_cancel(1, self.should_stop)
+                        continue
+                    raise
+                logf(f"[*] 邮箱: {email}")
+                try:
+                    with open(
+                        os.path.join(get_data_dir(), "mail_credentials.txt"),
+                        "a",
+                        encoding="utf-8",
+                    ) as f:
+                        f.write(f"{email}\t{dev_token}\n")
+                except Exception:
+                    pass
+                logf("[*] 3. 拉取验证码")
+                try:
+                    code = fill_code_and_submit(
+                        email, dev_token, log_callback=logf, cancel_callback=self.should_stop
+                    )
+                    logf(f"[*] 验证码: {code}")
+                    if signup_mode == "api":
+                        logf("[*] 4. API 建号（浏览器OTP + HTTP create_account）")
+                        sso_api, profile = register_via_api_after_otp(
+                            email,
+                            code,
+                            log_callback=logf,
+                            cancel_callback=self.should_stop,
+                        )
+                        profile = dict(profile or {})
+                        profile["sso"] = sso_api
+                        profile["signup_mode"] = "api"
+                    else:
+                        logf("[*] 4. 填写资料（浏览器 SPA）")
+                        profile = fill_profile_and_submit(
+                            log_callback=logf, cancel_callback=self.should_stop
+                        )
+                        profile = dict(profile or {})
+                        profile["signup_mode"] = "browser"
+                    mail_ok = True
+                    break
+                except ProfileSessionLost as profile_exc:
+                    if mail_try < max_mail_retry:
+                        logf(f"[!] 注册会话丢失，自动换邮箱重试: {profile_exc}")
+                        restart_browser(log_callback=logf)
+                        sleep_with_cancel(1, self.should_stop)
+                        continue
+                    raise
+                except Exception as mail_exc:
+                    msg = str(mail_exc)
+                    if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
+                        logf(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                        restart_browser(log_callback=logf)
+                        sleep_with_cancel(1, self.should_stop)
+                        continue
+                    raise
+            if not mail_ok:
+                raise Exception("验证码阶段失败，已达到最大重试次数")
+            logf(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+            sso = str((profile or {}).get("sso") or "").strip()
+            if sso:
+                logf("[*] 5. 已通过 API create_account 获取 sso")
+            else:
+                logf("[*] 5. 等待 sso cookie")
+                sso = wait_for_sso_cookie(log_callback=logf, cancel_callback=self.should_stop)
         if self.settings.get("enable_nsfw"):
             logf("[*] 6. 开启 NSFW")
             nsfw_ok, nsfw_message = enable_nsfw_for_token(sso, log_callback=logf)
@@ -4734,9 +4776,14 @@ class RegistrationJob:
     def _worker_loop(self, worker_id, total, task_queue):
         prefix = f"[T{worker_id}]"
         logf = lambda m: self.log(f"{prefix} {m}")
+        signup_mode = resolve_signup_mode()
+        need_browser = signup_mode != "http"
         try:
-            start_browser(log_callback=logf)
-            logf("[*] 浏览器已启动")
+            if need_browser:
+                start_browser(log_callback=logf)
+                logf("[*] 浏览器已启动")
+            else:
+                logf("[*] 纯 HTTP 模式（不启动浏览器）")
             while not self.should_stop():
                 try:
                     idx = task_queue.get_nowait()
@@ -4768,14 +4815,16 @@ class RegistrationJob:
                         if pause_seconds > 0:
                             logf(f"[*] 账号间隔等待 {pause_seconds:.1f}s，降低批量节奏")
                             sleep_with_cancel(pause_seconds, self.should_stop)
-                        restart_browser(log_callback=logf)
-                        sleep_with_cancel(1, self.should_stop)
+                        if need_browser:
+                            restart_browser(log_callback=logf)
+                            sleep_with_cancel(1, self.should_stop)
                 if should_stop_after_task:
                     break
         except Exception as exc:
             logf(f"[!] 线程异常: {exc}")
         finally:
-            stop_browser()
+            if need_browser:
+                stop_browser()
 
     def _run(self):
         global config
@@ -6046,15 +6095,15 @@ _NEXT_ACTION_CHUNK_HINTS = (
 
 
 def resolve_signup_mode():
-    """auto: Docker/容器默认 api，本机默认 browser。"""
+    """auto: Docker 默认 http 纯协议；本机默认 browser。"""
     mode = str(config.get("signup_mode") or "auto").strip().lower()
-    if mode in {"api", "browser"}:
+    if mode in {"http", "api", "browser"}:
         return mode
     env_mode = str(os.environ.get("GROK_REG_SIGNUP_MODE") or "").strip().lower()
-    if env_mode in {"api", "browser"}:
+    if env_mode in {"http", "api", "browser"}:
         return env_mode
     if _env_truthy("GROK_REG_IN_DOCKER"):
-        return "api"
+        return "http"
     return "browser"
 
 
@@ -7348,6 +7397,273 @@ def register_via_api_after_otp(
         "family_name": family_name,
         "password": password,
     }
+
+
+def _xai_http_session():
+    if requests is None:
+        raise RuntimeError("curl_cffi 未安装")
+    proxies = get_proxies()
+    sk = {"impersonate": "chrome131", "timeout": 30}
+    if proxies:
+        sk["proxies"] = proxies
+    return requests.Session(**sk)
+
+
+def _xai_grpc_call(session, url, fields, referer=SIGNUP_URL, log_callback=None):
+    """gRPC-web AuthManagement 调用。fields: [(field_no, string), ...]."""
+    msg = b""
+    for field_no, value in fields:
+        msg += _grpc_encode_string(int(field_no), str(value))
+    body = _grpc_frame_request(msg)
+    headers = {
+        "content-type": "application/grpc-web+proto",
+        "x-grpc-web": "1",
+        "x-user-agent": "connect-es/2.1.1",
+        "accept": "*/*",
+        "origin": "https://accounts.x.ai",
+        "referer": referer,
+        "user-agent": get_user_agent(),
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "empty",
+    }
+    resp = session.post(url, data=body, headers=headers, timeout=30)
+    raw = resp.content or b""
+    parsed = _grpc_parse_response(raw)
+    ok = int(getattr(resp, "status_code", 0) or 0) == 200 and parsed.get("grpc_status") == 0
+    if log_callback:
+        log_callback(
+            f"[*] gRPC {url.rsplit('/', 1)[-1]} HTTP {resp.status_code} "
+            f"grpc={parsed.get('grpc_status')} ok={ok} body_len={len(raw)}"
+        )
+    return {
+        "ok": ok,
+        "http_status": int(getattr(resp, "status_code", 0) or 0),
+        "grpc_status": parsed.get("grpc_status"),
+        "trailers": parsed.get("trailers") or {},
+        "raw": raw,
+    }
+
+
+def register_via_pure_http(log_callback=None, cancel_callback=None):
+    """纯 HTTP 注册（无浏览器），对齐 grokcli-2api：
+
+    1) 创建临时邮箱
+    2) GET sign-up 取 cookie + next-action
+    3) 并行解 signup/sign-in Turnstile
+    4) CreateEmailValidationCode → 收码 → VerifyEmailValidationCode
+    5) create_account + CreateSession + 返回 sso
+    """
+    raise_if_cancelled(cancel_callback)
+    given_name, family_name, password = build_profile()
+    sitekey = str(config.get("turnstile_sitekey") or "0x4AAAAAAAhr9JGVDZbrZOo0")
+    signup_url = SIGNUP_URL
+    signin_url = "https://accounts.x.ai/sign-in?redirect=grok-com"
+    create_code_url = "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateEmailValidationCode"
+    verify_code_url = "https://accounts.x.ai/auth_mgmt.AuthManagement/VerifyEmailValidationCode"
+
+    if log_callback:
+        log_callback(f"[*] 纯 HTTP 建号：{given_name} {family_name}")
+
+    # 1) 邮箱
+    email, dev_token = get_email_and_token(log_callback=log_callback)
+    if log_callback:
+        log_callback(f"[*] 邮箱: {email}")
+    try:
+        with open(os.path.join(get_data_dir(), "mail_credentials.txt"), "a", encoding="utf-8") as f:
+            f.write(f"{email}\t{dev_token}\n")
+    except Exception:
+        pass
+
+    if not probe_local_turnstile_solver():
+        raise RuntimeError(f"Turnstile Solver 不可达: {normalize_turnstile_solver_url()}")
+
+    session = _xai_http_session()
+    try:
+        # 2) 打开 sign-up（拿 CF cookie）
+        raise_if_cancelled(cancel_callback)
+        page_headers = {
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "user-agent": get_user_agent(),
+            "sec-fetch-site": "none",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-dest": "document",
+            "upgrade-insecure-requests": "1",
+        }
+        resp = session.get(signup_url, headers=page_headers, timeout=30)
+        html = resp.text or ""
+        if log_callback:
+            log_callback(f"[*] GET sign-up HTTP {resp.status_code} html_len={len(html)}")
+        if resp.status_code >= 400 or len(html) < 200:
+            raise RuntimeError(f"加载 sign-up 失败 HTTP {resp.status_code}")
+
+        # session cookies → list for later CreateSession
+        browser_cookies = []
+        try:
+            jar = session.cookies
+            # curl_cffi Cookies may support jar iteration
+            if hasattr(jar, "jar"):
+                for c in jar.jar:
+                    browser_cookies.append(
+                        {
+                            "name": getattr(c, "name", ""),
+                            "value": getattr(c, "value", ""),
+                            "domain": getattr(c, "domain", "") or ".x.ai",
+                            "path": getattr(c, "path", "/") or "/",
+                        }
+                    )
+            elif hasattr(jar, "items"):
+                for name, value in jar.items():
+                    browser_cookies.append(
+                        {"name": name, "value": value, "domain": ".x.ai", "path": "/"}
+                    )
+        except Exception:
+            pass
+
+        headers_meta = scrape_signup_next_headers(
+            html,
+            log_callback=log_callback,
+            proxies=get_proxies(),
+            browser_cookies=browser_cookies,
+            page=None,
+        )
+
+        # 3) 并行 Turnstile（与等邮件重叠：先启动线程）
+        if log_callback:
+            log_callback("[*] 并行求解 signup/sign-in Turnstile...")
+        signup_token = {"value": "", "error": None}
+        signin_token = {"value": "", "error": None}
+
+        def _job_signup():
+            try:
+                signup_token["value"] = _solve_turnstile_quiet(
+                    signup_url, sitekey, "signup",
+                    log_callback=log_callback, cancel_callback=cancel_callback,
+                )
+            except Exception as exc:
+                signup_token["error"] = exc
+
+        def _job_signin():
+            try:
+                signin_token["value"] = _solve_turnstile_quiet(
+                    signin_url, sitekey, "sign-in",
+                    log_callback=log_callback, cancel_callback=cancel_callback,
+                )
+            except Exception as exc:
+                signin_token["error"] = exc
+
+        t1 = threading.Thread(target=_job_signup, name="http-ts-signup", daemon=True)
+        t2 = threading.Thread(target=_job_signin, name="http-ts-signin", daemon=True)
+        t1.start()
+        t2.start()
+
+        # 4) 发验证码（与 Solver 并行）
+        raise_if_cancelled(cancel_callback)
+        send_res = _xai_grpc_call(
+            session, create_code_url, [(1, email)], referer=signup_url, log_callback=log_callback
+        )
+        if not send_res.get("ok"):
+            # 域名拒收等
+            trailers = send_res.get("trailers") or {}
+            msg = str(trailers.get("grpc-message") or "")
+            raw_preview = (send_res.get("raw") or b"")[:200]
+            if "reject" in msg.lower() or "domain" in msg.lower():
+                domain = email.split("@")[-1] if "@" in email else ""
+                if domain:
+                    remember_rejected_email_domain(domain)
+                raise EmailDomainRejected(domain or email)
+            raise RuntimeError(
+                f"CreateEmailValidationCode 失败 http={send_res.get('http_status')} "
+                f"grpc={send_res.get('grpc_status')} msg={msg!r} raw={raw_preview!r}"
+            )
+
+        # 5) 收验证码
+        if log_callback:
+            log_callback("[*] 等待邮箱验证码...")
+        code = get_oai_code(
+            dev_token,
+            email,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
+        if not code:
+            raise Exception("获取验证码失败")
+        clean_code = str(code).replace("-", "").replace(" ", "").strip().upper()
+        if log_callback:
+            log_callback(f"[*] 验证码: {clean_code}")
+
+        # 等 Turnstile 完成
+        while t1.is_alive() or t2.is_alive():
+            raise_if_cancelled(cancel_callback)
+            t1.join(timeout=0.4)
+            t2.join(timeout=0.4)
+        if signup_token["error"] or len(str(signup_token["value"] or "")) < 80:
+            raise RuntimeError(f"signup Turnstile 失败: {signup_token['error'] or 'empty'}")
+        if signin_token["error"] or len(str(signin_token["value"] or "")) < 80:
+            if log_callback:
+                log_callback(f"[!] sign-in Turnstile 失败，CreateSession 将串行补解: {signin_token['error']}")
+            signin_token["value"] = ""
+
+        # 6) 立即 verify（验证码时效短）
+        raise_if_cancelled(cancel_callback)
+        vres = _xai_grpc_call(
+            session,
+            verify_code_url,
+            [(1, email), (2, clean_code)],
+            referer=signup_url,
+            log_callback=log_callback,
+        )
+        if not vres.get("ok") and log_callback:
+            log_callback(
+                f"[!] VerifyEmail 非 ok（仍尝试 create_account） "
+                f"grpc={vres.get('grpc_status')}"
+            )
+
+        # 7) create_account + CreateSession
+        # 从 session 刷新 cookie 列表
+        try:
+            if hasattr(session.cookies, "jar"):
+                browser_cookies = []
+                for c in session.cookies.jar:
+                    browser_cookies.append(
+                        {
+                            "name": getattr(c, "name", ""),
+                            "value": getattr(c, "value", ""),
+                            "domain": getattr(c, "domain", "") or ".x.ai",
+                            "path": getattr(c, "path", "/") or "/",
+                        }
+                    )
+        except Exception:
+            pass
+
+        sso = create_xai_account_via_http(
+            email=email,
+            given_name=given_name,
+            family_name=family_name,
+            password=password,
+            email_code=clean_code,
+            turnstile_token=signup_token["value"],
+            next_action=headers_meta["next_action"],
+            router_state_tree=headers_meta["router_state_tree"],
+            browser_cookies=browser_cookies,
+            signup_url=signup_url,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            signin_turnstile_token=signin_token["value"],
+        )
+        return sso, {
+            "given_name": given_name,
+            "family_name": family_name,
+            "password": password,
+            "email": email,
+            "signup_mode": "http",
+            "sso": sso,
+        }
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
 
 
 _thread_ctx = threading.local()

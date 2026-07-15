@@ -171,9 +171,10 @@
                 <label>
                   建号模式
                   <select name="signup_mode">
-                    <option value="auto" selected>auto（Docker→API，本机→浏览器）</option>
-                    <option value="api">api（Solver+HTTP create_account，推荐容器）</option>
-                    <option value="browser">browser（SPA 点 Complete sign up）</option>
+                    <option value="auto" selected>auto（Docker→纯HTTP，本机→浏览器）</option>
+                    <option value="http">http（纯协议，无浏览器，推荐）</option>
+                    <option value="api">api（浏览器OTP + HTTP 建号）</option>
+                    <option value="browser">browser（全浏览器 SPA）</option>
                   </select>
                 </label>
                 <label class="wide">

@@ -6045,8 +6045,14 @@ def _cookie_header_from_list(cookies):
     return "; ".join(pairs)
 
 
-_NEXT_ACTION_CACHE = {"action": "", "router": "", "at": 0.0, "html_sig": ""}
-_NEXT_ACTION_CACHE_TTL = 6 * 3600  # 6h
+_NEXT_ACTION_CACHE = {
+    "action": "",
+    "router": "",
+    "chunk_path": "",
+    "at": 0.0,
+    "html_sig": "",
+}
+_NEXT_ACTION_CACHE_TTL = 24 * 3600  # 24h（部署很少变）
 _NEXT_ACTION_CACHE_LOCK = threading.Lock()
 
 
@@ -6066,6 +6072,7 @@ def _load_next_action_disk_cache():
                 {
                     "action": str(data.get("action") or ""),
                     "router": str(data.get("router") or ""),
+                    "chunk_path": str(data.get("chunk_path") or ""),
                     "at": float(data.get("at") or 0),
                     "html_sig": str(data.get("html_sig") or ""),
                 }
@@ -6146,45 +6153,23 @@ def scrape_signup_next_headers(
     sig = _html_action_signature(html)
     now = time.time()
     if not force_refresh:
+        _load_next_action_disk_cache()
         with _NEXT_ACTION_CACHE_LOCK:
             cached_action = str(_NEXT_ACTION_CACHE.get("action") or "")
             cached_router = str(_NEXT_ACTION_CACHE.get("router") or "")
             cached_at = float(_NEXT_ACTION_CACHE.get("at") or 0)
             cached_sig = str(_NEXT_ACTION_CACHE.get("html_sig") or "")
-        if (
-            cached_action
-            and len(cached_action) >= 40
-            and cached_router
-            and now - cached_at < _NEXT_ACTION_CACHE_TTL
-            and (not cached_sig or cached_sig == sig)
-        ):
+        # 只要 action 有效且未过期就用（html_sig 仅作参考，部署变了再靠失败重扫）
+        if cached_action and len(cached_action) >= 40 and now - cached_at < _NEXT_ACTION_CACHE_TTL:
             if log_callback:
                 age = int(now - cached_at)
                 log_callback(
-                    f"[Debug] next-action 使用缓存 {cached_action[:16]}... "
-                    f"(age={age}s, sig={sig})"
+                    f"[*] next-action 缓存命中 {cached_action[:16]}... (age={age}s)"
                 )
-            return {"next_action": cached_action, "router_state_tree": cached_router}
-        # 磁盘冷启动
-        if not cached_action or len(cached_action) < 40:
-            _load_next_action_disk_cache()
-            with _NEXT_ACTION_CACHE_LOCK:
-                cached_action = str(_NEXT_ACTION_CACHE.get("action") or "")
-                cached_router = str(_NEXT_ACTION_CACHE.get("router") or "")
-                cached_at = float(_NEXT_ACTION_CACHE.get("at") or 0)
-                cached_sig = str(_NEXT_ACTION_CACHE.get("html_sig") or "")
-            if (
-                cached_action
-                and len(cached_action) >= 40
-                and cached_router
-                and now - cached_at < _NEXT_ACTION_CACHE_TTL
-                and (not cached_sig or cached_sig == sig)
-            ):
-                if log_callback:
-                    log_callback(
-                        f"[Debug] next-action 磁盘缓存命中 {cached_action[:16]}... (sig={sig})"
-                    )
-                return {"next_action": cached_action, "router_state_tree": cached_router}
+            return {
+                "next_action": cached_action,
+                "router_state_tree": cached_router or _default_router_state_tree_header(),
+            }
 
     # ---- router state tree ----
     router_tree = None
@@ -6312,9 +6297,12 @@ def scrape_signup_next_headers(
         preferred = next((x for x in hashes if x.startswith("7f")), hashes[0])
         return preferred, is_signup
 
+    with _NEXT_ACTION_CACHE_LOCK:
+        preferred_path = str(_NEXT_ACTION_CACHE.get("chunk_path") or "")
     ordered = sorted(
         js_paths,
         key=lambda p: (
+            0 if preferred_path and p == preferred_path else 1,
             0
             if any(
                 x in p
@@ -6333,8 +6321,9 @@ def scrape_signup_next_headers(
             p,
         ),
     )
-    # 扫完全部 chunk，命中 signup 关键字立即停
-    for path in ordered:
+    # 命中 signup 关键字立即停；最多扫 12 个优先 chunk（避免 40 次空请求）
+    hit_path = ""
+    for path in ordered[:12]:
         scanned += 1
         h, is_signup = _fetch_chunk(path)
         if not h:
@@ -6343,9 +6332,29 @@ def scrape_signup_next_headers(
         hit_ok += 1
         if is_signup:
             signup_hash = h
+            hit_path = path
             break
         if fallback_hash is None or (h.startswith("7f") and not str(fallback_hash).startswith("7f")):
             fallback_hash = h
+            if not hit_path:
+                hit_path = path
+    # 前 12 没命中 signup，再扩扫剩余（仍命中即停）
+    if not signup_hash:
+        for path in ordered[12:]:
+            scanned += 1
+            h, is_signup = _fetch_chunk(path)
+            if not h:
+                hit_empty += 1
+                continue
+            hit_ok += 1
+            if is_signup:
+                signup_hash = h
+                hit_path = path
+                break
+            if fallback_hash is None or (h.startswith("7f") and not str(fallback_hash).startswith("7f")):
+                fallback_hash = h
+                if not hit_path:
+                    hit_path = path
 
     try:
         if session is not None:
@@ -6379,14 +6388,14 @@ def scrape_signup_next_headers(
 
     if log_callback:
         log_callback(
-            f"[Debug] next-action={action_id[:16]}... ({len(action_id)} chars, "
-            f"{'signup-chunk' if signup_hash else 'fallback'}, "
-            f"ok={hit_ok}/empty={hit_empty}/scanned={scanned})"
+            f"[*] next-action={action_id[:16]}... ({len(action_id)} chars, "
+            f"{'signup' if signup_hash else 'fallback'}, scanned={scanned})"
         )
 
     with _NEXT_ACTION_CACHE_LOCK:
         _NEXT_ACTION_CACHE["action"] = action_id
         _NEXT_ACTION_CACHE["router"] = router_header
+        _NEXT_ACTION_CACHE["chunk_path"] = hit_path or preferred_path
         _NEXT_ACTION_CACHE["at"] = time.time()
         _NEXT_ACTION_CACHE["html_sig"] = sig
     _save_next_action_disk_cache()
@@ -6859,28 +6868,9 @@ def obtain_sso_via_create_session(
                     session.cookies.set(c.get("name"), c.get("value"))
                 except Exception:
                     pass
-        try:
-            session.get(
-                signin_url,
-                headers={
-                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "user-agent": get_user_agent(),
-                    "referer": "https://accounts.x.ai/",
-                },
-                timeout=20,
-            )
-        except Exception:
-            pass
-
-        # 只试原始 email 一次（避免 lower 重复打两枪）
-        email_candidates = [email]
-        if email.lower() != email:
-            email_candidates.append(email.lower())
-
         for attempt in range(1, max(1, int(retries)) + 1):
             raise_if_cancelled(cancel_callback)
-            em = email_candidates[0]
-            body = encode_create_session_request(em, password, turnstile_token)
+            body = encode_create_session_request(email, password, turnstile_token)
             framed = _grpc_frame_request(body)
             headers = {
                 "content-type": "application/grpc-web+proto",
@@ -6898,8 +6888,8 @@ def obtain_sso_via_create_session(
                 resp = session.post(rpc, data=framed, headers=headers, timeout=30)
             except Exception as exc:
                 if log_callback:
-                    log_callback(f"[Debug] CreateSession 网络错误: {exc}")
-                sleep_with_cancel(0.8 * attempt, cancel_callback)
+                    log_callback(f"[!] CreateSession 网络错误: {exc}")
+                sleep_with_cancel(0.6 * attempt, cancel_callback)
                 continue
             set_cookies = []
             try:
@@ -6933,17 +6923,14 @@ def obtain_sso_via_create_session(
                 pass
             if log_callback:
                 log_callback(
-                    f"[Debug] CreateSession attempt={attempt}/{retries} "
-                    f"HTTP {resp.status_code} grpc={grpc_status} "
-                    f"set_cookies={len(set_cookies)} "
-                    f"sso={'yes' if token else 'no'} "
-                    f"session_jwt={'yes' if session_jwt else 'no'}"
+                    f"[*] CreateSession HTTP {resp.status_code} grpc={grpc_status} "
+                    f"jwt={'yes' if (token or session_jwt) else 'no'}"
                 )
             if token:
                 return token
             if session_jwt and session_jwt.startswith("eyJ") and session_jwt.count(".") >= 2:
                 return session_jwt
-            sleep_with_cancel(0.8 * attempt, cancel_callback)
+            sleep_with_cancel(0.5 * attempt, cancel_callback)
     return ""
 
 
@@ -7089,26 +7076,23 @@ def create_xai_account_via_http(
             raise RuntimeError(
                 f"create_account HTTP {resp.status_code}: {rsc_body[:300]}"
             )
-        # 当前 xAI：create_account 几乎不返回 sso 链路；signup turnstile 也不能直接用于
-        # CreateSession。成功路径：sign-in turnstile → CreateSession（优先，省 hop 时间）
-        if (not sso or not _looks_like_sso_session_jwt(sso)) and allow_create_session_fallback:
+        # 精简成功路径：不再扫 set-cookie hop（当前部署基本无效）
+        # create_account → sign-in Turnstile → CreateSession(1 次) → 失败再刷 token 重试 1 次
+        if (not sso) and allow_create_session_fallback:
             if log_callback:
-                log_callback(
-                    "[*] create_account 后优先 CreateSession（sign-in Turnstile，跳过慢 hop）..."
-                )
-            sleep_with_cancel(1.2, cancel_callback)
+                log_callback("[*] CreateSession 取会话（sign-in Turnstile）...")
+            sleep_with_cancel(0.8, cancel_callback)
+            sitekey = str(config.get("turnstile_sitekey") or "0x4AAAAAAAhr9JGVDZbrZOo0")
             try:
                 signin_token = solve_turnstile_via_local_solver(
                     website_url="https://accounts.x.ai/sign-in?redirect=grok-com",
-                    website_key=str(
-                        config.get("turnstile_sitekey") or "0x4AAAAAAAhr9JGVDZbrZOo0"
-                    ),
+                    website_key=sitekey,
                     log_callback=log_callback,
                     cancel_callback=cancel_callback,
                 )
             except Exception as ts_exc:
                 if log_callback:
-                    log_callback(f"[Debug] sign-in Turnstile 失败，尝试复用 signup token: {ts_exc}")
+                    log_callback(f"[!] sign-in Turnstile 失败: {ts_exc}")
                 signin_token = turnstile_token
             sso = obtain_sso_via_create_session(
                 email,
@@ -7118,32 +7102,19 @@ def create_xai_account_via_http(
                 proxies=proxies,
                 log_callback=log_callback,
                 cancel_callback=cancel_callback,
-                retries=2,
+                retries=1,
             )
-            # 仍失败：短链路 set-cookie（已跳过 grokipedia）
             if not sso:
                 if log_callback:
-                    log_callback("[*] CreateSession 未拿到 sso，短试 set-cookie 链路...")
-                sso = extract_sso_via_set_cookie_chain(
-                    rsc_body,
-                    session=session,
-                    proxies=proxies,
-                    log_callback=log_callback,
-                )
-            # 再刷一次 turnstile + CreateSession
-            if not sso:
+                    log_callback("[*] CreateSession 重试：刷新 Turnstile...")
                 try:
-                    if log_callback:
-                        log_callback("[*] 再刷 Turnstile + CreateSession...")
                     fresh = solve_turnstile_via_local_solver(
                         website_url="https://accounts.x.ai/sign-in?redirect=grok-com",
-                        website_key=str(
-                            config.get("turnstile_sitekey") or "0x4AAAAAAAhr9JGVDZbrZOo0"
-                        ),
+                        website_key=sitekey,
                         log_callback=log_callback,
                         cancel_callback=cancel_callback,
                     )
-                    sleep_with_cancel(1.0, cancel_callback)
+                    sleep_with_cancel(0.5, cancel_callback)
                     sso = obtain_sso_via_create_session(
                         email,
                         password,
@@ -7152,22 +7123,21 @@ def create_xai_account_via_http(
                         proxies=proxies,
                         log_callback=log_callback,
                         cancel_callback=cancel_callback,
-                        retries=2,
+                        retries=1,
                     )
                 except Exception as cs_exc:
                     if log_callback:
-                        log_callback(f"[Debug] CreateSession 二次 pass 失败: {cs_exc}")
+                        log_callback(f"[!] CreateSession 重试失败: {cs_exc}")
         if not sso:
             raise RuntimeError(
-                "create_account 成功但未拿到有效 sso（CreateSession / set-cookie 均失败）；"
-                f"set_cookies={len(set_cookies)} preview={rsc_body[:240]!r}"
+                "create_account 成功但未拿到 sso（CreateSession 失败）；"
+                f"set_cookies={len(set_cookies)} preview={rsc_body[:200]!r}"
             )
-        # CreateSession 的 session JWT 可能没有 session_id 字段，仍可用
         if log_callback:
             payload = _parse_jwt_payload(sso) or {}
             log_callback(
-                f"[*] 已获取 sso/session JWT len={len(sso)} "
-                f"session_id={str(payload.get('session_id') or payload.get('sid') or payload.get('sub') or '')[:32]}"
+                f"[*] 已获取会话 JWT len={len(sso)} "
+                f"sid={str(payload.get('session_id') or payload.get('sid') or payload.get('sub') or '')[:32]}"
             )
         return sso
 
@@ -7369,7 +7339,9 @@ def start_browser(log_callback=None):
                     f"强制execute: {'开' if config.get('turnstile_force_execute') else '关'}，"
                     f"Solver: {'开 ' + normalize_turnstile_solver_url() if solver_on else '关'}"
                 )
-            probe_browser_stealth(page, log_callback=log_callback)
+            # API 建号路径不依赖浏览器指纹对抗，跳过采样噪音
+            if resolve_signup_mode() != "api":
+                probe_browser_stealth(page, log_callback=log_callback)
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
             return browser, page

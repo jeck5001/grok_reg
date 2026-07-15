@@ -138,6 +138,16 @@ DEFAULT_CONFIG = {
     "signup_mode": "auto",
     # 并发时 Device Flow 最小间隔（秒），防 xAI rate_limited
     "device_flow_gap_seconds": 2.0,
+    # 邮件域名池（对齐 openai-cpa 内存池精简版）
+    "mail_domains": "",  # 与 defaultDomains 二选一；非空优先
+    "enable_sub_domains": False,
+    "sub_domain_level": 1,
+    "random_sub_domain_level": False,
+    "enable_mail_domain_runtime_control": True,
+    "mail_domain_pinpoint_burst": False,  # 黄金矿工：打满当前主域再换
+    "mail_domain_prefer_low_failure": True,
+    "mail_domain_fail_threshold": 3,
+    "mail_domain_fail_cooldown_sec": 600,
     "show_tutorial_on_start": True,
     "cloudmail_url": "",
     "cloudmail_admin_email": "",
@@ -402,31 +412,156 @@ def _pick_list_payload(data):
     return []
 
 
-def cloudflare_create_temp_address(api_base):
-    """适配 cloudflare_temp_email v1.8.x: POST /api/new_address -> {address,jwt}"""
-    global _cf_domain_index
-    url = f"{api_base}/api/new_address"
-    payload = {}
+def _mail_pool_settings():
+    """读取域名池相关配置。"""
+    import mail_domain_pool as mdp
+
+    domains = mdp.parse_domain_list(config.get("mail_domains") or config.get("defaultDomains") or "")
+    return {
+        "domains": domains,
+        "enable_sub": bool(config.get("enable_sub_domains")),
+        "sub_level": int(config.get("sub_domain_level") or 1),
+        "random_level": bool(config.get("random_sub_domain_level")),
+        "runtime": bool(config.get("enable_mail_domain_runtime_control", True)),
+        "pinpoint": bool(config.get("mail_domain_pinpoint_burst")),
+        "low_fail": bool(config.get("mail_domain_prefer_low_failure", True)),
+        "threshold": int(config.get("mail_domain_fail_threshold") or 3),
+        "cooldown": int(config.get("mail_domain_fail_cooldown_sec") or 600),
+    }
+
+
+def pick_configured_mail_domain(log_callback=None):
+    """从 mail_domains/defaultDomains 选主域（含冷却/黄金矿工）。"""
+    import mail_domain_pool as mdp
+
+    settings = _mail_pool_settings()
+    domains = settings["domains"]
+    if not domains:
+        raise Exception("未配置 mail_domains / defaultDomains，无法生成邮箱域名")
+    rejected = set(list_rejected_email_domains())
+    if settings["runtime"]:
+        main = mdp.pick_main_domain(
+            domains,
+            rejected=rejected,
+            pinpoint_burst=settings["pinpoint"],
+            prefer_low_failure=settings["low_fail"],
+        )
+    else:
+        # 简单轮询
+        global _cf_domain_index
+        usable = [d for d in domains if not is_email_domain_rejected(d)]
+        if not usable:
+            raise EmailProviderUnavailable("可用邮件域名均已被拒收")
+        main = usable[_cf_domain_index % len(usable)]
+        _cf_domain_index += 1
+    if log_callback and settings["enable_sub"]:
+        log_callback(
+            f"[*] 域名池选中主域 {main}（子域={'开' if settings['enable_sub'] else '关'}，"
+            f"黄金矿工={'开' if settings['pinpoint'] else '关'}）"
+        )
+    return main
+
+
+def compose_mail_address(main_domain=None, log_callback=None):
+    """生成 local@ [sub.]main 地址。"""
+    import mail_domain_pool as mdp
+
+    settings = _mail_pool_settings()
+    main = main_domain or pick_configured_mail_domain(log_callback=log_callback)
+    address = mdp.compose_email_address(
+        main,
+        enable_sub_domains=settings["enable_sub"],
+        sub_domain_level=settings["sub_level"],
+        random_sub_domain_level=settings["random_level"],
+    )
+    if log_callback and settings["enable_sub"]:
+        log_callback(f"[*] 多级域名邮箱: {address}")
+    return address, main
+
+
+def note_mail_domain_outcome(email_or_domain, success=True, reason="discarded_email", log_callback=None):
+    """注册成功/域名拒收时回写域名池统计。"""
+    if not bool(config.get("enable_mail_domain_runtime_control", True)):
+        return
     try:
-        # 在多个域名之间轮换，降低单域偶发不收件导致的失败率
-        domains = [x.strip() for x in re.split(r"[,，\s]+", str(config.get("defaultDomains", "") or "")) if x.strip()]
-        if domains:
-            payload["domain"] = domains[_cf_domain_index % len(domains)]
-            _cf_domain_index += 1
+        import mail_domain_pool as mdp
+
+        settings = _mail_pool_settings()
+        main = mdp.main_domain_of(email_or_domain, settings["domains"] or [email_or_domain])
+        if not main:
+            return
+        if success:
+            mdp.mark_domain_success(main)
+            return
+        info = mdp.mark_domain_failure(
+            main,
+            reason=reason,
+            threshold=settings["threshold"],
+            cooldown_sec=settings["cooldown"],
+        )
+        if log_callback and info.get("cooled"):
+            log_callback(
+                f"[!] 主域 {main} 失败过多，冷却 {settings['cooldown']}s "
+                f"(reason={reason})"
+            )
     except Exception:
         pass
-    resp = http_post(url, json=payload, headers={"Content-Type": "application/json"})
-    resp.raise_for_status()
-    try:
-        data = resp.json()
-    except Exception:
-        raise Exception(f"Cloudflare /api/new_address 返回非JSON: {resp.text[:300]}")
-    address = data.get("address")
-    jwt = data.get("jwt")
-    if not address or not jwt:
-        raise Exception(f"Cloudflare /api/new_address 缺少 address/jwt: {data}")
-    return address, jwt
 
+
+def cloudflare_create_temp_address(api_base, log_callback=None):
+    """适配 cloudflare_temp_email：优先指定 domain/name，支持多级子域。
+
+    多级子域依赖 CF Email Routing / Worker 的 catch-all，与 openai-cpa 一致，
+    用于摊薄「同主域日创建量」触发的 10w 类限制。
+    """
+    url = f"{api_base.rstrip('/')}/admin/new_address"
+    # 兼容旧路径
+    alt_url = f"{api_base.rstrip('/')}/api/new_address"
+    settings = _mail_pool_settings()
+    payload = {"enablePrefix": False}
+    address_hint = ""
+    main = ""
+    try:
+        if settings["domains"]:
+            address_hint, main = compose_mail_address(log_callback=log_callback)
+            local, host = address_hint.split("@", 1)
+            payload["name"] = local
+            payload["domain"] = host
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 域名池生成失败，回退服务端随机: {exc}")
+
+    headers = cloudflare_build_headers(content_type=True)
+    # admin_auth 常见：x-admin-auth 或 Authorization
+    admin = str(config.get("cloudflare_api_key") or "").strip()
+    if admin and "x-admin-auth" not in {k.lower() for k in headers}:
+        headers = {**headers, "x-admin-auth": admin}
+
+    last_err = None
+    for try_url in (url, alt_url):
+        try:
+            resp = http_post(try_url, json=payload, headers=headers)
+            if resp.status_code >= 400 and try_url == url:
+                # 旧部署只有 /api/new_address
+                last_err = f"HTTP {resp.status_code}: {(resp.text or '')[:200]}"
+                continue
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+            except Exception:
+                raise Exception(f"Cloudflare new_address 返回非JSON: {resp.text[:300]}")
+            address = data.get("address") or address_hint
+            jwt = data.get("jwt") or data.get("token")
+            if not address or not jwt:
+                raise Exception(f"Cloudflare new_address 缺少 address/jwt: {data}")
+            return address, jwt
+        except Exception as exc:
+            last_err = exc
+            continue
+    # 失败记主域
+    if main:
+        note_mail_domain_outcome(main, success=False, reason="cloudflare_temp_email_network", log_callback=log_callback)
+    raise Exception(f"Cloudflare 创建临时邮箱失败: {last_err}")
 
 def get_user_agent():
     return config.get(
@@ -4410,6 +4545,11 @@ def validate_registration_config(settings):
         "turnstile_solver_enabled",
         "turnstile_solver_fallback_click",
         "turnstile_solver_use_proxy",
+        "enable_sub_domains",
+        "random_sub_domain_level",
+        "enable_mail_domain_runtime_control",
+        "mail_domain_pinpoint_burst",
+        "mail_domain_prefer_low_failure",
     ):
         raw_bool = normalized.get(bool_key)
         if isinstance(raw_bool, str):
@@ -4423,6 +4563,27 @@ def validate_registration_config(settings):
     if env_mode in {"auto", "http", "api", "browser"}:
         signup_mode = env_mode
     normalized["signup_mode"] = signup_mode
+    try:
+        normalized["sub_domain_level"] = max(1, min(7, int(normalized.get("sub_domain_level") or 1)))
+    except Exception:
+        normalized["sub_domain_level"] = 1
+    try:
+        normalized["mail_domain_fail_threshold"] = max(
+            0, min(50, int(normalized.get("mail_domain_fail_threshold") or 3))
+        )
+    except Exception:
+        normalized["mail_domain_fail_threshold"] = 3
+    try:
+        normalized["mail_domain_fail_cooldown_sec"] = max(
+            0, min(86400, int(normalized.get("mail_domain_fail_cooldown_sec") or 600))
+        )
+    except Exception:
+        normalized["mail_domain_fail_cooldown_sec"] = 600
+    mail_domains = str(normalized.get("mail_domains") or "").strip()
+    default_domains = str(normalized.get("defaultDomains") or "").strip()
+    if not mail_domains and default_domains:
+        mail_domains = default_domains
+    normalized["mail_domains"] = mail_domains
     try:
         wait_seconds = float(normalized.get("turnstile_wait_seconds", 120) or 120)
     except Exception:
@@ -4811,6 +4972,10 @@ class RegistrationJob:
         add_token_to_grok2api_pools(sso, email=email, log_callback=logf)
         auto_push_registered_account(account, self.settings, log_callback=logf)
         self._note_registration_outcome(True, logf=logf)
+        try:
+            note_mail_domain_outcome(email, success=True, log_callback=logf)
+        except Exception:
+            pass
         logf(f"[+] 注册成功: {email}")
 
     def _worker_loop(self, worker_id, total, task_queue):
@@ -5371,7 +5536,7 @@ def save_rejected_email_domains():
 
 
 def remember_rejected_email_domain(domain):
-    """只记录被拒的精确后缀，不自动记父域。"""
+    """只记录被拒的精确后缀，不自动记父域；并触发域名池冷却。"""
     load_rejected_email_domains()
     exact = normalize_rejected_email_domain(domain)
     if not exact:
@@ -5386,6 +5551,11 @@ def remember_rejected_email_domain(domain):
             save_rejected_email_domains()
         except Exception:
             pass
+    # 域名池：记失败，必要时冷却主域
+    try:
+        note_mail_domain_outcome(exact, success=False, reason="discarded_email")
+    except Exception:
+        pass
     return snapshot
 
 
@@ -5703,21 +5873,11 @@ def _get_email_and_token_once(api_key=None):
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
     if provider == "cloudmail":
-        # CloudMail catch-all 模式：直接生成随机邮箱，无需注册
-        raw = str(config.get("defaultDomains", "") or "")
-        domains = [x.strip() for x in re.split(r"[,，\s]+", raw) if x.strip()]
-        if not domains:
-            raise Exception("CloudMail 需要在 defaultDomains 中配置可用域名")
-        available = [d for d in domains if not is_email_domain_rejected(d)]
-        if not available:
-            raise EmailProviderUnavailable(
-                "CloudMail defaultDomains 中的域名均已被 x.ai 拒收: " + ", ".join(domains)
-            )
-        global _cf_domain_index
-        domain = available[_cf_domain_index % len(available)]
-        _cf_domain_index += 1
-        username = generate_username(10)
-        address = f"{username}@{domain}"
+        # CloudMail catch-all：用域名池生成地址（支持多级子域）
+        try:
+            address, main = compose_mail_address()
+        except Exception as exc:
+            raise Exception(f"CloudMail 需要配置 mail_domains/defaultDomains: {exc}") from exc
         return address, "cloudmail_catch_all"
     if provider == "cloudflare":
         api_base = get_cloudflare_api_base()
@@ -5726,6 +5886,7 @@ def _get_email_and_token_once(api_key=None):
         try:
             address, token = cloudflare_create_temp_address(api_base)
             if address and is_email_domain_rejected(address):
+                note_mail_domain_outcome(address, success=False, reason="discarded_email")
                 raise Exception(f"临时邮箱域名已在拒收黑名单: {address}")
             return address, token
         except Exception as primary_exc:

@@ -245,7 +245,7 @@
                   <input name="cloudflare_api_base" placeholder="https://example.workers.dev" />
                 </label>
                 <label>
-                  Cloudflare API Key
+                  Cloudflare API Key / Admin Auth
                   <input name="cloudflare_api_key" type="password" autocomplete="off" />
                 </label>
                 <label>
@@ -273,11 +273,61 @@
                   CloudMail 管理员密码
                   <input name="cloudmail_password" type="password" autocomplete="off" />
                 </label>
-                <label>
-                  默认域名
+                <label class="wide">
+                  邮件主域池 (mail_domains)
+                  <input name="mail_domains" placeholder="a.com,b.com,c.net（优先于 defaultDomains）" />
+                </label>
+                <label class="wide">
+                  默认域名 (兼容)
                   <input name="defaultDomains" placeholder="a.com,b.com" />
                 </label>
               </div>
+            </section>
+
+            <section class="config-section" data-config-section="域名池">
+              <div class="section-copy">
+                <p class="section-kicker">域名池</p>
+                <h2>多级域名 / 黄金矿工 / 冷却（降 CF 日限额触发）</h2>
+              </div>
+              <div class="config-grid">
+                <label class="check">
+                  <input name="enable_sub_domains" type="checkbox" />
+                  启用多级子域（user@rand.main.com，需 CF catch-all）
+                </label>
+                <label class="check">
+                  <input name="random_sub_domain_level" type="checkbox" />
+                  随机子域层级（1~level）
+                </label>
+                <label>
+                  子域层级数
+                  <input name="sub_domain_level" type="number" min="1" max="7" value="1" />
+                </label>
+                <label class="check">
+                  <input name="enable_mail_domain_runtime_control" type="checkbox" checked />
+                  启用域名运行时控制（失败冷却）
+                </label>
+                <label class="check">
+                  <input name="mail_domain_pinpoint_burst" type="checkbox" />
+                  黄金矿工（打满当前最优主域再换）
+                </label>
+                <label class="check">
+                  <input name="mail_domain_prefer_low_failure" type="checkbox" checked />
+                  优先低失败主域
+                </label>
+                <label>
+                  失败阈值
+                  <input name="mail_domain_fail_threshold" type="number" min="0" max="50" value="3" />
+                </label>
+                <label>
+                  冷却秒数
+                  <input name="mail_domain_fail_cooldown_sec" type="number" min="0" max="86400" value="600" />
+                </label>
+              </div>
+              <p class="hint">
+                多级子域把创建分散到大量子域名上，减轻 Cloudflare Email Routing / Worker 按主域聚合的日配额压力。
+                黄金矿工适合「某主域暂时最稳」时短时冲量；失败冷却可自动跳过坏域。
+                需在 Cloudflare 为对应主域开 <strong>catch-all</strong> 到 temp-email Worker。
+              </p>
             </section>
 
             <section class="config-section" data-config-section="grok2api">

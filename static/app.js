@@ -112,6 +112,21 @@ function formPayload() {
   if (form.elements.turnstile_force_execute) {
     data.turnstile_force_execute = form.elements.turnstile_force_execute.checked;
   }
+  if (form.elements.enable_sub_domains) {
+    data.enable_sub_domains = form.elements.enable_sub_domains.checked;
+  }
+  if (form.elements.random_sub_domain_level) {
+    data.random_sub_domain_level = form.elements.random_sub_domain_level.checked;
+  }
+  if (form.elements.enable_mail_domain_runtime_control) {
+    data.enable_mail_domain_runtime_control = form.elements.enable_mail_domain_runtime_control.checked;
+  }
+  if (form.elements.mail_domain_pinpoint_burst) {
+    data.mail_domain_pinpoint_burst = form.elements.mail_domain_pinpoint_burst.checked;
+  }
+  if (form.elements.mail_domain_prefer_low_failure) {
+    data.mail_domain_prefer_low_failure = form.elements.mail_domain_prefer_low_failure.checked;
+  }
   data.register_count = Number(data.register_count || 1);
   data.register_threads = Number(data.register_threads || 1);
   data.thread_start_interval = Number(data.thread_start_interval || 2);
@@ -123,6 +138,9 @@ function formPayload() {
   data.cpa_push_workers = Number(data.cpa_push_workers || 3);
   data.turnstile_solver_timeout = Number(data.turnstile_solver_timeout || 120);
   data.turnstile_wait_seconds = Number(data.turnstile_wait_seconds || 120);
+  data.sub_domain_level = Number(data.sub_domain_level || 1);
+  data.mail_domain_fail_threshold = Number(data.mail_domain_fail_threshold || 3);
+  data.mail_domain_fail_cooldown_sec = Number(data.mail_domain_fail_cooldown_sec || 600);
   return data;
 }
 

@@ -42,6 +42,7 @@
   "turnstile_solver_client_key": "local",
   "turnstile_solver_timeout": 120,
   "turnstile_solver_fallback_click": true,
+  "turnstile_solver_use_proxy": true,
   "turnstile_sitekey": "0x4AAAAAAAhr9JGVDZbrZOo0",
   "show_tutorial_on_start": true,
   "cloudmail_url": "",

@@ -103,6 +103,9 @@ function formPayload() {
   if (form.elements.turnstile_solver_fallback_click) {
     data.turnstile_solver_fallback_click = form.elements.turnstile_solver_fallback_click.checked;
   }
+  if (form.elements.turnstile_solver_use_proxy) {
+    data.turnstile_solver_use_proxy = form.elements.turnstile_solver_use_proxy.checked;
+  }
   if (form.elements.turnstile_patch_api) {
     data.turnstile_patch_api = form.elements.turnstile_patch_api.checked;
   }

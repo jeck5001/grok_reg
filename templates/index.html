@@ -164,6 +164,10 @@
                   <input name="turnstile_solver_fallback_click" type="checkbox" checked />
                   Solver 失败时回退 shadow/CDP 点选
                 </label>
+                <label class="check">
+                  <input name="turnstile_solver_use_proxy" type="checkbox" checked />
+                  透传业务代理给 Solver（task.proxy，与注册浏览器同出口）
+                </label>
                 <label class="wide">
                   Solver 地址
                   <input name="turnstile_solver_url" placeholder="http://127.0.0.1:5072（Docker 内自动映射 host.docker.internal）" />

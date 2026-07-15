@@ -55,6 +55,8 @@ def test_solve_turnstile_via_local_solver_polls_until_ready(monkeypatch):
     monkeypatch.setitem(reg.config, "turnstile_solver_url", "http://solver.test:5072")
     monkeypatch.setitem(reg.config, "turnstile_solver_client_key", "local")
     monkeypatch.setitem(reg.config, "turnstile_solver_timeout", 30)
+    monkeypatch.setitem(reg.config, "turnstile_solver_use_proxy", True)
+    monkeypatch.setitem(reg.config, "proxy", "http://192.168.5.35:7890")
 
     calls = []
 
@@ -84,7 +86,16 @@ def test_solve_turnstile_via_local_solver_polls_until_ready(monkeypatch):
     assert len(token) == 100
     assert calls[0][1] == "/createTask"
     assert calls[0][2]["task"]["type"] == "TurnstileTaskProxyless"
+    assert calls[0][2]["task"]["proxy"] == "http://192.168.5.35:7890"
     assert any(c[1] == "/getTaskResult" for c in calls)
+
+
+def test_proxy_for_turnstile_solver_can_be_disabled(monkeypatch):
+    monkeypatch.setitem(reg.config, "proxy", "http://192.168.5.35:7890")
+    monkeypatch.setitem(reg.config, "turnstile_solver_use_proxy", False)
+    assert reg._proxy_for_turnstile_solver() == ""
+    monkeypatch.setitem(reg.config, "turnstile_solver_use_proxy", True)
+    assert reg._proxy_for_turnstile_solver() == "http://192.168.5.35:7890"
 
 
 def test_get_turnstile_token_prefers_solver_then_returns(monkeypatch):

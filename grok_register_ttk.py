@@ -128,6 +128,8 @@ DEFAULT_CONFIG = {
     "turnstile_solver_client_key": "local",
     "turnstile_solver_timeout": 120,
     "turnstile_solver_fallback_click": True,
+    # 把 config.proxy 透传给 solver（任务级 task.proxy），保证与注册浏览器同出口 IP
+    "turnstile_solver_use_proxy": True,
     # accounts.x.ai 公开 sitekey（页面刮不到时回退；非密钥）
     "turnstile_sitekey": "0x4AAAAAAAhr9JGVDZbrZOo0",
     "show_tutorial_on_start": True,
@@ -4077,6 +4079,7 @@ def validate_registration_config(settings):
         "turnstile_force_execute",
         "turnstile_solver_enabled",
         "turnstile_solver_fallback_click",
+        "turnstile_solver_use_proxy",
     ):
         raw_bool = normalized.get(bool_key)
         if isinstance(raw_bool, str):
@@ -6868,18 +6871,44 @@ def probe_local_turnstile_solver(force=False, timeout=2.0):
     return ok
 
 
+def _proxy_for_turnstile_solver():
+    """业务代理透传给 solver（与注册浏览器同出口）。
+
+    使用 normalize_proxy_for_runtime，保证 Docker 内 localhost 映射一致。
+    可用 turnstile_solver_use_proxy=false 关闭透传。
+    """
+    if not bool(config.get("turnstile_solver_use_proxy", True)):
+        return ""
+    return str(normalize_proxy_for_runtime(config.get("proxy", "")) or "").strip()
+
+
+def _redact_proxy_for_log(proxy):
+    raw = str(proxy or "").strip()
+    if not raw:
+        return ""
+    try:
+        if "@" in raw and "://" in raw:
+            scheme, rest = raw.split("://", 1)
+            _auth, hostpart = rest.rsplit("@", 1)
+            return f"{scheme}://***:***@{hostpart}"
+    except Exception:
+        pass
+    return raw
+
+
 def solve_turnstile_via_local_solver(
     website_url,
     website_key,
     action="",
     cdata="",
+    proxy=None,
     log_callback=None,
     cancel_callback=None,
     timeout=None,
 ):
     """YesCaptcha 协议：POST /createTask + 轮询 /getTaskResult，返回 token。
 
-    兼容 grokcli-2api/turnstile-solver（Camoufox）以及远端 YesCaptcha。
+    兼容本地 turnstile-solver（Camoufox，支持 task.proxy）以及远端 YesCaptcha。
     """
     website_url = str(website_url or "").strip()
     website_key = str(website_key or "").strip()
@@ -6892,6 +6921,10 @@ def solve_turnstile_via_local_solver(
     timeout = max(30.0, min(timeout, 300.0))
     client_key = str(config.get("turnstile_solver_client_key") or "local").strip() or "local"
     base = normalize_turnstile_solver_url()
+    if proxy is None:
+        proxy = _proxy_for_turnstile_solver()
+    else:
+        proxy = str(proxy or "").strip()
     task = {
         "type": "TurnstileTaskProxyless",
         "websiteURL": website_url,
@@ -6901,10 +6934,14 @@ def solve_turnstile_via_local_solver(
         task["action"] = str(action)
     if cdata:
         task["cdata"] = str(cdata)
+    if proxy:
+        # 本地 solver 已支持任务级 proxy；云端 YesCaptcha 会忽略未知字段
+        task["proxy"] = proxy
 
     if log_callback:
         log_callback(
-            f"[*] 请求 Turnstile Solver: {base} key={website_key[:14]}... url={website_url[:80]}"
+            f"[*] 请求 Turnstile Solver: {base} key={website_key[:14]}... "
+            f"url={website_url[:80]} proxy={_redact_proxy_for_log(proxy) or '直连'}"
         )
 
     # 本地 Camoufox 池有限，串行化避免打爆

@@ -7375,11 +7375,13 @@ def start_browser(log_callback=None):
                 pass
             # 启动时只装轻量 stealth，绝不补丁 turnstile API。
             # pageHook（补丁 window.turnstile）默认关闭，手动能过时补丁反而容易干扰 flexible 模式。
+            api_mode = resolve_signup_mode() == "api"
             try:
-                install_light_stealth_script(page, log_callback=log_callback)
+                install_light_stealth_script(
+                    page, log_callback=None if api_mode else log_callback
+                )
             except Exception:
                 pass
-            api_mode = resolve_signup_mode() == "api"
             if log_callback and not api_mode and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback:

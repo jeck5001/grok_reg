@@ -136,6 +136,8 @@ DEFAULT_CONFIG = {
     # auto：Docker 默认走 API create_account（与 grokcli-2api 同路径）；本机默认 browser
     # auto|http|api|browser — docker 默认 http 纯协议；api=浏览器OTP+HTTP建号；browser=全浏览器
     "signup_mode": "auto",
+    # 并发时 Device Flow 最小间隔（秒），防 xAI rate_limited
+    "device_flow_gap_seconds": 2.0,
     "show_tutorial_on_start": True,
     "cloudmail_url": "",
     "cloudmail_admin_email": "",
@@ -3081,6 +3083,18 @@ def import_accounts_to_cpa(accounts, settings=None, log_callback=None):
     }
 
 
+# 并发注册时 Device Flow 全局串行，避免 xAI rate_limited（对齐 2api）
+_DEVICE_FLOW_LOCK = threading.RLock()
+_DEVICE_FLOW_LAST_TS = 0.0
+
+
+def _device_flow_gap_sec():
+    try:
+        return max(0.0, float(config.get("device_flow_gap_seconds", 2.0) or 2.0))
+    except Exception:
+        return 2.0
+
+
 def exchange_sso_to_refresh_token_via_device_flow(
     sso,
     log_callback=None,
@@ -3095,7 +3109,10 @@ def exchange_sso_to_refresh_token_via_device_flow(
       3) GET verification_uri_complete + POST device/verify
       4) POST device/approve
       5) 轮询 /oauth2/token 拿 refresh_token
+
+    并发时全局串行 + 最小间隔，降低 rate_limited。
     """
+    global _DEVICE_FLOW_LAST_TS
     if requests is None:
         raise RuntimeError("curl_cffi 未安装，无法 Device Flow")
     token = _normalize_sso_token(sso)
@@ -3113,172 +3130,184 @@ def exchange_sso_to_refresh_token_via_device_flow(
         if log_callback:
             log_callback(msg)
 
-    session = requests.Session(impersonate="chrome131")
-    try:
-        try:
-            session.cookies.set("sso", token, domain=".x.ai")
-            session.cookies.set("sso-rw", token, domain=".x.ai")
-        except Exception:
-            session.cookies.set("sso", token)
-            session.cookies.set("sso-rw", token)
+    # 整段 Device Flow 串行，避免两线程同时 verify/approve 触发限流
+    with _DEVICE_FLOW_LOCK:
+        gap = _device_flow_gap_sec()
+        wait = (_DEVICE_FLOW_LAST_TS + gap) - time.time()
+        if wait > 0:
+            log(f"[*] Device Flow 节流等待 {wait:.1f}s（防 rate_limited）")
+            sleep_with_cancel(wait, cancel_callback)
+        _DEVICE_FLOW_LAST_TS = time.time()
 
-        # 1) 校验 sso
-        raise_if_cancelled(cancel_callback)
+        session = requests.Session(impersonate="chrome131")
         try:
-            r = session.get(
-                "https://accounts.x.ai/",
-                timeout=timeout,
-                **proxy_kw,
-            )
-            final_url = str(getattr(r, "url", "") or "")
-        except Exception as exc:
-            raise RuntimeError(f"Device Flow 校验 sso 网络错误: {exc}") from exc
-        if "sign-in" in final_url or "sign-up" in final_url:
-            raise RuntimeError(f"sso 无效（校验落到登录页）: {final_url}")
-        log(f"[*] Device Flow: sso 有效（校验 URL={final_url[:80]}）")
+            try:
+                session.cookies.set("sso", token, domain=".x.ai")
+                session.cookies.set("sso-rw", token, domain=".x.ai")
+            except Exception:
+                session.cookies.set("sso", token)
+                session.cookies.set("sso-rw", token)
 
-        last_err = ""
-        for attempt in range(1, max(1, int(retries)) + 1):
+            # 1) 校验 sso
             raise_if_cancelled(cancel_callback)
-            log(f"[*] Device Flow 第 {attempt}/{retries} 次...")
-
-            # 2) device/code
             try:
-                r = session.post(
-                    f"{issuer}/oauth2/device/code",
-                    data={"client_id": client_id, "scope": scopes},
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                r = session.get(
+                    "https://accounts.x.ai/",
                     timeout=timeout,
                     **proxy_kw,
                 )
-                if int(getattr(r, "status_code", 0) or 0) >= 400:
-                    last_err = f"device/code HTTP {r.status_code}: {(r.text or '')[:160]}"
-                    log(f"[Debug] {last_err}")
-                    sleep_with_cancel(1.5 * attempt, cancel_callback)
-                    continue
-                dc = r.json() if hasattr(r, "json") else {}
+                final_url = str(getattr(r, "url", "") or "")
             except Exception as exc:
-                last_err = f"device/code 异常: {exc}"
-                log(f"[Debug] {last_err}")
-                sleep_with_cancel(1.5 * attempt, cancel_callback)
-                continue
-            if not isinstance(dc, dict) or not dc.get("device_code") or not dc.get("user_code"):
-                last_err = f"device/code 响应异常: {str(dc)[:160]}"
-                log(f"[Debug] {last_err}")
-                sleep_with_cancel(1.5 * attempt, cancel_callback)
-                continue
-            user_code = str(dc.get("user_code") or "")
-            device_code = str(dc.get("device_code") or "")
-            verify_url = str(dc.get("verification_uri_complete") or "")
-            log(f"[*] Device Flow user_code={user_code}")
+                raise RuntimeError(f"Device Flow 校验 sso 网络错误: {exc}") from exc
+            if "sign-in" in final_url or "sign-up" in final_url:
+                raise RuntimeError(f"sso 无效（校验落到登录页）: {final_url}")
+            log(f"[*] Device Flow: sso 有效（校验 URL={final_url[:80]}）")
 
-            # 3) verify
-            try:
-                if verify_url:
-                    session.get(verify_url, timeout=timeout, **proxy_kw)
-                r = session.post(
-                    f"{issuer}/oauth2/device/verify",
-                    data={"user_code": user_code},
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    timeout=timeout,
-                    allow_redirects=True,
-                    **proxy_kw,
-                )
-                vurl = str(getattr(r, "url", "") or "")
-                if "consent" not in vurl:
-                    last_err = f"verify 未到 consent: {vurl[:160]}"
-                    log(f"[Debug] {last_err}")
-                    sleep_with_cancel(1.5 * attempt, cancel_callback)
-                    continue
-            except Exception as exc:
-                last_err = f"verify 异常: {exc}"
-                log(f"[Debug] {last_err}")
-                sleep_with_cancel(1.5 * attempt, cancel_callback)
-                continue
-
-            # 4) approve
-            try:
-                r = session.post(
-                    f"{issuer}/oauth2/device/approve",
-                    data={
-                        "user_code": user_code,
-                        "action": "allow",
-                        "principal_type": "User",
-                        "principal_id": "",
-                    },
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    timeout=timeout,
-                    allow_redirects=True,
-                    **proxy_kw,
-                )
-                aurl = str(getattr(r, "url", "") or "")
-                if "done" not in aurl:
-                    last_err = f"approve 未到 done: {aurl[:160]}"
-                    log(f"[Debug] {last_err}")
-                    sleep_with_cancel(1.5 * attempt, cancel_callback)
-                    continue
-                log("[*] Device Flow 已 approve")
-            except Exception as exc:
-                last_err = f"approve 异常: {exc}"
-                log(f"[Debug] {last_err}")
-                sleep_with_cancel(1.5 * attempt, cancel_callback)
-                continue
-
-            # 5) poll token
-            poll_deadline = time.time() + 45
-            interval = 1.0
-            form = {
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                "client_id": client_id,
-                "device_code": device_code,
-            }
-            first = True
-            while time.time() < poll_deadline:
+            last_err = ""
+            for attempt in range(1, max(1, int(retries)) + 1):
                 raise_if_cancelled(cancel_callback)
-                if not first:
-                    sleep_with_cancel(interval, cancel_callback)
-                first = False
+                log(f"[*] Device Flow 第 {attempt}/{retries} 次...")
+
+                # 2) device/code
                 try:
                     r = session.post(
-                        f"{issuer}/oauth2/token",
-                        data=form,
+                        f"{issuer}/oauth2/device/code",
+                        data={"client_id": client_id, "scope": scopes},
                         headers={"Content-Type": "application/x-www-form-urlencoded"},
                         timeout=timeout,
                         **proxy_kw,
                     )
-                    code = int(getattr(r, "status_code", 0) or 0)
-                    if code < 400:
-                        data = r.json() if hasattr(r, "json") else {}
-                        refresh = str((data or {}).get("refresh_token") or "").strip()
-                        if refresh:
-                            log(f"[*] Device Flow 成功，refresh_token 长度={len(refresh)}")
-                            return refresh
-                        last_err = f"token 响应无 refresh_token: {str(data)[:160]}"
-                        break
-                    try:
-                        err = r.json() if getattr(r, "content", None) else {}
-                    except Exception:
-                        err = {}
-                    error = str((err or {}).get("error") or "")
-                    if error == "authorization_pending":
+                    if int(getattr(r, "status_code", 0) or 0) >= 400:
+                        last_err = f"device/code HTTP {r.status_code}: {(r.text or '')[:160]}"
+                        log(f"[Debug] {last_err}")
+                        sleep_with_cancel(2.0 * attempt, cancel_callback)
                         continue
-                    if error == "slow_down":
-                        interval = min(8.0, interval + 1.0)
-                        continue
-                    last_err = f"token 错误: {error or f'HTTP {code}'}"
-                    break
+                    dc = r.json() if hasattr(r, "json") else {}
                 except Exception as exc:
-                    last_err = f"token 轮询异常: {exc}"
+                    last_err = f"device/code 异常: {exc}"
+                    log(f"[Debug] {last_err}")
+                    sleep_with_cancel(2.0 * attempt, cancel_callback)
                     continue
-            log(f"[Debug] Device Flow 本轮未拿到 token: {last_err}")
-            sleep_with_cancel(1.5 * attempt, cancel_callback)
+                if not isinstance(dc, dict) or not dc.get("device_code") or not dc.get("user_code"):
+                    last_err = f"device/code 响应异常: {str(dc)[:160]}"
+                    log(f"[Debug] {last_err}")
+                    sleep_with_cancel(2.0 * attempt, cancel_callback)
+                    continue
+                user_code = str(dc.get("user_code") or "")
+                device_code = str(dc.get("device_code") or "")
+                verify_url = str(dc.get("verification_uri_complete") or "")
+                log(f"[*] Device Flow user_code={user_code}")
 
-        raise RuntimeError(f"Device Flow 失败: {last_err or 'unknown'}")
-    finally:
-        try:
-            session.close()
-        except Exception:
-            pass
+                # 3) verify
+                try:
+                    if verify_url:
+                        session.get(verify_url, timeout=timeout, **proxy_kw)
+                    r = session.post(
+                        f"{issuer}/oauth2/device/verify",
+                        data={"user_code": user_code},
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        timeout=timeout,
+                        allow_redirects=True,
+                        **proxy_kw,
+                    )
+                    vurl = str(getattr(r, "url", "") or "")
+                    if "consent" not in vurl:
+                        last_err = f"verify 未到 consent: {vurl[:160]}"
+                        log(f"[Debug] {last_err}")
+                        # rate_limited 时多等一会
+                        backoff = 4.0 * attempt if "rate_limited" in vurl else 2.0 * attempt
+                        sleep_with_cancel(backoff, cancel_callback)
+                        continue
+                except Exception as exc:
+                    last_err = f"verify 异常: {exc}"
+                    log(f"[Debug] {last_err}")
+                    sleep_with_cancel(2.0 * attempt, cancel_callback)
+                    continue
+
+                # 4) approve
+                try:
+                    r = session.post(
+                        f"{issuer}/oauth2/device/approve",
+                        data={
+                            "user_code": user_code,
+                            "action": "allow",
+                            "principal_type": "User",
+                            "principal_id": "",
+                        },
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        timeout=timeout,
+                        allow_redirects=True,
+                        **proxy_kw,
+                    )
+                    aurl = str(getattr(r, "url", "") or "")
+                    if "done" not in aurl:
+                        last_err = f"approve 未到 done: {aurl[:160]}"
+                        log(f"[Debug] {last_err}")
+                        backoff = 4.0 * attempt if "rate_limited" in aurl else 2.0 * attempt
+                        sleep_with_cancel(backoff, cancel_callback)
+                        continue
+                    log("[*] Device Flow 已 approve")
+                except Exception as exc:
+                    last_err = f"approve 异常: {exc}"
+                    log(f"[Debug] {last_err}")
+                    sleep_with_cancel(2.0 * attempt, cancel_callback)
+                    continue
+
+                # 5) poll token
+                poll_deadline = time.time() + 45
+                interval = 1.0
+                form = {
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "client_id": client_id,
+                    "device_code": device_code,
+                }
+                first = True
+                while time.time() < poll_deadline:
+                    raise_if_cancelled(cancel_callback)
+                    if not first:
+                        sleep_with_cancel(interval, cancel_callback)
+                    first = False
+                    try:
+                        r = session.post(
+                            f"{issuer}/oauth2/token",
+                            data=form,
+                            headers={"Content-Type": "application/x-www-form-urlencoded"},
+                            timeout=timeout,
+                            **proxy_kw,
+                        )
+                        code = int(getattr(r, "status_code", 0) or 0)
+                        if code < 400:
+                            data = r.json() if hasattr(r, "json") else {}
+                            refresh = str((data or {}).get("refresh_token") or "").strip()
+                            if refresh:
+                                log(f"[*] Device Flow 成功，refresh_token 长度={len(refresh)}")
+                                return refresh
+                            last_err = f"token 响应无 refresh_token: {str(data)[:160]}"
+                            break
+                        try:
+                            err = r.json() if getattr(r, "content", None) else {}
+                        except Exception:
+                            err = {}
+                        error = str((err or {}).get("error") or "")
+                        if error == "authorization_pending":
+                            continue
+                        if error == "slow_down":
+                            interval = min(8.0, interval + 1.0)
+                            continue
+                        last_err = f"token 错误: {error or f'HTTP {code}'}"
+                        break
+                    except Exception as exc:
+                        last_err = f"token 轮询异常: {exc}"
+                        continue
+                log(f"[Debug] Device Flow 本轮未拿到 token: {last_err}")
+                sleep_with_cancel(2.0 * attempt, cancel_callback)
+
+            raise RuntimeError(f"Device Flow 失败: {last_err or 'unknown'}")
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
 
 
 def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_callback=None):
@@ -4627,9 +4656,15 @@ class RegistrationJob:
                     raise
                 except Exception as mail_exc:
                     msg = str(mail_exc)
-                    if ("未收到验证码" in msg or "验证码" in msg or "502" in msg or "503" in msg) and mail_try < max_mail_retry:
+                    retriable = (
+                        "未收到验证码" in msg
+                        or "验证码" in msg
+                        or any(c in msg for c in ("403", "429", "502", "503", "504"))
+                        or "邮箱服务" in msg
+                    )
+                    if retriable and mail_try < max_mail_retry:
                         logf(f"[!] HTTP 注册失败，换邮箱重试: {msg}")
-                        sleep_with_cancel(1, self.should_stop)
+                        sleep_with_cancel(1.2 * mail_try, self.should_stop)
                         continue
                     raise
             if not mail_ok:
@@ -5623,22 +5658,40 @@ def get_email_provider():
 
 
 def _is_transient_http_error(exc):
-    """502/503/504/超时等可重试错误。"""
+    """403/429/502/503/504/超时等可重试错误（邮箱站限流常见 403）。"""
     text = str(exc or "")
     low = text.lower()
-    if any(code in text for code in ("502", "503", "504", "429")):
+    if any(code in text for code in ("403", "429", "502", "503", "504")):
         return True
-    if any(k in low for k in ("timeout", "timed out", "temporarily", "bad gateway", "gateway")):
+    if any(
+        k in low
+        for k in (
+            "timeout",
+            "timed out",
+            "temporarily",
+            "bad gateway",
+            "gateway",
+            "forbidden",
+            "rate",
+            "too many",
+        )
+    ):
         return True
     code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
     try:
-        if int(code) in {429, 502, 503, 504}:
+        if int(code) in {403, 429, 502, 503, 504}:
             return True
     except Exception:
         pass
     resp = getattr(exc, "response", None)
     try:
-        if resp is not None and int(getattr(resp, "status_code", 0) or 0) in {429, 502, 503, 504}:
+        if resp is not None and int(getattr(resp, "status_code", 0) or 0) in {
+            403,
+            429,
+            502,
+            503,
+            504,
+        }:
             return True
     except Exception:
         pass

@@ -1,7 +1,10 @@
-FROM python:3.12-slim
+# 精简镜像：默认 amd64 构建约 2–4 分钟（视缓存）
+# 反检测：Google Chrome（amd64）/ Chromium（arm64）
+FROM python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
     GROK_REG_DATA_DIR=/app/data \
     GROK_REG_IN_DOCKER=1 \
     GROK_REG_HEADLESS=0 \
@@ -9,24 +12,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# amd64 安装 Google Chrome（反检测更友好），arm64 回退到 Chromium
+# 浏览器 + 最少 GUI/字体依赖（去掉 fonts-noto-cjk，体积大、装得慢）
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends wget gnupg \
-    && if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
-        wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
-        && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
-        && apt-get update \
-        && apt-get install -y --no-install-recommends google-chrome-stable \
-        && ln -sf /usr/bin/google-chrome-stable /usr/bin/browser; \
-    else \
-        apt-get install -y --no-install-recommends chromium \
-        && ln -sf /usr/bin/chromium /usr/bin/browser; \
-    fi \
     && apt-get install -y --no-install-recommends \
-        fonts-noto-cjk \
+        ca-certificates \
+        curl \
+        wget \
+        gnupg \
         fonts-liberation \
         fonts-dejavu-core \
-        fonts-noto-color-emoji \
         libasound2 \
         libatk-bridge2.0-0 \
         libgtk-3-0 \
@@ -40,7 +34,16 @@ RUN apt-get update \
         xauth \
         xvfb \
         tzdata \
-    && rm -rf /var/lib/apt/lists/*
+    && if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+        wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+        && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+        && ln -sf /usr/bin/google-chrome-stable /usr/bin/browser \
+        && rm -f /tmp/chrome.deb; \
+    else \
+        apt-get install -y --no-install-recommends chromium \
+        && ln -sf /usr/bin/chromium /usr/bin/browser; \
+    fi \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 ENV CHROME_BIN=/usr/bin/browser
 
@@ -48,7 +51,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data \
+    && find /app -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
 
 EXPOSE 8787
 

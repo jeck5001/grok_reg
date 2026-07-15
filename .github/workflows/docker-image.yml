@@ -2,8 +2,13 @@ name: Build Docker Image
 
 on:
   push:
-    branches: ["master"]
+    branches: ["master", "main"]
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Docker platforms (comma-separated)"
+        required: false
+        default: "linux/amd64"
 
 permissions:
   contents: read
@@ -17,6 +22,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up QEMU
+        # 仅多架构时需要；单 amd64 几乎无额外开销
+        if: ${{ contains(github.event.inputs.platforms || 'linux/amd64', 'arm') }}
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
@@ -39,11 +46,25 @@ jobs:
             type=ref,event=branch
             type=sha,prefix=sha-
 
+      - name: Resolve platforms
+        id: plats
+        run: |
+          # 默认只打 amd64（快 2–3 倍）。需要 arm64 时用 workflow_dispatch 改 platforms
+          P="${{ github.event.inputs.platforms }}"
+          if [ -z "$P" ]; then P="linux/amd64"; fi
+          echo "platforms=$P" >> "$GITHUB_OUTPUT"
+          echo "Building platforms: $P"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ steps.plats.outputs.platforms }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # 加速：不导出 attestation 到多平台（单平台时也更干净）
+          provenance: false
+          sbom: false

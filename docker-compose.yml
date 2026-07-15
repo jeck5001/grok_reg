@@ -13,6 +13,8 @@ services:
       TZ: Asia/Shanghai
       # 独立 turnstile-solver；同 compose 网络可用 http://turnstile-solver:5072
       GROK_REG_TURNSTILE_SOLVER_URL: "${GROK_REG_TURNSTILE_SOLVER_URL:-http://host.docker.internal:5072}"
+      # 容器默认 API 建号；可改 browser
+      GROK_REG_SIGNUP_MODE: "${GROK_REG_SIGNUP_MODE:-api}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

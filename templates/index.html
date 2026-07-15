@@ -168,6 +168,14 @@
                   <input name="turnstile_solver_use_proxy" type="checkbox" checked />
                   透传业务代理给 Solver（task.proxy，与注册浏览器同出口）
                 </label>
+                <label>
+                  建号模式
+                  <select name="signup_mode">
+                    <option value="auto" selected>auto（Docker→API，本机→浏览器）</option>
+                    <option value="api">api（Solver+HTTP create_account，推荐容器）</option>
+                    <option value="browser">browser（SPA 点 Complete sign up）</option>
+                  </select>
+                </label>
                 <label class="wide">
                   Solver 地址
                   <input name="turnstile_solver_url" placeholder="http://127.0.0.1:5072（Docker 内自动映射 host.docker.internal）" />

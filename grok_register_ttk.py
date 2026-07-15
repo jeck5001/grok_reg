@@ -132,6 +132,9 @@ DEFAULT_CONFIG = {
     "turnstile_solver_use_proxy": True,
     # accounts.x.ai 公开 sitekey（页面刮不到时回退；非密钥）
     "turnstile_sitekey": "0x4AAAAAAAhr9JGVDZbrZOo0",
+    # 注册最终建号方式：auto|api|browser
+    # auto：Docker 默认走 API create_account（与 grokcli-2api 同路径）；本机默认 browser
+    "signup_mode": "auto",
     "show_tutorial_on_start": True,
     "cloudmail_url": "",
     "cloudmail_admin_email": "",
@@ -4086,6 +4089,13 @@ def validate_registration_config(settings):
             normalized[bool_key] = raw_bool.strip().lower() in {"1", "true", "yes", "on"}
         else:
             normalized[bool_key] = bool(raw_bool)
+    signup_mode = str(normalized.get("signup_mode") or "auto").strip().lower()
+    if signup_mode not in {"auto", "api", "browser"}:
+        signup_mode = "auto"
+    env_mode = str(os.environ.get("GROK_REG_SIGNUP_MODE") or "").strip().lower()
+    if env_mode in {"auto", "api", "browser"}:
+        signup_mode = env_mode
+    normalized["signup_mode"] = signup_mode
     try:
         wait_seconds = float(normalized.get("turnstile_wait_seconds", 120) or 120)
     except Exception:
@@ -4324,10 +4334,26 @@ class RegistrationJob:
                     email, dev_token, log_callback=logf, cancel_callback=self.should_stop
                 )
                 logf(f"[*] 验证码: {code}")
-                logf("[*] 4. 填写资料")
-                profile = fill_profile_and_submit(
-                    log_callback=logf, cancel_callback=self.should_stop
-                )
+                signup_mode = resolve_signup_mode()
+                if signup_mode == "api":
+                    logf("[*] 4. API 建号（Solver token + create_account，容器推荐）")
+                    sso_api, profile = register_via_api_after_otp(
+                        email,
+                        code,
+                        log_callback=logf,
+                        cancel_callback=self.should_stop,
+                    )
+                    # 把 sso 暂存到 profile，后续跳过 wait_for_sso
+                    profile = dict(profile or {})
+                    profile["sso"] = sso_api
+                    profile["signup_mode"] = "api"
+                else:
+                    logf("[*] 4. 填写资料（浏览器 SPA）")
+                    profile = fill_profile_and_submit(
+                        log_callback=logf, cancel_callback=self.should_stop
+                    )
+                    profile = dict(profile or {})
+                    profile["signup_mode"] = "browser"
                 mail_ok = True
                 break
             except ProfileSessionLost as profile_exc:
@@ -4348,8 +4374,12 @@ class RegistrationJob:
         if not mail_ok:
             raise Exception("验证码阶段失败，已达到最大重试次数")
         logf(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-        logf("[*] 5. 等待 sso cookie")
-        sso = wait_for_sso_cookie(log_callback=logf, cancel_callback=self.should_stop)
+        sso = str((profile or {}).get("sso") or "").strip()
+        if sso:
+            logf("[*] 5. 已通过 API create_account 获取 sso")
+        else:
+            logf("[*] 5. 等待 sso cookie")
+            sso = wait_for_sso_cookie(log_callback=logf, cancel_callback=self.should_stop)
         if self.settings.get("enable_nsfw"):
             logf("[*] 6. 开启 NSFW")
             nsfw_ok, nsfw_message = enable_nsfw_for_token(sso, log_callback=logf)
@@ -5654,9 +5684,489 @@ def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
 
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+_RSC_PUSH_RE = re.compile(r'self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)')
+_NEXT_ACTION_CHUNK_HINTS = (
+    "createUserAndSessionRequest",
+    "emailValidationCode",
+    "turnstileToken",
+)
 
-_thread_ctx = threading.local()
-_browser_launch_semaphore = threading.Semaphore(2)
+
+def resolve_signup_mode():
+    """auto: Docker/容器默认 api，本机默认 browser。"""
+    mode = str(config.get("signup_mode") or "auto").strip().lower()
+    if mode in {"api", "browser"}:
+        return mode
+    env_mode = str(os.environ.get("GROK_REG_SIGNUP_MODE") or "").strip().lower()
+    if env_mode in {"api", "browser"}:
+        return env_mode
+    if _env_truthy("GROK_REG_IN_DOCKER"):
+        return "api"
+    return "browser"
+
+
+def export_browser_cookies(page, domain_hint="x.ai"):
+    """导出浏览器 cookie，供 curl_cffi Session 复用 cf_clearance 等。"""
+    cookies = []
+    if not page:
+        return cookies
+    try:
+        raw = page.cookies(all_domains=True, all_info=True) or []
+    except Exception:
+        try:
+            raw = page.cookies() or []
+        except Exception:
+            raw = []
+    for item in raw:
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+            value = str(item.get("value") or "").strip()
+            domain = str(item.get("domain") or item.get("host") or "").strip()
+            path = str(item.get("path") or "/").strip() or "/"
+        else:
+            name = str(getattr(item, "name", "") or "").strip()
+            value = str(getattr(item, "value", "") or "").strip()
+            domain = str(getattr(item, "domain", "") or "").strip()
+            path = str(getattr(item, "path", "/") or "/").strip() or "/"
+        if not name:
+            continue
+        if domain_hint and domain and domain_hint not in domain:
+            continue
+        cookies.append(
+            {
+                "name": name,
+                "value": value,
+                "domain": domain or ".x.ai",
+                "path": path,
+            }
+        )
+    return cookies
+
+
+def _cookie_header_from_list(cookies):
+    pairs = []
+    for c in cookies or []:
+        name = str(c.get("name") or "").strip()
+        value = str(c.get("value") or "")
+        if name:
+            pairs.append(f"{name}={value}")
+    return "; ".join(pairs)
+
+
+def scrape_signup_next_headers(html, log_callback=None, proxies=None):
+    """从 accounts.x.ai sign-up HTML/JS 提取 next-action 与 router-state-tree。
+
+    逻辑对齐 grokcli-2api/xconsole_client（动态 action，避免硬编码过期）。
+    """
+    html = str(html or "")
+    if not html:
+        raise RuntimeError("sign-up 页面 HTML 为空，无法提取 next-action")
+
+    # ---- router state tree ----
+    router_tree = None
+    rsc_segments = _RSC_PUSH_RE.findall(html)
+    for seg in rsc_segments:
+        unescaped = seg.replace('\\"', '"')
+        m = re.search(r'"f":\[(\[.*?\])', unescaped)
+        if not m:
+            continue
+        flight_seg = m.group(1)
+        if not flight_seg.startswith('[["",{"children"'):
+            continue
+        depth = 0
+        tree_end = 0
+        for i, ch in enumerate(flight_seg):
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    tree_end = i + 1
+                    break
+        if tree_end <= 0:
+            continue
+        try:
+            parsed = json.loads(flight_seg[:tree_end])
+            if isinstance(parsed, list) and parsed:
+                router_tree = json.dumps(parsed[0], separators=(",", ":"))
+                break
+        except Exception:
+            continue
+    if not router_tree:
+        # 兜底：与当前浏览器 redirect=grok-com 对齐
+        router_tree = json.dumps(
+            [
+                "",
+                {
+                    "children": [
+                        "(app)",
+                        {
+                            "children": [
+                                "(auth)",
+                                {
+                                    "children": [
+                                        "sign-up",
+                                        {
+                                            "children": [
+                                                '__PAGE__?{"redirect":"grok-com"}',
+                                                {},
+                                            ]
+                                        },
+                                    ]
+                                },
+                            ]
+                        },
+                    ]
+                },
+                "$undefined",
+                "$undefined",
+                16,
+            ],
+            separators=(",", ":"),
+        )
+        if log_callback:
+            log_callback("[Debug] next-router-state-tree 使用 grok-com 兜底结构")
+
+    router_header = urllib.parse.quote(router_tree, safe="")
+
+    # ---- next-action from JS chunks ----
+    js_paths = list(set(re.findall(r'src="(/_next/static/chunks/[^"]+\.js)"', html)))
+    if log_callback:
+        log_callback(f"[Debug] 扫描 {len(js_paths)} 个 JS chunk 查找 next-action...")
+
+    signup_hash = None
+    fallback_hash = None
+    session_kwargs = {"timeout": 20, "impersonate": "chrome131"}
+    if proxies:
+        session_kwargs["proxies"] = proxies
+
+    def _fetch_chunk(path):
+        url = f"https://accounts.x.ai{path}"
+        try:
+            if requests is None:
+                return None, False
+            resp = requests.get(url, **session_kwargs)
+            text = resp.text or ""
+            hashes = set(re.findall(r'"([a-f0-9]{42})"', text))
+            if not hashes:
+                return None, False
+            is_signup = any(h in text for h in _NEXT_ACTION_CHUNK_HINTS)
+            return next(iter(hashes)), is_signup
+        except Exception:
+            return None, False
+
+    # 优先可能含 signup 的 chunk
+    ordered = sorted(
+        js_paths,
+        key=lambda p: (
+            0
+            if any(x in p for x in ("06rq", "create", "sign", "auth", "action"))
+            else 1,
+            p,
+        ),
+    )
+    # 限制扫描数量，避免过慢
+    for path in ordered[:40]:
+        h, is_signup = _fetch_chunk(path)
+        if not h:
+            continue
+        if is_signup:
+            signup_hash = h
+            break
+        if fallback_hash is None:
+            fallback_hash = h
+    action_id = signup_hash or fallback_hash
+    if not action_id:
+        raise RuntimeError("未能从 JS chunk 提取 next-action，页面结构可能已变化")
+    if log_callback:
+        log_callback(
+            f"[Debug] next-action={action_id[:16]}... ({len(action_id)} chars, "
+            f"{'signup-chunk' if signup_hash else 'fallback'})"
+        )
+    return {"next_action": action_id, "router_state_tree": router_header}
+
+
+def extract_sso_from_http_result(set_cookies=None, body="", cookie_jar=None):
+    """从 Set-Cookie / RSC body / session jar 提取 sso。"""
+    patterns = [
+        re.compile(r"(?:^|,\s*)sso=([^;,\s]+)", re.I),
+        re.compile(r"sso=(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"),
+    ]
+    for raw in set_cookies or []:
+        text = str(raw or "")
+        for pat in patterns:
+            m = pat.search(text)
+            if m:
+                return m.group(1).strip()
+    body_text = str(body or "")
+    m = re.search(r"sso=(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)", body_text)
+    if m:
+        return m.group(1).strip()
+    m = re.search(
+        r"set-cookie\?q=(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)",
+        body_text,
+        flags=re.I,
+    )
+    if m:
+        return m.group(1).strip()
+    if cookie_jar is not None:
+        try:
+            if hasattr(cookie_jar, "get"):
+                for domain in (".x.ai", "accounts.x.ai", ".grok.com", None):
+                    try:
+                        val = (
+                            cookie_jar.get("sso", domain=domain)
+                            if domain is not None
+                            else cookie_jar.get("sso")
+                        )
+                        if val:
+                            return str(val).strip()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return ""
+
+
+def extract_signup_hard_error(rsc_body):
+    text = str(rsc_body or "")
+    if not text:
+        return None
+    text_l = text.lower()
+    m = re.search(r"(?m)^(\d+):E\{([^}]{0,400})", text)
+    if m:
+        return f"next_action_error:{m.group(2)[:160]}"
+    for pat in (
+        r"\b(turnstile_failed)\b",
+        r"\b(account_signup_error)\b",
+        r"\b(rate_limited)\b",
+        r"\b(invalid_verification_code)\b",
+        r"\b(email_already_in_use)\b",
+        r"\b(user_already_exists)\b",
+        r"\b(account_email_domain_rejected)\b",
+        r"\b(form_invalid_disposable_email)\b",
+    ):
+        m = re.search(pat, text_l)
+        if m:
+            return m.group(1)
+    m = re.search(r"wke\s*=\s*([a-z0-9_.:/-]+)", text_l)
+    if m:
+        return f"wke={m.group(1)}"
+    return None
+
+
+def create_xai_account_via_http(
+    email,
+    given_name,
+    family_name,
+    password,
+    email_code,
+    turnstile_token,
+    *,
+    next_action,
+    router_state_tree,
+    browser_cookies=None,
+    signup_url=None,
+    log_callback=None,
+    cancel_callback=None,
+):
+    """对齐 grokcli-2api：POST accounts.x.ai/sign-up Next.js server action 建号。"""
+    if requests is None:
+        raise RuntimeError("curl_cffi 未安装，无法 API 建号")
+    raise_if_cancelled(cancel_callback)
+    signup_url = (signup_url or SIGNUP_URL).strip()
+    email_code = str(email_code or "").strip().upper().replace(" ", "").replace("-", "")
+    turnstile_token = str(turnstile_token or "").strip()
+    if len(email_code) != 6:
+        raise ValueError(f"验证码格式异常: {email_code!r}")
+    if len(turnstile_token) < 80:
+        raise ValueError(f"turnstile token 过短: len={len(turnstile_token)}")
+
+    create_req = {
+        "email": email,
+        "givenName": given_name,
+        "familyName": family_name,
+        "clearTextPassword": password,
+        "tosAcceptedVersion": "$undefined",
+    }
+    args = [
+        {
+            "emailValidationCode": email_code,
+            "createUserAndSessionRequest": create_req,
+            "turnstileToken": turnstile_token,
+            "conversionId": str(uuid.uuid4()),
+            "castleRequestToken": "",
+        },
+        {"client": "$T", "meta": "$undefined", "mutationKey": "$undefined"},
+    ]
+    body = json.dumps(args, separators=(",", ":"))
+    ua = get_user_agent()
+    proxies = get_proxies()
+    headers = {
+        "accept": "text/x-component",
+        "content-type": "text/plain;charset=UTF-8",
+        "next-action": next_action,
+        "next-router-state-tree": router_state_tree,
+        "origin": "https://accounts.x.ai",
+        "referer": signup_url,
+        "user-agent": ua,
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "empty",
+    }
+    cookie_header = _cookie_header_from_list(browser_cookies)
+    if cookie_header:
+        headers["cookie"] = cookie_header
+
+    if log_callback:
+        log_callback(
+            f"[*] API create_account: email={email} action={str(next_action)[:16]}... "
+            f"tokenLen={len(turnstile_token)} cookies={len(browser_cookies or [])}"
+        )
+
+    session_kwargs = {"impersonate": "chrome131", "timeout": 45}
+    if proxies:
+        session_kwargs["proxies"] = proxies
+    with requests.Session(**session_kwargs) as session:
+        # 注入浏览器 cookie（cf_clearance 等）
+        for c in browser_cookies or []:
+            try:
+                session.cookies.set(
+                    c.get("name"),
+                    c.get("value"),
+                    domain=c.get("domain") or ".x.ai",
+                    path=c.get("path") or "/",
+                )
+            except Exception:
+                try:
+                    session.cookies.set(c.get("name"), c.get("value"))
+                except Exception:
+                    pass
+        resp = session.post(signup_url, data=body.encode("utf-8"), headers=headers)
+        set_cookies = []
+        try:
+            # curl_cffi may expose headers differently
+            if hasattr(resp.headers, "get_list"):
+                set_cookies = resp.headers.get_list("set-cookie") or []
+            else:
+                raw_sc = resp.headers.get("set-cookie")
+                if raw_sc:
+                    set_cookies = [raw_sc] if isinstance(raw_sc, str) else list(raw_sc)
+        except Exception:
+            set_cookies = []
+        rsc_body = resp.text or ""
+        hard_err = extract_signup_hard_error(rsc_body)
+        sso = extract_sso_from_http_result(set_cookies, rsc_body, session.cookies)
+        if log_callback:
+            log_callback(
+                f"[*] create_account HTTP {resp.status_code} hard_error={hard_err!r} "
+                f"sso={'yes' if sso else 'no'} body_len={len(rsc_body)} "
+                f"preview={rsc_body[:180]!r}"
+            )
+        if hard_err:
+            raise RuntimeError(f"create_account 被拒绝: {hard_err}")
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"create_account HTTP {resp.status_code}: {rsc_body[:300]}"
+            )
+        if not sso:
+            # 部分成功响应延迟写 cookie，再读 jar
+            sso = extract_sso_from_http_result([], rsc_body, session.cookies)
+        if not sso:
+            raise RuntimeError(
+                "create_account 成功但未拿到 sso；"
+                f"set_cookies={len(set_cookies)} preview={rsc_body[:240]!r}"
+            )
+        return sso
+
+
+def register_via_api_after_otp(
+    email,
+    email_code,
+    log_callback=None,
+    cancel_callback=None,
+):
+    """OTP 已在浏览器验证后：Solver 出 token + HTTP create_account 拿 sso。"""
+    page = _get_page()
+    if page is None:
+        raise RuntimeError("页面未就绪，无法 API 建号")
+
+    given_name, family_name, password = build_profile()
+    if log_callback:
+        log_callback(
+            f"[*] API 建号模式：资料 {given_name} {family_name}，"
+            f"Solver + create_account（跳过 SPA Complete sign up）"
+        )
+
+    # 1) 页面 HTML + cookies
+    try:
+        html = page.html or ""
+    except Exception:
+        html = ""
+    if len(html) < 500:
+        # 回拉 sign-up 页
+        if log_callback:
+            log_callback("[Debug] 当前页 HTML 过短，重新打开 sign-up 提取 next-action")
+        try:
+            page.get(SIGNUP_URL)
+            sleep_with_cancel(2, cancel_callback)
+            html = page.html or ""
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] 重开 sign-up 失败: {exc}")
+    browser_cookies = export_browser_cookies(page)
+    if log_callback:
+        names = [c.get("name") for c in browser_cookies]
+        log_callback(f"[Debug] 浏览器 cookies: {names[:20]}")
+
+    # 2) next-action / router tree
+    headers_meta = scrape_signup_next_headers(
+        html, log_callback=log_callback, proxies=get_proxies()
+    )
+
+    # 3) Turnstile token（与业务代理同出口）
+    ctx = scrape_turnstile_context_from_page(page)
+    website_url = ctx.get("url") or SIGNUP_URL
+    website_key = ctx.get("sitekey") or str(config.get("turnstile_sitekey") or "")
+    if log_callback:
+        log_callback(
+            f"[*] API 建号请求 Solver: key={(website_key or '')[:14]}... "
+            f"proxy={_redact_proxy_for_log(_proxy_for_turnstile_solver()) or '直连'}"
+        )
+    if not probe_local_turnstile_solver():
+        raise RuntimeError(
+            f"Turnstile Solver 不可达: {normalize_turnstile_solver_url()}，API 建号需要 Solver"
+        )
+    turnstile_token = solve_turnstile_via_local_solver(
+        website_url=website_url,
+        website_key=website_key,
+        action=ctx.get("action") or "",
+        cdata=ctx.get("cdata") or "",
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+    )
+
+    # 4) HTTP create_account
+    sso = create_xai_account_via_http(
+        email=email,
+        given_name=given_name,
+        family_name=family_name,
+        password=password,
+        email_code=email_code,
+        turnstile_token=turnstile_token,
+        next_action=headers_meta["next_action"],
+        router_state_tree=headers_meta["router_state_tree"],
+        browser_cookies=browser_cookies,
+        signup_url=SIGNUP_URL,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+    )
+    profile = {
+        "given_name": given_name,
+        "family_name": family_name,
+        "password": password,
+    }
+    return sso, profile
 _xvfb_process = None
 _xvfb_lock = threading.Lock()
 

@@ -6126,10 +6126,18 @@ def _default_router_state_tree_header():
     return urllib.parse.quote(router_tree, safe="")
 
 
-def scrape_signup_next_headers(html, log_callback=None, proxies=None, force_refresh=False):
+def scrape_signup_next_headers(
+    html,
+    log_callback=None,
+    proxies=None,
+    force_refresh=False,
+    browser_cookies=None,
+    page=None,
+):
     """从 accounts.x.ai sign-up HTML/JS 提取 next-action 与 router-state-tree。
 
     逻辑对齐 grokcli-2api/xconsole_client；带内存+磁盘缓存，避免每次扫 40+ chunk。
+    chunk 下载必须带浏览器 cookie（cf_clearance），否则代理下常被 CF 空响应。
     """
     html = str(html or "")
     if not html:
@@ -6145,6 +6153,7 @@ def scrape_signup_next_headers(html, log_callback=None, proxies=None, force_refr
             cached_sig = str(_NEXT_ACTION_CACHE.get("html_sig") or "")
         if (
             cached_action
+            and len(cached_action) >= 40
             and cached_router
             and now - cached_at < _NEXT_ACTION_CACHE_TTL
             and (not cached_sig or cached_sig == sig)
@@ -6157,7 +6166,7 @@ def scrape_signup_next_headers(html, log_callback=None, proxies=None, force_refr
                 )
             return {"next_action": cached_action, "router_state_tree": cached_router}
         # 磁盘冷启动
-        if not cached_action:
+        if not cached_action or len(cached_action) < 40:
             _load_next_action_disk_cache()
             with _NEXT_ACTION_CACHE_LOCK:
                 cached_action = str(_NEXT_ACTION_CACHE.get("action") or "")
@@ -6166,6 +6175,7 @@ def scrape_signup_next_headers(html, log_callback=None, proxies=None, force_refr
                 cached_sig = str(_NEXT_ACTION_CACHE.get("html_sig") or "")
             if (
                 cached_action
+                and len(cached_action) >= 40
                 and cached_router
                 and now - cached_at < _NEXT_ACTION_CACHE_TTL
                 and (not cached_sig or cached_sig == sig)
@@ -6213,83 +6223,165 @@ def scrape_signup_next_headers(html, log_callback=None, proxies=None, force_refr
         if log_callback:
             log_callback("[Debug] next-router-state-tree 使用 grok-com 兜底结构")
 
-    # ---- next-action from JS chunks（串行优先扫，curl_cffi 非线程安全不能并行）----
+    # ---- next-action from JS chunks ----
+    # 1) 先从 HTML/RSC 正文抠 42 位 hex（部分部署会内联）
+    # 2) 再用「浏览器 cookie」下载 chunk（无 cookie 时代理下常被 CF 空响应）
     js_paths = list(set(re.findall(r'src="(/_next/static/chunks/[^"]+\.js)"', html)))
     if log_callback:
         log_callback(f"[Debug] 扫描 JS chunk 查找 next-action（共 {len(js_paths)}）...")
 
-    session_kwargs = {"timeout": 15, "impersonate": "chrome131"}
-    if proxies:
-        session_kwargs["proxies"] = proxies
-
-    def _fetch_chunk(path):
-        url = f"https://accounts.x.ai{path}"
-        try:
-            if requests is None:
-                return None, False
-            resp = requests.get(url, **session_kwargs)
-            text = resp.text or ""
-            hashes = re.findall(r'"([a-f0-9]{42})"', text)
-            if not hashes:
-                return None, False
-            is_signup = any(h in text for h in _NEXT_ACTION_CHUNK_HINTS)
-            return hashes[0], is_signup
-        except Exception:
-            return None, False
-
-    # 关键字优先；再扫剩余，最多 24 个（通常前几个就命中）
-    ordered = sorted(
-        js_paths,
-        key=lambda p: (
-            0 if any(x in p for x in ("06rq", "create", "sign", "auth", "action", "0rq")) else 1,
-            p,
-        ),
-    )
     signup_hash = None
     fallback_hash = None
     scanned = 0
-    for path in ordered[:24]:
+    hit_ok = 0
+    hit_empty = 0
+
+    # HTML 内联候选
+    inline_hashes = re.findall(r'["\']([a-f0-9]{42})["\']', html)
+    for h in inline_hashes:
+        # 带 7f 前缀的更像 server action metadata
+        if h.startswith("7f") and not fallback_hash:
+            fallback_hash = h
+
+    cookie_header = _cookie_header_from_list(browser_cookies or [])
+    session = None
+    if requests is not None:
+        sk = {"impersonate": "chrome131", "timeout": 15}
+        if proxies:
+            sk["proxies"] = proxies
+        try:
+            session = requests.Session(**sk)
+            for c in browser_cookies or []:
+                try:
+                    session.cookies.set(
+                        c.get("name"),
+                        c.get("value"),
+                        domain=c.get("domain") or ".x.ai",
+                        path=c.get("path") or "/",
+                    )
+                except Exception:
+                    try:
+                        session.cookies.set(c.get("name"), c.get("value"))
+                    except Exception:
+                        pass
+        except Exception:
+            session = None
+
+    def _fetch_chunk(path):
+        url = f"https://accounts.x.ai{path}"
+        text = ""
+        # 优先浏览器 fetch（同源 cookie/TLS 最稳；CDP awaitPromise 真正等待）
+        if page is not None:
+            try:
+                expr = (
+                    "(async()=>{try{const r=await fetch(%s,{credentials:'include',cache:'force-cache'});"
+                    "return r.ok?await r.text():'';}catch(e){return '';}})()"
+                ) % json.dumps(url)
+                cdp = page.run_cdp(
+                    "Runtime.evaluate",
+                    expression=expr,
+                    awaitPromise=True,
+                    returnByValue=True,
+                ) or {}
+                text = str(((cdp.get("result") or {}).get("value")) or "")
+            except Exception:
+                text = ""
+        if (not text or len(text) < 50) and session is not None:
+            try:
+                headers = {
+                    "accept": "*/*",
+                    "user-agent": get_user_agent(),
+                    "referer": SIGNUP_URL,
+                }
+                if cookie_header:
+                    headers["cookie"] = cookie_header
+                resp = session.get(url, headers=headers, timeout=15)
+                text = resp.text or ""
+            except Exception:
+                text = ""
+        if not text or len(text) < 50:
+            return None, False
+        hashes = re.findall(r'"([a-f0-9]{42})"', text)
+        if not hashes:
+            # 无引号形态
+            hashes = re.findall(r'(?<![a-f0-9])([a-f0-9]{42})(?![a-f0-9])', text)
+        if not hashes:
+            return None, False
+        is_signup = any(h in text for h in _NEXT_ACTION_CHUNK_HINTS)
+        # signup chunk 里优先 7f 开头
+        preferred = next((x for x in hashes if x.startswith("7f")), hashes[0])
+        return preferred, is_signup
+
+    ordered = sorted(
+        js_paths,
+        key=lambda p: (
+            0
+            if any(
+                x in p
+                for x in (
+                    "06rq",
+                    "create",
+                    "sign",
+                    "auth",
+                    "action",
+                    "0rq",
+                    "csyr",
+                    "user",
+                )
+            )
+            else 1,
+            p,
+        ),
+    )
+    # 扫完全部 chunk，命中 signup 关键字立即停
+    for path in ordered:
         scanned += 1
         h, is_signup = _fetch_chunk(path)
         if not h:
+            hit_empty += 1
             continue
+        hit_ok += 1
         if is_signup:
             signup_hash = h
             break
-        if fallback_hash is None:
+        if fallback_hash is None or (h.startswith("7f") and not str(fallback_hash).startswith("7f")):
             fallback_hash = h
+
+    try:
+        if session is not None:
+            session.close()
+    except Exception:
+        pass
 
     action_id = signup_hash or fallback_hash
 
-    # 扫描失败：放宽用任意未过期缓存（忽略 html_sig），再不行用已知可用 action
-    if not action_id:
+    # 扫描失败：放宽用任意缓存（忽略 html_sig，最长 14 天）
+    if not action_id or len(str(action_id)) < 40:
         _load_next_action_disk_cache()
         with _NEXT_ACTION_CACHE_LOCK:
             stale_action = str(_NEXT_ACTION_CACHE.get("action") or "")
             stale_router = str(_NEXT_ACTION_CACHE.get("router") or "")
             stale_at = float(_NEXT_ACTION_CACHE.get("at") or 0)
-        if stale_action and time.time() - stale_at < 7 * 86400:
+        if stale_action and len(stale_action) >= 40 and time.time() - stale_at < 14 * 86400:
             if log_callback:
                 log_callback(
-                    f"[!] next-action 扫描失败（扫了 {scanned} 个），回退缓存 "
-                    f"{stale_action[:16]}... age={int(time.time() - stale_at)}s"
+                    f"[!] next-action 扫描失败（ok={hit_ok}/empty={hit_empty}/total={scanned}），"
+                    f"回退缓存 {stale_action[:16]}... age={int(time.time() - stale_at)}s"
                 )
             return {
                 "next_action": stale_action,
                 "router_state_tree": stale_router or router_header,
             }
-        # 线上已验证可用的 action（部署变更前可顶一阵）
-        known = "7f50061dd2f5b389"
-        # 完整 42 位未知时不硬编；若缓存也没有就报错
         raise RuntimeError(
-            f"未能从 JS chunk 提取 next-action（扫了 {scanned} 个）。"
-            "可检查代理/网络，或删除 data/next_action_cache.json 后重试"
+            f"未能从 JS chunk 提取 next-action（ok={hit_ok}/empty={hit_empty}/total={scanned}）。"
+            "请确认代理可访问 accounts.x.ai 静态资源，或检查浏览器 cookie 是否带 cf_clearance"
         )
 
     if log_callback:
         log_callback(
             f"[Debug] next-action={action_id[:16]}... ({len(action_id)} chars, "
-            f"{'signup-chunk' if signup_hash else 'fallback'}, scanned={scanned})"
+            f"{'signup-chunk' if signup_hash else 'fallback'}, "
+            f"ok={hit_ok}/empty={hit_empty}/scanned={scanned})"
         )
 
     with _NEXT_ACTION_CACHE_LOCK:
@@ -7119,9 +7211,13 @@ def register_via_api_after_otp(
         names = [c.get("name") for c in browser_cookies]
         log_callback(f"[Debug] 浏览器 cookies: {names[:20]}")
 
-    # 2) next-action / router tree
+    # 2) next-action / router tree（带浏览器 cookie，避免 CF 空响应）
     headers_meta = scrape_signup_next_headers(
-        html, log_callback=log_callback, proxies=get_proxies()
+        html,
+        log_callback=log_callback,
+        proxies=get_proxies(),
+        browser_cookies=browser_cookies,
+        page=page,
     )
 
     # 3) Turnstile token（与业务代理同出口）

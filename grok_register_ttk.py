@@ -105,7 +105,7 @@ DEFAULT_CONFIG = {
     # 推送后是否自动探测（遇 xAI 429 时可关掉，只 refresh）
     "sub2api_auto_probe": True,
     "sub2api_init_gap_seconds": 8,
-    "sub2api_test_model": "grok-3",
+    "sub2api_test_model": "grok-4.5",
     "cpa_auth_dir": "cpa_auths",
     "cpa_auto_push_remote": False,
     "cpa_management_base": "",
@@ -1319,7 +1319,7 @@ def _sub2api_test_models(settings=None):
     """探测只用 1 个模型，避免连打触发 oauth refresh account state changed。"""
     settings = settings or {}
     preferred = str(settings.get("sub2api_test_model") or "").strip()
-    return [preferred] if preferred else ["grok-3"]
+    return [preferred] if preferred else ["grok-4.5"]
 
 
 def _parse_sub2api_test_sse(text):
@@ -4980,8 +4980,8 @@ def validate_registration_config(settings):
     except Exception:
         normalized["sub2api_init_gap_seconds"] = 8.0
     normalized["sub2api_test_model"] = str(
-        normalized.get("sub2api_test_model") or "grok-3"
-    ).strip() or "grok-3"
+        normalized.get("sub2api_test_model") or "grok-4.5"
+    ).strip() or "grok-4.5"
     if isinstance(normalized.get("cpa_auto_push_remote"), str):
         normalized["cpa_auto_push_remote"] = normalized["cpa_auto_push_remote"].strip().lower() in {
             "1",

@@ -8254,16 +8254,6 @@ def _xai_grpc_call(session, url, fields, referer=SIGNUP_URL, log_callback=None):
     }
     resp = session.post(url, data=body, headers=headers, timeout=30)
     raw = resp.content or b""
-    # 空 body 时打一点 headers 便于排查 CF/代理
-    if not raw and log_callback:
-        try:
-            ct = resp.headers.get("content-type") or resp.headers.get("Content-Type") or ""
-            cl = resp.headers.get("content-length") or resp.headers.get("Content-Length") or ""
-            log_callback(
-                f"[Debug] gRPC 空响应 headers content-type={ct!r} content-length={cl!r}"
-            )
-        except Exception:
-            pass
     parsed = _grpc_parse_response(raw)
     ok = int(getattr(resp, "status_code", 0) or 0) == 200 and parsed.get("grpc_status") == 0
     if log_callback:
@@ -8278,90 +8268,6 @@ def _xai_grpc_call(session, url, fields, referer=SIGNUP_URL, log_callback=None):
         "trailers": parsed.get("trailers") or {},
         "raw": raw,
     }
-
-
-# 并发发码时 accounts.x.ai 易返回空 body；全局串行 CreateEmailValidationCode
-_CREATE_EMAIL_CODE_LOCK = threading.RLock()
-_CREATE_EMAIL_CODE_LAST_TS = 0.0
-
-
-def _create_email_validation_code_with_retry(
-    session,
-    email,
-    *,
-    create_code_url,
-    signup_url,
-    page_headers,
-    log_callback=None,
-    cancel_callback=None,
-):
-    """CreateEmailValidationCode：串行 + 空响应时重建会话重试。"""
-    global _CREATE_EMAIL_CODE_LAST_TS
-    email = str(email or "").strip()
-    last_res = None
-    with _CREATE_EMAIL_CODE_LOCK:
-        # 线程间最小间隔，降低被 CF 空响应
-        gap = 1.5
-        wait = (_CREATE_EMAIL_CODE_LAST_TS + gap) - time.time()
-        if wait > 0:
-            sleep_with_cancel(wait, cancel_callback)
-
-        for send_try in range(1, 4):
-            raise_if_cancelled(cancel_callback)
-            # 第 2 次起：新 Session + 重新 GET sign-up
-            if send_try > 1:
-                if log_callback:
-                    log_callback(
-                        f"[*] CreateEmailValidationCode 重建会话后重试 ({send_try}/3)"
-                    )
-                try:
-                    session.close()
-                except Exception:
-                    pass
-                session = _xai_http_session()
-                try:
-                    session.get(signup_url, headers=page_headers, timeout=30)
-                except Exception as exc:
-                    if log_callback:
-                        log_callback(f"[Debug] 重开 sign-up 失败: {exc}")
-                sleep_with_cancel(1.5 * send_try, cancel_callback)
-
-            last_res = _xai_grpc_call(
-                session,
-                create_code_url,
-                [(1, email)],
-                referer=signup_url,
-                log_callback=log_callback,
-            )
-            _CREATE_EMAIL_CODE_LAST_TS = time.time()
-            if last_res.get("ok"):
-                return session, last_res
-
-            trailers = last_res.get("trailers") or {}
-            msg = str(trailers.get("grpc-message") or "")
-            raw = last_res.get("raw") or b""
-            if "reject" in msg.lower() or "domain" in msg.lower():
-                domain = email.split("@")[-1] if "@" in email else ""
-                if domain:
-                    remember_rejected_email_domain(domain, log_callback=log_callback)
-                raise EmailDomainRejected(domain or email)
-
-            empty = (
-                not raw
-                or last_res.get("grpc_status") is None
-                or int(last_res.get("http_status") or 0) in {0, 429, 502, 503}
-            )
-            if empty and send_try < 3:
-                if log_callback:
-                    log_callback(
-                        f"[*] CreateEmailValidationCode 空/异常响应，将重试 ({send_try}/3)"
-                    )
-                continue
-            raise RuntimeError(
-                f"CreateEmailValidationCode 失败 http={last_res.get('http_status')} "
-                f"grpc={last_res.get('grpc_status')} msg={msg!r} raw={(raw[:200])!r}"
-            )
-    return session, last_res
 
 
 def register_via_pure_http(log_callback=None, cancel_callback=None):
@@ -8476,17 +8382,28 @@ def register_via_pure_http(log_callback=None, cancel_callback=None):
         t1.start()
         t2.start()
 
-        # 4) 发验证码：全局串行，空 body 时重建会话重试
+        # 4) 发验证码（不重试：空 body 多半重试也失败，直接换号更快）
         raise_if_cancelled(cancel_callback)
-        session, send_res = _create_email_validation_code_with_retry(
+        send_res = _xai_grpc_call(
             session,
-            email,
-            create_code_url=create_code_url,
-            signup_url=signup_url,
-            page_headers=page_headers,
+            create_code_url,
+            [(1, email)],
+            referer=signup_url,
             log_callback=log_callback,
-            cancel_callback=cancel_callback,
         )
+        if not send_res.get("ok"):
+            trailers = send_res.get("trailers") or {}
+            msg = str(trailers.get("grpc-message") or "")
+            raw = send_res.get("raw") or b""
+            if "reject" in msg.lower() or "domain" in msg.lower():
+                domain = email.split("@")[-1] if "@" in email else ""
+                if domain:
+                    remember_rejected_email_domain(domain, log_callback=log_callback)
+                raise EmailDomainRejected(domain or email)
+            raise RuntimeError(
+                f"CreateEmailValidationCode 失败 http={send_res.get('http_status')} "
+                f"grpc={send_res.get('grpc_status')} msg={msg!r} raw={(raw[:120])!r}"
+            )
 
         # 5) 收验证码
         if log_callback:

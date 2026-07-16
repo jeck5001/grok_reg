@@ -4877,6 +4877,80 @@ def validate_registration_config(settings):
     return normalized
 
 
+def _jobs_dir():
+    path = os.path.join(get_data_dir(), "jobs")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+
+def _job_log_path(job_id):
+    return os.path.join(_jobs_dir(), f"{job_id}.log")
+
+
+def _job_status_path(job_id):
+    return os.path.join(_jobs_dir(), f"{job_id}.json")
+
+
+def _current_job_meta_path():
+    return os.path.join(_jobs_dir(), "current.json")
+
+
+def save_current_job_meta(meta):
+    path = _current_job_meta_path()
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(meta or {}, handle, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def load_current_job_meta():
+    path = _current_job_meta_path()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def load_job_snapshot(job_id):
+    job_id = str(job_id or "").strip()
+    if not job_id:
+        return None
+    path = _job_status_path(job_id)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def read_job_log_lines(job_id, offset=0):
+    path = _job_log_path(job_id)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = [line.rstrip("\n") for line in handle]
+    except Exception:
+        return []
+    if offset < 0:
+        offset = 0
+    return lines[offset:]
+
+
+def append_job_log_line(job_id, line):
+    path = _job_log_path(job_id)
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(str(line).rstrip("\n") + "\n")
+    except Exception:
+        pass
+
+
 class RegistrationJob:
     def __init__(self, settings=None, log_sink=None):
         self.id = uuid.uuid4().hex
@@ -4898,12 +4972,34 @@ class RegistrationJob:
         self.stats_lock = threading.Lock()
         self._logs = []
         self._log_lock = threading.Lock()
+        self._persist_status()
+
+    def _persist_status(self):
+        st = self.status()
+        try:
+            with open(_job_status_path(self.id), "w", encoding="utf-8") as handle:
+                json.dump(st, handle, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        try:
+            save_current_job_meta(
+                {
+                    "job_id": self.id,
+                    "status": st.get("status"),
+                    "success_count": st.get("success_count"),
+                    "fail_count": st.get("fail_count"),
+                    "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+        except Exception:
+            pass
 
     def log(self, message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{timestamp}] {message}"
         with self._log_lock:
             self._logs.append(line)
+        append_job_log_line(self.id, line)
         if self.log_sink:
             self.log_sink(message)
 
@@ -4911,7 +5007,15 @@ class RegistrationJob:
         with self._log_lock:
             if offset < 0:
                 offset = 0
-            return list(self._logs[offset:])
+            mem = list(self._logs[offset:])
+        # 内存若被裁剪，回落到文件
+        if not mem and offset > 0:
+            return read_job_log_lines(self.id, offset=offset)
+        if offset == 0 and not mem:
+            disk = read_job_log_lines(self.id, offset=0)
+            if disk:
+                return disk
+        return mem
 
     def should_stop(self):
         return self.stop_requested or self.status_value not in {"pending", "running"}
@@ -4923,6 +5027,7 @@ class RegistrationJob:
         self.started_at = datetime.datetime.now().isoformat(timespec="seconds")
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.output_file = f"accounts_{now}_{self.id[:8]}.txt"
+        self._persist_status()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         return self
@@ -4930,6 +5035,7 @@ class RegistrationJob:
     def stop(self):
         self.stop_requested = True
         self.log("[!] 用户停止注册")
+        self._persist_status()
 
     def status(self):
         with self.stats_lock:
@@ -5170,6 +5276,10 @@ class RegistrationJob:
                         f.write(line)
             except Exception as file_exc:
                 logf(f"[Debug] 保存账号文件失败: {file_exc}")
+        try:
+            self._persist_status()
+        except Exception:
+            pass
         account = parse_registered_account_line(
             line,
             source=self.output_file,
@@ -5224,6 +5334,10 @@ class RegistrationJob:
                         self.fail_count += 1
                     self._note_registration_outcome(False, str(exc), logf=logf)
                     logf(f"[-] 注册失败: {exc}")
+                    try:
+                        self._persist_status()
+                    except Exception:
+                        pass
                 finally:
                     should_stop_after_task = self.should_stop()
                     has_more_tasks = (not task_queue.empty()) and (not should_stop_after_task)
@@ -5300,6 +5414,10 @@ class RegistrationJob:
         finally:
             self.finished_at = datetime.datetime.now().isoformat(timespec="seconds")
             self.log("[*] 任务结束")
+            try:
+                self._persist_status()
+            except Exception:
+                pass
 
 
 def get_domains(api_key=None):

@@ -210,16 +210,40 @@ async function saveConfig() {
   setMessage("配置已保存");
 }
 
+const JOB_ID_STORAGE_KEY = "grok-reg.currentJobId";
+
+function rememberJobId(jobId) {
+  currentJobId = jobId || null;
+  try {
+    if (currentJobId) localStorage.setItem(JOB_ID_STORAGE_KEY, currentJobId);
+    else localStorage.removeItem(JOB_ID_STORAGE_KEY);
+  } catch (e) {
+    /* ignore */
+  }
+  if (jobIdText) jobIdText.textContent = currentJobId || "-";
+}
+
+function restoreRememberedJobId() {
+  try {
+    return localStorage.getItem(JOB_ID_STORAGE_KEY) || null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function startJob() {
   const job = await requestJson("/api/jobs/start", {
     method: "POST",
     body: JSON.stringify(formPayload()),
   });
-  currentJobId = job.job_id;
+  rememberJobId(job.job_id);
   logOffset = 0;
   logBox.textContent = "";
-  jobIdText.textContent = currentJobId;
-  setMessage("任务已启动");
+  if (job.already_running) {
+    setMessage("已有任务在运行，已恢复跟踪");
+  } else {
+    setMessage("任务已启动");
+  }
   startPolling();
 }
 
@@ -231,15 +255,25 @@ async function stopJob() {
 
 async function pollJob() {
   if (!currentJobId) return;
-  const status = await requestJson(`/api/jobs/${currentJobId}`);
+  let status;
+  try {
+    status = await requestJson(`/api/jobs/${currentJobId}`);
+  } catch (error) {
+    // 任务可能已结束且内存丢失：尝试 current 接口
+    if (String(error.message || "").includes("404") || String(error.message || "").includes("不存在")) {
+      await restoreCurrentJob({ silent: true });
+      return;
+    }
+    throw error;
+  }
   statusText.textContent = status.status;
-  statsText.textContent = `成功 ${status.success_count} / 失败 ${status.fail_count}`;
+  statsText.textContent = `成功 ${status.success_count || 0} / 失败 ${status.fail_count || 0}`;
   const running = ["pending", "running"].includes(status.status);
   startBtn.disabled = running;
   stopBtn.disabled = !running;
 
   const logs = await requestJson(`/api/jobs/${currentJobId}/logs?offset=${logOffset}`);
-  if (logs.lines.length) {
+  if (logs.lines && logs.lines.length) {
     logBox.textContent += `${logs.lines.join("\n")}\n`;
     logBox.scrollTop = logBox.scrollHeight;
     logOffset = logs.next_offset;
@@ -251,6 +285,62 @@ async function pollJob() {
     loadAccounts().catch((error) => setMessage(error.message));
   }
   renderDashboard();
+}
+
+async function restoreCurrentJob({ silent = false } = {}) {
+  // 1) localStorage 记住的 job
+  let jobId = restoreRememberedJobId();
+  // 2) 服务端当前/最近任务
+  try {
+    const current = await requestJson("/api/jobs/current");
+    if (current && current.has_job && current.job_id) {
+      jobId = current.job_id;
+      rememberJobId(jobId);
+      statusText.textContent = current.status || "-";
+      statsText.textContent = `成功 ${current.success_count || 0} / 失败 ${current.fail_count || 0}`;
+      const running = Boolean(current.running) || ["pending", "running"].includes(current.status);
+      startBtn.disabled = running;
+      stopBtn.disabled = !running;
+      // 拉全量日志
+      logOffset = 0;
+      logBox.textContent = "";
+      const logs = await requestJson(`/api/jobs/${jobId}/logs?offset=0`);
+      if (logs.lines && logs.lines.length) {
+        logBox.textContent = `${logs.lines.join("\n")}\n`;
+        logBox.scrollTop = logBox.scrollHeight;
+        logOffset = logs.next_offset;
+      }
+      if (running) {
+        if (!silent) setMessage("已恢复运行中的注册任务");
+        startPolling();
+      } else if (!silent) {
+        setMessage("已恢复最近一次任务记录（已结束）");
+      }
+      renderDashboard();
+      return true;
+    }
+  } catch (error) {
+    if (!silent) setMessage(`恢复任务失败: ${error.message}`);
+  }
+  // 没有任务
+  if (!jobId) {
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    return false;
+  }
+  // 仅有本地 jobId：尝试拉取
+  try {
+    rememberJobId(jobId);
+    logOffset = 0;
+    logBox.textContent = "";
+    await pollJob();
+    const running = ["pending", "running"].includes(statusText.textContent);
+    if (running) startPolling();
+    return true;
+  } catch (error) {
+    rememberJobId(null);
+    return false;
+  }
 }
 
 function loadAccountTablePrefs() {
@@ -959,3 +1049,5 @@ tabButtons.forEach((button) => {
 
 loadConfig().catch((error) => setMessage(error.message));
 loadAccounts().catch((error) => setMessage(error.message));
+// 刷新页面后自动恢复运行中/最近任务与日志
+restoreCurrentJob().catch((error) => setMessage(error.message));

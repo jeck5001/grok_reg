@@ -316,6 +316,55 @@ def check_accounts_health(payload: dict):
     }
 
 
+def _resolve_job(job_id: str):
+    """内存中的 job，或从落盘恢复的只读快照。"""
+    job = _jobs.get(job_id)
+    if job is not None:
+        return job, False
+    snapshot = reg.load_job_snapshot(job_id)
+    if snapshot is None:
+        return None, False
+    return snapshot, True
+
+
+@app.get("/api/jobs/current")
+def get_current_job():
+    """页面刷新后恢复：优先返回运行中任务，否则最近一次任务。"""
+    with _job_lock:
+        job_id = _active_job_id
+        job = _jobs.get(job_id) if job_id else None
+        if job is not None:
+            st = job.status()
+            return {
+                "job_id": job.id,
+                "has_job": True,
+                "running": st.get("status") in {"pending", "running"},
+                **st,
+            }
+        # 内存没有：读落盘 current
+        meta = reg.load_current_job_meta()
+        if not meta:
+            return {"has_job": False, "job_id": None, "status": "idle"}
+        job_id = str(meta.get("job_id") or "").strip()
+        snapshot = reg.load_job_snapshot(job_id) if job_id else None
+        if not snapshot:
+            return {"has_job": False, "job_id": job_id or None, "status": "idle"}
+        st = snapshot if isinstance(snapshot, dict) else {}
+        return {
+            "job_id": job_id,
+            "has_job": True,
+            "running": False,
+            "from_disk": True,
+            **{k: st.get(k) for k in (
+                "status", "success_count", "fail_count", "register_count",
+                "register_threads", "output_file", "created_at", "started_at", "finished_at",
+            ) if k in st or True},
+            "status": st.get("status") or meta.get("status") or "finished",
+            "success_count": int(st.get("success_count") or meta.get("success_count") or 0),
+            "fail_count": int(st.get("fail_count") or meta.get("fail_count") or 0),
+        }
+
+
 @app.post("/api/jobs/start")
 def start_job(payload: dict):
     global _active_job_id
@@ -327,6 +376,14 @@ def start_job(payload: dict):
 
     with _job_lock:
         if active_job_running():
+            # 返回正在运行的任务，方便前端自动恢复而不是 409 打断
+            job = _jobs.get(_active_job_id)
+            if job is not None:
+                return {
+                    "job_id": job.id,
+                    "already_running": True,
+                    **job.status(),
+                }
             raise HTTPException(status_code=409, detail="已有任务正在运行")
         reg.config = validated
         reg.save_config()
@@ -341,23 +398,34 @@ def start_job(payload: dict):
 def stop_job(job_id: str):
     job = _jobs.get(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="任务不存在")
+        # 落盘快照无法 stop
+        raise HTTPException(status_code=404, detail="任务不存在或已结束")
     job.stop()
     return job.status()
 
 
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
-    job = _jobs.get(job_id)
-    if not job:
+    job, from_disk = _resolve_job(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="任务不存在")
+    if from_disk:
+        st = dict(job) if isinstance(job, dict) else {}
+        st.setdefault("id", job_id)
+        st["from_disk"] = True
+        return st
     return job.status()
 
 
 @app.get("/api/jobs/{job_id}/logs")
 def get_job_logs(job_id: str, offset: int = Query(0, ge=0)):
-    job = _jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    job, from_disk = _resolve_job(job_id)
+    if job is None:
+        # 仅日志文件
+        lines = reg.read_job_log_lines(job_id, offset=offset)
+        return {"offset": offset, "next_offset": offset + len(lines), "lines": lines, "from_disk": True}
+    if from_disk:
+        lines = reg.read_job_log_lines(job_id, offset=offset)
+        return {"offset": offset, "next_offset": offset + len(lines), "lines": lines, "from_disk": True}
     lines = job.logs(offset=offset)
     return {"offset": offset, "next_offset": offset + len(lines), "lines": lines}

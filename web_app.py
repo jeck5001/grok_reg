@@ -1,7 +1,7 @@
 from pathlib import Path
 from threading import Lock
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -18,6 +18,7 @@ SENSITIVE_KEYS = {
     "cpa_management_key",
     "yyds_api_key",
     "yyds_jwt",
+    "email_webhook_secret",
 }
 
 app = FastAPI(title="Grok Register Web", version="1.0.0")
@@ -112,6 +113,62 @@ def mail_domain_pool_clear_domain(payload: dict):
         import mail_domain_pool as mdp
 
         return {"ok": True, "result": mdp.clear_domain_counters(domain)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/webhook/email")
+async def webhook_email(request: Request):
+    """兼容 openai-cpa-email Worker 推送。
+
+    Header: X-Webhook-Secret
+    Body: {message_id, to_addr, raw_content}
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    headers = request.headers
+
+    settings = reg.load_config()
+    secret_cfg = str(settings.get("email_webhook_secret") or "").strip()
+    if not secret_cfg:
+        raise HTTPException(status_code=503, detail="email_webhook_secret 未配置")
+
+    header_secret = str(
+        headers.get("x-webhook-secret")
+        or headers.get("X-Webhook-Secret")
+        or ""
+    ).strip()
+    body_secret = str((payload or {}).get("secret") or "").strip()
+    if header_secret != secret_cfg and body_secret != secret_cfg:
+        raise HTTPException(status_code=401, detail="invalid webhook secret")
+
+    to_addr = str((payload or {}).get("to_addr") or (payload or {}).get("to") or "").strip()
+    raw_content = str((payload or {}).get("raw_content") or (payload or {}).get("raw") or "")
+    message_id = str((payload or {}).get("message_id") or (payload or {}).get("id") or "").strip()
+    if not to_addr or not raw_content:
+        raise HTTPException(status_code=400, detail="to_addr and raw_content required")
+
+    try:
+        import webhook_mail_store as wms
+
+        result = wms.store_webhook_mail(
+            to_addr=to_addr,
+            raw_content=raw_content,
+            message_id=message_id,
+        )
+        return {"ok": True, **result, "stats": wms.stats()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/webhook/email/stats")
+def webhook_email_stats():
+    try:
+        import webhook_mail_store as wms
+
+        return {"ok": True, "stats": wms.stats()}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

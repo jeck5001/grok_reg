@@ -66,6 +66,8 @@
   "mail_domain_groups": [],
   "disabled_mail_domains": "",
   "mail_domain_failure_types": ["discarded_email", "cloudflare_temp_email_network", "capacity_exceeded"],
+  "email_webhook_enabled": false,
+  "email_webhook_secret": "",
   "email_provider": "cloudflare",
   "yyds_api_key": "",
   "yyds_jwt": ""

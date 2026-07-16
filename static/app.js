@@ -130,6 +130,9 @@ function formPayload() {
   if (form.elements.enable_mail_domain_grouping) {
     data.enable_mail_domain_grouping = form.elements.enable_mail_domain_grouping.checked;
   }
+  if (form.elements.email_webhook_enabled) {
+    data.email_webhook_enabled = form.elements.email_webhook_enabled.checked;
+  }
   // 手动分组：textarea 每行一组
   if (form.elements.mail_domain_groups_text) {
     const lines = String(form.elements.mail_domain_groups_text.value || "")

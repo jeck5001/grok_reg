@@ -155,6 +155,9 @@ DEFAULT_CONFIG = {
     "mail_domain_groups": [],  # 手动分组时每组逗号域名
     "disabled_mail_domains": "",  # 手动禁用主域
     "mail_domain_failure_types": ["discarded_email", "cloudflare_temp_email_network", "capacity_exceeded"],
+    # openai-cpa-email Worker webhook 收件（本地内存池）
+    "email_webhook_enabled": False,
+    "email_webhook_secret": "",
     "show_tutorial_on_start": True,
     "cloudmail_url": "",
     "cloudmail_admin_email": "",
@@ -4537,12 +4540,14 @@ def validate_registration_config(settings):
         "mail_domain_pinpoint_burst",
         "mail_domain_prefer_low_failure",
         "enable_mail_domain_grouping",
+        "email_webhook_enabled",
     ):
         raw_bool = normalized.get(bool_key)
         if isinstance(raw_bool, str):
             normalized[bool_key] = raw_bool.strip().lower() in {"1", "true", "yes", "on"}
         else:
             normalized[bool_key] = bool(raw_bool)
+    normalized["email_webhook_secret"] = str(normalized.get("email_webhook_secret") or "").strip()
     signup_mode = str(normalized.get("signup_mode") or "auto").strip().lower()
     if signup_mode not in {"auto", "http", "api", "browser"}:
         signup_mode = "auto"
@@ -4686,6 +4691,22 @@ def validate_registration_config(settings):
             raise ValueError("CloudMail 模式需要先填写 CloudMail 管理员邮箱")
         if not str(normalized.get("cloudmail_password") or "").strip():
             raise ValueError("CloudMail 模式需要先填写 CloudMail 管理员密码")
+    if provider in {"openai_cpa_email", "cpa_email"}:
+        mail_domains = str(
+            normalized.get("mail_domains") or normalized.get("defaultDomains") or ""
+        ).strip()
+        if not mail_domains:
+            raise ValueError("openai_cpa_email 模式需要填写 mail_domains / defaultDomains")
+        # webhook 模式默认开启收件池
+        normalized["email_webhook_enabled"] = True
+        if not str(normalized.get("email_webhook_secret") or "").strip():
+            raise ValueError(
+                "openai_cpa_email 模式需要填写 email_webhook_secret（与 CF Worker EMAIL_WEBHOOK_SECRET 一致）"
+            )
+    if bool(normalized.get("email_webhook_enabled")) and not str(
+        normalized.get("email_webhook_secret") or ""
+    ).strip():
+        raise ValueError("启用 webhook 收件时需要填写 email_webhook_secret")
     if normalized["cpa_auto_push_remote"]:
         if not str(normalized.get("cpa_management_base") or "").strip():
             raise ValueError("CPA 自动推送需要先填写 CPA 管理地址")
@@ -5891,12 +5912,14 @@ def _get_email_and_token_once(api_key=None):
     provider = get_email_provider()
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
-    if provider == "cloudmail":
-        # CloudMail catch-all：用域名池生成地址（支持多级子域）
+    if provider in {"cloudmail", "openai_cpa_email", "cpa_email"}:
+        # catch-all / webhook 模式：本地生成地址，收信靠 webhook 或 CloudMail 公开查询
         try:
             address, main = compose_mail_address()
         except Exception as exc:
-            raise Exception(f"CloudMail 需要配置 mail_domains/defaultDomains: {exc}") from exc
+            raise Exception(f"需要配置 mail_domains/defaultDomains: {exc}") from exc
+        if provider in {"openai_cpa_email", "cpa_email"} or bool(config.get("email_webhook_enabled")):
+            return address, "webhook_mail"
         return address, "cloudmail_catch_all"
     if provider == "cloudflare":
         api_base = get_cloudflare_api_base()
@@ -5993,6 +6016,44 @@ def get_email_and_token(api_key=None, retries=3, log_callback=None):
     ) from last_exc
 
 
+def webhook_get_oai_code(
+    email,
+    timeout=180,
+    poll_interval=2,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+):
+    """从 openai-cpa-email webhook 内存池取验证码。"""
+    import webhook_mail_store as wms
+
+    deadline = time.time() + max(30, float(timeout or 180))
+    next_resend_at = time.time() + 60
+    if log_callback:
+        log_callback(f"[*] webhook 收件池等待验证码: {email}")
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        if resend_callback and time.time() >= next_resend_at:
+            try:
+                resend_callback()
+                if log_callback:
+                    log_callback("[*] 已触发重新发送验证码")
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] 触发重发验证码失败: {exc}")
+            next_resend_at = time.time() + 60
+        code = wms.pop_code_for_email(
+            email,
+            extract_fn=lambda raw: extract_verification_code(raw, "") or wms.extract_xai_code_from_raw(raw),
+        )
+        if code:
+            if log_callback:
+                log_callback(f"[*] webhook 收件池提取到验证码: {code}")
+            return code
+        sleep_with_cancel(max(1.0, float(poll_interval or 2)), cancel_callback)
+    raise Exception(f"webhook 收件池在 {int(timeout)}s 内未收到验证码邮件")
+
+
 def get_oai_code(
     dev_token,
     email,
@@ -6003,6 +6064,20 @@ def get_oai_code(
     resend_callback=None,
 ):
     provider = get_email_provider()
+    # 优先 webhook 内存池（openai-cpa-email Worker）
+    if (
+        bool(config.get("email_webhook_enabled"))
+        or str(dev_token or "") == "webhook_mail"
+        or provider in {"openai_cpa_email", "cpa_email"}
+    ):
+        return webhook_get_oai_code(
+            email,
+            timeout=timeout,
+            poll_interval=min(2, float(poll_interval or 2)),
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+        )
     if provider == "yyds":
         return yyds_get_oai_code(
             dev_token,
@@ -6042,7 +6117,6 @@ def get_oai_code(
         log_callback=log_callback,
         cancel_callback=cancel_callback,
     )
-
 
 def extract_verification_code(text, subject=""):
     if subject:

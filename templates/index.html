@@ -112,6 +112,7 @@
                     <option value="yyds">yyds</option>
                     <option value="cloudflare">cloudflare</option>
                     <option value="cloudmail">cloudmail</option>
+                    <option value="openai_cpa_email">openai_cpa_email（CF Worker webhook）</option>
                   </select>
                 </label>
                 <label>
@@ -360,6 +361,29 @@
               <p class="hint">
                 多级子域：<code>user@rand.main.com</code>（需 CF catch-all）。黄金矿工=定点爆破同一主域；
                 分组可把域名拆成多组轮转/耗尽切换。失败冷却按主域统计，减轻坏域与日配额踩踏。
+              </p>
+            </section>
+
+            <section class="config-section" data-config-section="Webhook收件">
+              <div class="section-copy">
+                <p class="section-kicker">openai-cpa-email</p>
+                <h2>CF Worker → 本地 webhook 收件</h2>
+              </div>
+              <div class="config-grid">
+                <label class="check">
+                  <input name="email_webhook_enabled" type="checkbox" />
+                  启用 webhook 收件池（配合 openai-cpa-email Worker）
+                </label>
+                <label class="wide">
+                  Webhook Secret（= Worker 的 EMAIL_WEBHOOK_SECRET）
+                  <input name="email_webhook_secret" type="password" autocomplete="off" placeholder="与 CF Worker 变量一致" />
+                </label>
+              </div>
+              <p class="hint">
+                Worker 推送地址填公网可访问的：
+                <code>http://你的域名或IP:8787/api/webhook/email</code>
+                （Worker 会自动补全路径；也可只填 <code>http://host:8787</code>）。
+                邮箱服务商选 <strong>openai_cpa_email</strong>，并配置 <code>mail_domains</code> + 多级子域。
               </p>
             </section>
 

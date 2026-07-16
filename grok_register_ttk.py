@@ -5212,7 +5212,7 @@ def validate_registration_config(settings):
     provider = str(normalized.get("email_provider") or "duckmail").strip() or "duckmail"
     normalized["email_provider"] = provider
     normalized["register_count"] = _parse_positive_int(
-        normalized.get("register_count"), 1, minimum=1, maximum=100
+        normalized.get("register_count"), 1, minimum=1, maximum=1000
     )
     normalized["register_threads"] = _parse_positive_int(
         normalized.get("register_threads"), 1, minimum=1, maximum=10

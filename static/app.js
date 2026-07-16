@@ -24,6 +24,8 @@ const dashboardPushMix = document.querySelector("#dashboardPushMix");
 const dashboardSources = document.querySelector("#dashboardSources");
 const selectPageAccounts = document.querySelector("#selectPageAccounts");
 const accountPageSize = document.querySelector("#accountPageSize");
+const accountSearchInput = document.querySelector("#accountSearchInput");
+const accountPushFilter = document.querySelector("#accountPushFilter");
 const accountColumnOptions = document.querySelector("#accountColumnOptions");
 const accountPagination = document.querySelector("#accountPagination");
 const accountsHead = document.querySelector("#accountsHead");
@@ -59,6 +61,8 @@ let logOffset = 0;
 let pollTimer = null;
 let accounts = [];
 let accountPage = 1;
+let accountSearchQuery = "";
+let accountPushFilterValue = "all";
 let accountTablePrefs = loadAccountTablePrefs();
 let selectedAccountIdsSet = new Set();
 let accountHealthStatus = {};
@@ -439,13 +443,91 @@ function visibleAccountColumns() {
   return ACCOUNT_COLUMNS.filter((column) => column.locked || visible.has(column.key));
 }
 
+function accountIsPushed(account, channel) {
+  const status = String(account[`${channel}_status`] || "").toLowerCase();
+  const text = String(account[`${channel}_status_text`] || "");
+  if (channel === "sub2api") {
+    const live = accountPushStatus[account.id];
+    if (live) return live === "已推送" || String(live).includes("已推送");
+  }
+  if (channel === "grok2api") {
+    const live = accountGrok2apiPushStatus[account.id];
+    if (live) return live === "已推送" || String(live).includes("已推送");
+  }
+  if (channel === "cpa") {
+    const live = accountCpaPushStatus[account.id];
+    if (live) return live === "已推送" || String(live).includes("已推送");
+  }
+  return status === "pushed" || text === "已推送";
+}
+
+function accountHasPushFailure(account) {
+  for (const channel of ["grok2api", "sub2api", "cpa"]) {
+    const status = String(account[`${channel}_status`] || "").toLowerCase();
+    const text = String(
+      (channel === "sub2api" && accountPushStatus[account.id]) ||
+        (channel === "grok2api" && accountGrok2apiPushStatus[account.id]) ||
+        (channel === "cpa" && accountCpaPushStatus[account.id]) ||
+        account[`${channel}_status_text`] ||
+        ""
+    );
+    if (status === "failed" || text.startsWith("失败") || text.includes("失败")) return true;
+  }
+  return false;
+}
+
+function filteredAccounts() {
+  const q = String(accountSearchQuery || "").trim().toLowerCase();
+  const filter = accountPushFilterValue || "all";
+  return accounts.filter((account) => {
+    if (q) {
+      const hay = [
+        account.email,
+        account.source_file,
+        account.sso_preview,
+        account.grok2api_status_text,
+        account.sub2api_status_text,
+        account.cpa_status_text,
+        account.health_status_text,
+        accountGrok2apiPushStatus[account.id],
+        accountPushStatus[account.id],
+        accountCpaPushStatus[account.id],
+      ]
+        .map((x) => String(x || "").toLowerCase())
+        .join(" ");
+      if (!hay.includes(q)) return false;
+    }
+    if (filter === "all") return true;
+    if (filter === "any_pushed") {
+      return (
+        accountIsPushed(account, "grok2api") ||
+        accountIsPushed(account, "sub2api") ||
+        accountIsPushed(account, "cpa")
+      );
+    }
+    if (filter === "none_pushed") {
+      return (
+        !accountIsPushed(account, "grok2api") &&
+        !accountIsPushed(account, "sub2api") &&
+        !accountIsPushed(account, "cpa")
+      );
+    }
+    if (filter === "grok2api_pushed") return accountIsPushed(account, "grok2api");
+    if (filter === "sub2api_pushed") return accountIsPushed(account, "sub2api");
+    if (filter === "cpa_pushed") return accountIsPushed(account, "cpa");
+    if (filter === "failed") return accountHasPushFailure(account);
+    return true;
+  });
+}
+
 function accountTotalPages() {
-  return Math.max(1, Math.ceil(accounts.length / accountTablePrefs.pageSize));
+  return Math.max(1, Math.ceil(filteredAccounts().length / accountTablePrefs.pageSize));
 }
 
 function currentPageAccounts() {
+  const list = filteredAccounts();
   const start = (accountPage - 1) * accountTablePrefs.pageSize;
-  return accounts.slice(start, start + accountTablePrefs.pageSize);
+  return list.slice(start, start + accountTablePrefs.pageSize);
 }
 
 function clampAccountPage() {
@@ -453,7 +535,10 @@ function clampAccountPage() {
 }
 
 function selectedAccountIds() {
-  return Array.from(selectedAccountIdsSet).filter((id) => accounts.some((account) => account.id === id));
+  const visible = new Set(filteredAccounts().map((a) => a.id));
+  return Array.from(selectedAccountIdsSet).filter(
+    (id) => accounts.some((account) => account.id === id) && (visible.has(id) || true)
+  );
 }
 
 function renderAccountColumns() {
@@ -706,11 +791,12 @@ function renderPagination() {
   if (!accountPagination) return;
   accountPagination.innerHTML = "";
   const totalPages = accountTotalPages();
-  const start = accounts.length ? (accountPage - 1) * accountTablePrefs.pageSize + 1 : 0;
-  const end = Math.min(accounts.length, accountPage * accountTablePrefs.pageSize);
+  const filtered = filteredAccounts();
+  const start = filtered.length ? (accountPage - 1) * accountTablePrefs.pageSize + 1 : 0;
+  const end = Math.min(filtered.length, accountPage * accountTablePrefs.pageSize);
   const summary = document.createElement("span");
   summary.className = "pagination-summary";
-  summary.textContent = `${start}-${end} / ${accounts.length}`;
+  summary.textContent = `${start}-${end} / ${filtered.length}`;
   accountPagination.appendChild(summary);
 
   const prevButton = document.createElement("button");
@@ -748,11 +834,23 @@ function renderAccounts() {
   renderAccountsHead();
   renderAccountColumns();
   accountsBody.innerHTML = "";
-  accountsSummary.textContent = `共 ${accounts.length} 个账号，已选择 ${selectedAccountIdsSet.size} 个`;
+  const filtered = filteredAccounts();
+  const filterHint =
+    filtered.length !== accounts.length
+      ? `，筛选后 ${filtered.length} 个`
+      : "";
+  accountsSummary.textContent = `共 ${accounts.length} 个账号${filterHint}，已选择 ${selectedAccountIdsSet.size} 个`;
   if (accountPageSize) accountPageSize.value = String(accountTablePrefs.pageSize);
-  if (!accounts.length) {
+  if (accountSearchInput && accountSearchInput.value !== accountSearchQuery) {
+    accountSearchInput.value = accountSearchQuery;
+  }
+  if (accountPushFilter) accountPushFilter.value = accountPushFilterValue;
+  if (!filtered.length) {
     const row = document.createElement("tr");
-    row.innerHTML = `<td colspan="${visibleAccountColumns().length}" class="empty">暂无账号，注册成功后会出现在这里</td>`;
+    const emptyText = accounts.length
+      ? "没有匹配的账号，试试清空搜索/筛选"
+      : "暂无账号，注册成功后会出现在这里";
+    row.innerHTML = `<td colspan="${visibleAccountColumns().length}" class="empty">${emptyText}</td>`;
     accountsBody.appendChild(row);
     syncSelectPageAccounts();
     renderPagination();
@@ -770,11 +868,13 @@ function renderAccounts() {
         checkbox.type = "checkbox";
         checkbox.value = account.id;
         checkbox.checked = selectedAccountIdsSet.has(account.id);
-        checkbox.title = account.has_refresh_token ? "" : "可推送到 grok2api；缺少 Refresh Token 时不能推送到 sub2api 或 CPA";
+        checkbox.title = account.has_refresh_token
+          ? ""
+          : "可推送到 grok2api；缺少 Refresh Token 时不能推送到 sub2api 或 CPA";
         checkbox.addEventListener("change", () => {
           if (checkbox.checked) selectedAccountIdsSet.add(account.id);
           else selectedAccountIdsSet.delete(account.id);
-          accountsSummary.textContent = `共 ${accounts.length} 个账号，已选择 ${selectedAccountIdsSet.size} 个`;
+          accountsSummary.textContent = `共 ${accounts.length} 个账号${filterHint}，已选择 ${selectedAccountIdsSet.size} 个`;
           syncSelectPageAccounts();
         });
         cell.appendChild(checkbox);
@@ -787,18 +887,15 @@ function renderAccounts() {
         const formatted = formatAccountStatusDisplay(rawText);
         cell.textContent = formatted.display;
         if (formatted.title) cell.title = formatted.title;
-        if (formatted.tone === "ok") cell.classList.add("push-ok");
-        if (formatted.tone === "running") cell.classList.add("push-running");
-        if (formatted.tone === "failed") cell.classList.add("push-failed");
+        if (rawText.startsWith("失败") || rawText.includes("失败")) {
+          cell.classList.add("status-failed");
+        } else if (rawText === "已推送" || rawText === "可用") {
+          cell.classList.add("status-ok");
+        }
       } else {
         cell.textContent = rawText;
-        if (rawText === "已推送" || rawText === "可用") cell.classList.add("push-ok");
-        if (rawText === "推送中" || rawText === "检查中") cell.classList.add("push-running");
-        if (rawText.startsWith("失败") || rawText === "失效" || rawText === "资料不完整") {
-          cell.classList.add("push-failed");
-        }
       }
-      if (column.className) cell.classList.add(column.className);
+      if (column.className) cell.className = `${cell.className} ${column.className}`.trim();
       row.appendChild(cell);
     }
     accountsBody.appendChild(row);
@@ -1070,6 +1167,25 @@ accountPageSize.addEventListener("change", () => {
   saveAccountTablePrefs();
   renderAccounts();
 });
+
+if (accountSearchInput) {
+  let searchTimer = null;
+  accountSearchInput.addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      accountSearchQuery = accountSearchInput.value || "";
+      accountPage = 1;
+      renderAccounts();
+    }, 180);
+  });
+}
+if (accountPushFilter) {
+  accountPushFilter.addEventListener("change", () => {
+    accountPushFilterValue = accountPushFilter.value || "all";
+    accountPage = 1;
+    renderAccounts();
+  });
+}
 
 accountColumnOptions.addEventListener("change", (event) => {
   const checkbox = event.target.closest("[data-column-toggle]");

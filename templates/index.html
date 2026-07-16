@@ -541,6 +541,22 @@
                 <input id="selectPageAccounts" type="checkbox" />
                 当页全选
               </label>
+              <label class="toolbar-field wide">
+                搜索
+                <input id="accountSearchInput" type="search" placeholder="邮箱 / 来源文件 / 推送状态" autocomplete="off" />
+              </label>
+              <label class="toolbar-field">
+                推送筛选
+                <select id="accountPushFilter">
+                  <option value="all">全部</option>
+                  <option value="any_pushed">任一已推送</option>
+                  <option value="none_pushed">全部未推送</option>
+                  <option value="grok2api_pushed">grok2api 已推送</option>
+                  <option value="sub2api_pushed">sub2api 已推送</option>
+                  <option value="cpa_pushed">CPA 已推送</option>
+                  <option value="failed">推送失败</option>
+                </select>
+              </label>
               <label class="toolbar-field">
                 每页
                 <select id="accountPageSize">

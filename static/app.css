@@ -644,6 +644,29 @@ label.compact input {
   padding: 8px 10px;
 }
 
+.toolbar-field.wide {
+  flex: 1 1 220px;
+  min-width: 200px;
+}
+
+.toolbar-field input[type="search"] {
+  width: 100%;
+  min-width: 160px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.2);
+  color: var(--text);
+}
+
+td.status-ok {
+  color: #7dffa5;
+}
+
+td.status-failed {
+  color: #ff8f8f;
+}
+
 .column-menu {
   position: relative;
 }

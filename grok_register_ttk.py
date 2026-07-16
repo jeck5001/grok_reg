@@ -192,6 +192,8 @@ _yyds_domain_index = 0
 _rejected_email_domains = set()
 _rejected_email_domains_lock = threading.Lock()
 _registered_accounts_lock = threading.Lock()
+_account_status_lock = threading.Lock()
+
 # CloudMail 公开 token 单例（多线程共享，避免并发覆盖）
 _cloudmail_public_token = None
 _cloudmail_public_token_lock = threading.Lock()
@@ -645,6 +647,17 @@ def save_account_statuses(statuses):
     os.replace(tmp_path, path)
 
 
+def update_account_status_records(mutator):
+    """线程安全更新账号状态文件。mutator(statuses_dict) -> None"""
+    with _account_status_lock:
+        statuses = load_account_statuses()
+        if not isinstance(statuses, dict):
+            statuses = {}
+        mutator(statuses)
+        save_account_statuses(statuses)
+        return statuses
+
+
 def account_status_text(status):
     value = str(status or "").strip().lower()
     if value == "pushed":
@@ -724,7 +737,18 @@ def attach_account_status(account, statuses=None):
     if not isinstance(account, dict):
         return account
     statuses = load_account_statuses() if statuses is None else statuses
-    record = statuses.get(str(account.get("id") or ""), {})
+    account_id = str(account.get("id") or "").strip()
+    record = statuses.get(account_id, {}) if account_id else {}
+    # 兼容：id 对不上时按 email 回退匹配（自动注册时 line_no 偶发漂移）
+    if not isinstance(record, dict) or not record:
+        email_key = str(account.get("email") or "").strip().lower()
+        if email_key:
+            for rec in statuses.values():
+                if not isinstance(rec, dict):
+                    continue
+                if str(rec.get("email") or "").strip().lower() == email_key:
+                    record = rec
+                    break
     if not isinstance(record, dict):
         record = {}
     status = str(record.get("sub2api_status") or record.get("status") or "not_pushed").strip() or "not_pushed"
@@ -820,142 +844,174 @@ def replace_registered_account_refresh_token(account, refresh_token):
 
 
 def persist_sub2api_push_status(accounts, result):
-    statuses = load_account_statuses()
     items = result.get("items") if isinstance(result, dict) else []
     if not isinstance(items, list):
         items = []
     now = datetime.datetime.now().isoformat(timespec="seconds")
-    for index, account in enumerate(accounts or []):
-        account_id = str(account.get("id") or "").strip()
-        if not account_id:
-            continue
-        record = statuses.get(account_id)
-        if not isinstance(record, dict):
-            record = {}
-        item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
-        item_status = str(item.get("status") or "pushed").strip().lower()
-        if item_status == "failed":
-            record.update(
-                {
-                    "sub2api_status": "failed",
-                    "sub2api_status_text": f"失败：{str(item.get('error') or '')[:220]}",
-                    "sub2api_failed_at": now,
-                    "sub2api_error": str(item.get("error") or ""),
-                    "sub2api_step": str(item.get("step") or ""),
-                    "email": account.get("email", ""),
-                    "source_file": account.get("source_file", ""),
-                    "line_no": account.get("line_no", ""),
-                }
-            )
-        else:
-            record.update(
-                {
-                    "sub2api_status": "pushed",
-                    "sub2api_status_text": "已推送",
-                    "sub2api_pushed_at": now,
-                    "sub2api_response": item.get("response", item),
-                    "email": account.get("email", ""),
-                    "source_file": account.get("source_file", ""),
-                    "line_no": account.get("line_no", ""),
-                }
-            )
-        statuses[account_id] = record
-    save_account_statuses(statuses)
-    return statuses
+
+    def _mutate(statuses):
+        for index, account in enumerate(accounts or []):
+            account_id = str(account.get("id") or "").strip()
+            email = str(account.get("email") or "").strip()
+            if not account_id and not email:
+                continue
+            key = account_id or f"email:{email.lower()}"
+            record = statuses.get(key)
+            if not isinstance(record, dict):
+                record = {}
+            item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
+            if not item and email:
+                for it in items:
+                    if isinstance(it, dict) and str(it.get("email") or "").strip().lower() == email.lower():
+                        item = it
+                        break
+            item_status = str(item.get("status") or "pushed").strip().lower()
+            if item_status == "failed":
+                record.update(
+                    {
+                        "sub2api_status": "failed",
+                        "sub2api_status_text": f"失败：{str(item.get('error') or '')[:220]}",
+                        "sub2api_failed_at": now,
+                        "sub2api_error": str(item.get("error") or ""),
+                        "sub2api_step": str(item.get("step") or ""),
+                        "email": email,
+                        "source_file": account.get("source_file", ""),
+                        "line_no": account.get("line_no", ""),
+                    }
+                )
+            else:
+                record.update(
+                    {
+                        "sub2api_status": "pushed",
+                        "sub2api_status_text": "已推送",
+                        "sub2api_pushed_at": now,
+                        "sub2api_response": item.get("response", item),
+                        "email": email,
+                        "source_file": account.get("source_file", ""),
+                        "line_no": account.get("line_no", ""),
+                    }
+                )
+                record.pop("sub2api_error", None)
+            statuses[key] = record
+            if account_id:
+                statuses[account_id] = record
+
+    return update_account_status_records(_mutate)
 
 
 def persist_grok2api_push_status(accounts, result):
-    statuses = load_account_statuses()
     items = result.get("items") if isinstance(result, dict) else []
     if not isinstance(items, list):
         items = []
     now = datetime.datetime.now().isoformat(timespec="seconds")
-    for index, account in enumerate(accounts or []):
-        account_id = str(account.get("id") or "").strip()
-        if not account_id:
-            continue
-        record = statuses.get(account_id)
-        if not isinstance(record, dict):
-            record = {}
-        item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
-        item_status = str(item.get("status") or "pushed").strip().lower()
-        if item_status == "failed":
-            record.update(
-                {
-                    "grok2api_status": "failed",
-                    "grok2api_status_text": f"失败：{str(item.get('error') or '')[:220]}",
-                    "grok2api_failed_at": now,
-                    "grok2api_error": str(item.get("error") or ""),
-                    "email": account.get("email", ""),
-                    "source_file": account.get("source_file", ""),
-                    "line_no": account.get("line_no", ""),
-                }
-            )
-        else:
-            record.update(
-                {
-                    "grok2api_status": "pushed",
-                    "grok2api_status_text": "已推送",
-                    "grok2api_pushed_at": now,
-                    "grok2api_response": item.get("response", item),
-                    "email": account.get("email", ""),
-                    "source_file": account.get("source_file", ""),
-                    "line_no": account.get("line_no", ""),
-                }
-            )
-        statuses[account_id] = record
-    save_account_statuses(statuses)
-    return statuses
+
+    def _mutate(statuses):
+        for index, account in enumerate(accounts or []):
+            account_id = str(account.get("id") or "").strip()
+            email = str(account.get("email") or "").strip()
+            if not account_id and not email:
+                continue
+            key = account_id or f"email:{email.lower()}"
+            record = statuses.get(key)
+            if not isinstance(record, dict):
+                record = {}
+            item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
+            if not item and email:
+                for it in items:
+                    if isinstance(it, dict) and str(it.get("email") or "").strip().lower() == email.lower():
+                        item = it
+                        break
+            item_status = str(item.get("status") or "pushed").strip().lower()
+            if item_status == "failed":
+                record.update(
+                    {
+                        "grok2api_status": "failed",
+                        "grok2api_status_text": f"失败：{str(item.get('error') or '')[:220]}",
+                        "grok2api_failed_at": now,
+                        "grok2api_error": str(item.get("error") or ""),
+                        "email": email,
+                        "source_file": account.get("source_file", ""),
+                        "line_no": account.get("line_no", ""),
+                    }
+                )
+            else:
+                record.update(
+                    {
+                        "grok2api_status": "pushed",
+                        "grok2api_status_text": "已推送",
+                        "grok2api_pushed_at": now,
+                        "grok2api_response": item.get("response", item),
+                        "email": email,
+                        "source_file": account.get("source_file", ""),
+                        "line_no": account.get("line_no", ""),
+                    }
+                )
+                record.pop("grok2api_error", None)
+            statuses[key] = record
+            if account_id:
+                statuses[account_id] = record
+
+    return update_account_status_records(_mutate)
 
 
 def persist_cpa_push_status(accounts, result):
-    statuses = load_account_statuses()
     items = result.get("items") if isinstance(result, dict) else []
     if not isinstance(items, list):
         items = []
     now = datetime.datetime.now().isoformat(timespec="seconds")
-    for index, account in enumerate(accounts or []):
-        account_id = str(account.get("id") or "").strip()
-        if not account_id:
-            continue
-        record = statuses.get(account_id)
-        if not isinstance(record, dict):
-            record = {}
-        item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
-        item_status = str(item.get("status") or "pushed").strip().lower()
-        if item_status == "failed":
-            record.pop("cpa_pushed_at", None)
-            record.pop("cpa_response", None)
-            record.update(
-                {
-                    "cpa_status": "failed",
-                    "cpa_status_text": f"失败：{str(item.get('error') or '')[:220]}",
-                    "cpa_failed_at": now,
-                    "cpa_error": str(item.get("error") or ""),
-                    "cpa_step": str(item.get("step") or ""),
-                    "email": account.get("email", ""),
-                    "source_file": account.get("source_file", ""),
-                    "line_no": account.get("line_no", ""),
-                }
-            )
-        else:
-            record.pop("cpa_failed_at", None)
-            record.pop("cpa_error", None)
-            record.pop("cpa_step", None)
-            record.update(
-                {
-                    "cpa_status": "pushed",
-                    "cpa_status_text": "已推送",
-                    "cpa_pushed_at": now,
-                    "cpa_response": item.get("response", item),
-                    "email": account.get("email", ""),
-                    "source_file": account.get("source_file", ""),
-                    "line_no": account.get("line_no", ""),
-                }
-            )
-        statuses[account_id] = record
-    save_account_statuses(statuses)
-    return statuses
+
+    def _mutate(statuses):
+        for index, account in enumerate(accounts or []):
+            account_id = str(account.get("id") or "").strip()
+            email = str(account.get("email") or "").strip()
+            if not account_id and not email:
+                continue
+            key = account_id or f"email:{email.lower()}"
+            record = statuses.get(key)
+            if not isinstance(record, dict):
+                record = {}
+            item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
+            if not item and email:
+                for it in items:
+                    if isinstance(it, dict) and str(it.get("email") or "").strip().lower() == email.lower():
+                        item = it
+                        break
+            item_status = str(item.get("status") or "pushed").strip().lower()
+            if item_status in {"failed", "error"}:
+                record.pop("cpa_pushed_at", None)
+                record.pop("cpa_response", None)
+                record.update(
+                    {
+                        "cpa_status": "failed",
+                        "cpa_status_text": f"失败：{str(item.get('error') or item.get('upload_error') or '')[:220]}",
+                        "cpa_failed_at": now,
+                        "cpa_error": str(item.get("error") or item.get("upload_error") or ""),
+                        "cpa_step": str(item.get("step") or ""),
+                        "email": email,
+                        "source_file": account.get("source_file", ""),
+                        "line_no": account.get("line_no", ""),
+                    }
+                )
+            else:
+                record.pop("cpa_failed_at", None)
+                record.pop("cpa_error", None)
+                record.pop("cpa_step", None)
+                record.update(
+                    {
+                        "cpa_status": "pushed",
+                        "cpa_status_text": "已推送",
+                        "cpa_pushed_at": now,
+                        "cpa_response": item.get("response", item),
+                        "email": email,
+                        "source_file": account.get("source_file", ""),
+                        "line_no": account.get("line_no", ""),
+                    }
+                )
+            statuses[key] = record
+            if account_id:
+                statuses[account_id] = record
+
+    return update_account_status_records(_mutate)
 
 
 def persist_account_health_status(accounts, result):
@@ -5470,6 +5526,7 @@ class RegistrationJob:
         refresh_token = fetch_xai_oauth_refresh_token(
             sso, log_callback=logf, cancel_callback=self.should_stop
         )
+        cpa_push_item = None
         if self.settings.get("cpa_auto_push_remote"):
             logf("[*] 8. 推送 CPA 凭证")
             try:
@@ -5481,12 +5538,35 @@ class RegistrationJob:
                     refresh_token = rotated_refresh_token
                 if cpa_result.get("upload_error"):
                     logf(f"[!] CPA 凭证推送失败，已保留本地文件: {cpa_result['upload_error']}")
+                    cpa_push_item = {
+                        "email": email,
+                        "status": "failed",
+                        "error": str(cpa_result.get("upload_error") or ""),
+                    }
                 elif cpa_result.get("uploaded"):
                     logf(f"[+] CPA 凭证已推送: {cpa_result.get('filename', '')}")
+                    cpa_push_item = {"email": email, "status": "pushed", "response": cpa_result}
+                else:
+                    # 仅本地生成也算部分成功
+                    cpa_push_item = {
+                        "email": email,
+                        "status": "pushed" if cpa_result else "failed",
+                        "response": cpa_result,
+                    }
             except Exception as cpa_exc:
                 logf(f"[!] CPA 凭证生成或推送失败，继续注册流程: {cpa_exc}")
+                cpa_push_item = {"email": email, "status": "failed", "error": str(cpa_exc)}
         with self.stats_lock:
-            source_line_no = self.success_count + 1
+            # 用文件真实行号生成 account id，避免 success_count 与行号不一致导致状态对不上
+            out_path = os.path.join(get_data_dir(), self.output_file)
+            try:
+                if os.path.isfile(out_path):
+                    with open(out_path, "r", encoding="utf-8") as rf:
+                        source_line_no = sum(1 for _ in rf) + 1
+                else:
+                    source_line_no = 1
+            except Exception:
+                source_line_no = self.success_count + 1
             self.results.append(
                 {"email": email, "sso": sso, "refresh_token": refresh_token, "profile": profile}
             )
@@ -5494,11 +5574,7 @@ class RegistrationJob:
             line = f"{email}----{profile.get('password','')}----{sso}----{refresh_token}\n"
             try:
                 with _registered_accounts_lock:
-                    with open(
-                        os.path.join(get_data_dir(), self.output_file),
-                        "a",
-                        encoding="utf-8",
-                    ) as f:
+                    with open(out_path, "a", encoding="utf-8") as f:
                         f.write(line)
             except Exception as file_exc:
                 logf(f"[Debug] 保存账号文件失败: {file_exc}")
@@ -5512,12 +5588,50 @@ class RegistrationJob:
             line_no=source_line_no,
             include_sso=True,
         ) or {
+            "id": _account_id(self.output_file, source_line_no, email, sso),
             "email": email,
             "sso": sso,
             "refresh_token": refresh_token,
             "has_refresh_token": bool(refresh_token),
+            "source_file": self.output_file,
+            "line_no": source_line_no,
         }
-        add_token_to_grok2api_pools(sso, email=email, log_callback=logf)
+        # 保证 id 始终存在，便于状态落盘
+        if not account.get("id"):
+            account["id"] = _account_id(
+                account.get("source_file") or self.output_file,
+                int(account.get("line_no") or source_line_no or 0),
+                email,
+                sso,
+            )
+
+        # CPA：按实际推送结果写状态
+        if cpa_push_item is not None:
+            try:
+                persist_cpa_push_status([account], {"items": [cpa_push_item]})
+            except Exception as st_exc:
+                logf(f"[Debug] 写入 CPA 推送状态失败: {st_exc}")
+
+        # grok2api：无论走 pools 还是 auto_push，都落状态
+        try:
+            add_token_to_grok2api_pools(sso, email=email, log_callback=logf)
+            if self.settings.get("grok2api_auto_add_remote") or self.settings.get(
+                "grok2api_auto_add_local", True
+            ):
+                persist_grok2api_push_status(
+                    [account],
+                    {"items": [{"email": email, "status": "pushed"}]},
+                )
+        except Exception as grok_exc:
+            logf(f"[Debug] grok2api 写入失败: {grok_exc}")
+            try:
+                persist_grok2api_push_status(
+                    [account],
+                    {"items": [{"email": email, "status": "failed", "error": str(grok_exc)}]},
+                )
+            except Exception:
+                pass
+
         auto_push_registered_account(account, self.settings, log_callback=logf)
         self._note_registration_outcome(True, logf=logf)
         try:

@@ -612,6 +612,22 @@ button:disabled {
   padding: 0 16px 12px;
 }
 
+.accounts-export-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  padding: 0 16px 10px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.accounts-export-bar .export-label {
+  margin-right: 4px;
+  color: var(--text);
+  font-weight: 600;
+}
+
 .accounts-toolbar {
   display: flex;
   flex-wrap: wrap;

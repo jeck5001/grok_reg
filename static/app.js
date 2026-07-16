@@ -11,7 +11,12 @@ const checkHealthBtn = document.querySelector("#checkHealthBtn");
 const importGrok2apiBtn = document.querySelector("#importGrok2apiBtn");
 const importSub2apiBtn = document.querySelector("#importSub2apiBtn");
 const importCpaBtn = document.querySelector("#importCpaBtn");
+const exportAccountsBtn = document.querySelector("#exportAccountsBtn");
 const deleteAccountsBtn = document.querySelector("#deleteAccountsBtn");
+const exportFmtNative = document.querySelector("#exportFmtNative");
+const exportFmtGrok2api = document.querySelector("#exportFmtGrok2api");
+const exportFmtSub2api = document.querySelector("#exportFmtSub2api");
+const exportFmtCpa = document.querySelector("#exportFmtCpa");
 const dashboardStatusText = document.querySelector("#dashboardStatusText");
 const dashboardRunNote = document.querySelector("#dashboardRunNote");
 const dashboardTotalAccounts = document.querySelector("#dashboardTotalAccounts");
@@ -205,6 +210,79 @@ async function requestJson(url, options = {}) {
     throw new Error(payload.detail || `HTTP ${response.status}`);
   }
   return payload;
+}
+
+function selectedExportFormats() {
+  const formats = [];
+  if (exportFmtNative && exportFmtNative.checked) formats.push("native");
+  if (exportFmtGrok2api && exportFmtGrok2api.checked) formats.push("grok2api");
+  if (exportFmtSub2api && exportFmtSub2api.checked) formats.push("sub2api");
+  if (exportFmtCpa && exportFmtCpa.checked) formats.push("cpa");
+  return formats;
+}
+
+function parseFilenameFromDisposition(headerValue) {
+  const raw = String(headerValue || "");
+  const star = raw.match(/filename\*=UTF-8''([^;]+)/i);
+  if (star) {
+    try {
+      return decodeURIComponent(star[1].trim().replace(/"/g, ""));
+    } catch (e) {
+      /* ignore */
+    }
+  }
+  const plain = raw.match(/filename="?([^";]+)"?/i);
+  return plain ? plain[1].trim() : "export_accounts.zip";
+}
+
+async function exportSelectedAccounts() {
+  const accountIds = selectedAccountIds();
+  if (!accountIds.length) {
+    setMessage("请先勾选要导出的账号");
+    return;
+  }
+  const formats = selectedExportFormats();
+  if (!formats.length) {
+    setMessage("请至少勾选一种导出格式");
+    return;
+  }
+  if (exportAccountsBtn) {
+    exportAccountsBtn.disabled = true;
+    exportAccountsBtn.textContent = "导出中…";
+  }
+  try {
+    const response = await fetch("/api/accounts/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...formPayload(), account_ids: accountIds, formats }),
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.detail || `HTTP ${response.status}`);
+    }
+    const blob = await response.blob();
+    const filename = parseFilenameFromDisposition(
+      response.headers.get("Content-Disposition")
+    );
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    setMessage(
+      `已导出 ${accountIds.length} 个账号（${formats.join(" + ")}）→ ${filename}`
+    );
+  } catch (error) {
+    setMessage(`导出失败：${error.message}`);
+  } finally {
+    if (exportAccountsBtn) {
+      exportAccountsBtn.disabled = false;
+      exportAccountsBtn.textContent = "导出选中";
+    }
+  }
 }
 
 async function loadConfig() {
@@ -1152,6 +1230,12 @@ refreshAccountsBtn.addEventListener("click", () => {
 checkHealthBtn.addEventListener("click", () => {
   checkSelectedAccountHealth().catch((error) => setMessage(error.message));
 });
+
+if (exportAccountsBtn) {
+  exportAccountsBtn.addEventListener("click", () => {
+    exportSelectedAccounts().catch((error) => setMessage(error.message));
+  });
+}
 
 selectPageAccounts.addEventListener("change", () => {
   for (const account of currentPageAccounts()) {

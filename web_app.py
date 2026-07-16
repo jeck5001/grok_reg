@@ -2,7 +2,7 @@ from pathlib import Path
 from threading import Lock
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import grok_register_ttk as reg
@@ -321,6 +321,33 @@ def check_accounts_health(payload: dict):
         "message": f"健康检查完成：可用 {healthy} 个，异常 {failed} 个",
         "accounts": [public_account(account) for account in accounts],
     }
+
+
+@app.post("/api/accounts/export")
+def export_accounts(payload: dict):
+    """导出选中账号。formats 多选：native/grok2api/sub2api/cpa，每种格式一个 zip。"""
+    settings = merge_sensitive_values(payload)
+    account_ids = payload.get("account_ids") or []
+    formats = payload.get("formats") or []
+    accounts = reg.find_registered_accounts(account_ids)
+    if not accounts:
+        raise HTTPException(status_code=404, detail="未找到选中的账号")
+    try:
+        result = reg.export_accounts_zip(accounts, formats, settings=settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"导出失败: {exc}")
+    content = result.get("content") or b""
+    filename = str(result.get("filename") or "export_accounts.zip")
+    return Response(
+        content=content,
+        media_type=str(result.get("content_type") or "application/zip"),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Export-Formats": ",".join(result.get("formats") or []),
+        },
+    )
 
 
 def _resolve_job(job_id: str):

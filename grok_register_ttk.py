@@ -24,6 +24,8 @@ import subprocess
 import hashlib
 import base64
 import urllib.parse
+import io
+import zipfile
 
 try:
     import tkinter as tk
@@ -3486,6 +3488,299 @@ def export_and_push_cpa_credential(email, refresh_token, settings=None, log_call
         if multipart is not None:
             multipart.close()
     return result
+
+
+def build_native_account_export_line(account):
+    email = str((account or {}).get("email") or "").strip()
+    password = str((account or {}).get("password") or "").strip()
+    sso = _normalize_sso_token((account or {}).get("sso") or "")
+    refresh_token = str((account or {}).get("refresh_token") or "").strip()
+    if not email or not sso:
+        return ""
+    if refresh_token:
+        return f"{email}----{password}----{sso}----{refresh_token}"
+    return f"{email}----{password}----{sso}"
+
+
+def build_grok2api_export_payload(accounts):
+    """导出 grok2api 可导入的 token 列表（SSO）。"""
+    tokens = []
+    for account in accounts or []:
+        sso = _normalize_sso_token(account.get("sso") or "")
+        if not sso:
+            continue
+        tokens.append(
+            {
+                "token": sso,
+                "email": str(account.get("email") or "").strip(),
+                "tags": ["export", "auto-register"],
+                "note": str(account.get("email") or "").strip(),
+            }
+        )
+    pool_name = str(config.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip() or "ssoBasic"
+    return {
+        "exported_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "pool": pool_name,
+        "tokens": tokens,
+        "count": len(tokens),
+    }
+
+
+def build_sub2api_export_account(account, settings=None, index=1, log_callback=None):
+    """导出单个 sub2api oauth 账号（含 cli-chat-proxy headers）。"""
+    settings = {**config, **dict(settings or {})}
+    refresh_token = str((account or {}).get("refresh_token") or "").strip()
+    if not refresh_token:
+        raise ValueError(f"{account.get('email') or index}: 缺少 refresh_token")
+    token_info = {}
+    # 尽量换成新 access_token，失败则只带 refresh_token
+    try:
+        token_info = exchange_xai_refresh_token(refresh_token, settings=settings) or {}
+        new_rt = str(token_info.get("refresh_token") or "").strip()
+        if new_rt:
+            refresh_token = new_rt
+            try:
+                replace_registered_account_refresh_token(account, new_rt)
+            except Exception:
+                pass
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 导出 sub2api 时 refresh 失败，仅导出 refresh_token: {exc}")
+        token_info = {"refresh_token": refresh_token}
+    payload = build_sub2api_grok_refresh_token_payload(
+        account, token_info=token_info, settings=settings, index=index
+    )
+    # sub2api 批量导入常见结构：accounts[]
+    return {
+        "name": payload.get("name"),
+        "platform": payload.get("platform") or "grok",
+        "type": payload.get("type") or "oauth",
+        "credentials": payload.get("credentials") or {},
+        "concurrency": payload.get("concurrency"),
+        "priority": payload.get("priority"),
+        "group_ids": payload.get("group_ids") or [],
+    }
+
+
+def build_cpa_export_payload(account, settings=None, log_callback=None):
+    """生成 CPA xai-*.json 内容（不上传）。"""
+    settings = {**config, **dict(settings or {})}
+    email = str((account or {}).get("email") or "").strip()
+    refresh_token = str((account or {}).get("refresh_token") or "").strip()
+    if not email or not refresh_token:
+        raise ValueError(f"{email or 'unknown'}: 缺少 email/refresh_token")
+    token_data = exchange_xai_refresh_token(refresh_token, settings=settings)
+    access_token = str(token_data.get("access_token") or "").strip()
+    resolved_refresh_token = str(token_data.get("refresh_token") or refresh_token or "").strip()
+    if not access_token or not resolved_refresh_token:
+        raise ValueError(f"{email}: OAuth 返回缺少 access/refresh token")
+    expired, token_expires_in, subject = _cpa_access_token_metadata(access_token)
+    payload = {
+        "type": "xai",
+        "access_token": access_token,
+        "refresh_token": resolved_refresh_token,
+        "token_type": str(token_data.get("token_type") or "Bearer"),
+        "expires_in": int(token_data.get("expires_in") or token_expires_in),
+        "expired": expired,
+        "last_refresh": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "email": email,
+        "sub": subject,
+        "base_url": str(settings.get("cpa_base_url") or CPA_DEFAULT_BASE_URL).rstrip("/"),
+        "redirect_uri": XAI_GROK_OAUTH_REDIRECT_URI,
+        "token_endpoint": XAI_GROK_OAUTH_TOKEN_URL,
+        "auth_kind": "oauth",
+        "headers": dict(CPA_CLIENT_HEADERS),
+    }
+    if token_data.get("id_token"):
+        payload["id_token"] = str(token_data["id_token"])
+    return _cpa_credential_file_name(email), payload
+
+
+def export_accounts_zip(accounts, formats, settings=None, log_callback=None):
+    """按格式导出账号，每种格式一个 zip；多种格式时再包一层 outer zip。
+
+    formats: iterable of native|grok2api|sub2api|cpa
+    返回: {filename, content_type, content: bytes, summary: {...}}
+    """
+    settings = {**config, **dict(settings or {})}
+    log = log_callback or (lambda m: None)
+    wanted = []
+    for item in formats or []:
+        key = str(item or "").strip().lower()
+        if key in {"native", "raw", "accounts"}:
+            key = "native"
+        if key in {"native", "grok2api", "sub2api", "cpa"} and key not in wanted:
+            wanted.append(key)
+    if not wanted:
+        raise ValueError("请至少选择一种导出格式：native / grok2api / sub2api / cpa")
+    accounts = list(accounts or [])
+    if not accounts:
+        raise ValueError("没有可导出的账号")
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    summary = {fmt: {"ok": 0, "failed": 0, "errors": []} for fmt in wanted}
+    packages = {}  # fmt -> bytes of zip
+
+    # native
+    if "native" in wanted:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            lines = []
+            for account in accounts:
+                line = build_native_account_export_line(account)
+                if not line:
+                    summary["native"]["failed"] += 1
+                    summary["native"]["errors"].append(
+                        f"{account.get('email') or '?'}: 缺少 email/sso"
+                    )
+                    continue
+                lines.append(line)
+                summary["native"]["ok"] += 1
+            zf.writestr("accounts.txt", "\n".join(lines) + ("\n" if lines else ""))
+            zf.writestr(
+                "manifest.json",
+                json.dumps(
+                    {
+                        "format": "native",
+                        "count": len(lines),
+                        "exported_at": stamp,
+                        "line_format": "email----password----sso----refresh_token",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+        packages["native"] = buf.getvalue()
+        log(f"[*] 导出 native: {summary['native']['ok']} 个")
+
+    # grok2api
+    if "grok2api" in wanted:
+        payload = build_grok2api_export_payload(accounts)
+        summary["grok2api"]["ok"] = int(payload.get("count") or 0)
+        summary["grok2api"]["failed"] = max(0, len(accounts) - summary["grok2api"]["ok"])
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(
+                "grok2api_tokens.json",
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
+            # 也给一份纯 token 列表，方便粘贴
+            plain = "\n".join(item["token"] for item in payload.get("tokens") or [])
+            zf.writestr("tokens.txt", plain + ("\n" if plain else ""))
+        packages["grok2api"] = buf.getvalue()
+        log(f"[*] 导出 grok2api: {summary['grok2api']['ok']} 个")
+
+    # sub2api
+    if "sub2api" in wanted:
+        exported = []
+        for index, account in enumerate(accounts, start=1):
+            try:
+                exported.append(
+                    build_sub2api_export_account(
+                        account, settings=settings, index=index, log_callback=log
+                    )
+                )
+                summary["sub2api"]["ok"] += 1
+            except Exception as exc:
+                summary["sub2api"]["failed"] += 1
+                summary["sub2api"]["errors"].append(
+                    f"{account.get('email') or index}: {exc}"
+                )
+        payload = {
+            "exported_at": datetime.datetime.now(datetime.timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            "proxies": [],
+            "accounts": exported,
+            "count": len(exported),
+        }
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(
+                f"sub2api-accounts-{stamp}.json",
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
+            # 每个账号单独一份，便于挑着用
+            for item in exported:
+                email = str((item.get("credentials") or {}).get("email") or item.get("name") or "account")
+                safe = re.sub(r"[^A-Za-z0-9@._-]", "-", email).strip("-") or "account"
+                zf.writestr(
+                    f"accounts/{safe}.json",
+                    json.dumps(item, ensure_ascii=False, indent=2),
+                )
+        packages["sub2api"] = buf.getvalue()
+        log(f"[*] 导出 sub2api: {summary['sub2api']['ok']} 个 / 失败 {summary['sub2api']['failed']}")
+
+    # cpa
+    if "cpa" in wanted:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for account in accounts:
+                try:
+                    filename, payload = build_cpa_export_payload(
+                        account, settings=settings, log_callback=log
+                    )
+                    zf.writestr(
+                        filename,
+                        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    )
+                    summary["cpa"]["ok"] += 1
+                except Exception as exc:
+                    summary["cpa"]["failed"] += 1
+                    summary["cpa"]["errors"].append(
+                        f"{account.get('email') or '?'}: {exc}"
+                    )
+            zf.writestr(
+                "manifest.json",
+                json.dumps(
+                    {
+                        "format": "cpa",
+                        "count": summary["cpa"]["ok"],
+                        "failed": summary["cpa"]["failed"],
+                        "exported_at": stamp,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+        packages["cpa"] = buf.getvalue()
+        log(f"[*] 导出 CPA: {summary['cpa']['ok']} 个 / 失败 {summary['cpa']['failed']}")
+
+    # 单格式：直接返回该 zip；多格式：再包 outer zip
+    if len(packages) == 1:
+        fmt = next(iter(packages))
+        return {
+            "filename": f"export_{fmt}_{stamp}.zip",
+            "content_type": "application/zip",
+            "content": packages[fmt],
+            "summary": summary,
+            "formats": [fmt],
+        }
+
+    outer = io.BytesIO()
+    with zipfile.ZipFile(outer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for fmt, data in packages.items():
+            zf.writestr(f"export_{fmt}_{stamp}.zip", data)
+        zf.writestr(
+            "export_summary.json",
+            json.dumps(
+                {
+                    "exported_at": stamp,
+                    "formats": wanted,
+                    "account_count": len(accounts),
+                    "summary": summary,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    return {
+        "filename": f"export_accounts_{stamp}.zip",
+        "content_type": "application/zip",
+        "content": outer.getvalue(),
+        "summary": summary,
+        "formats": wanted,
+    }
 
 
 def import_accounts_to_cpa(accounts, settings=None, log_callback=None):

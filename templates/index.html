@@ -492,6 +492,52 @@
               </p>
             </section>
 
+            <section class="config-section" data-config-section="Telegram通知">
+              <div class="section-copy">
+                <p class="section-kicker">Notify</p>
+                <h2>Telegram 通知</h2>
+              </div>
+              <div class="config-grid">
+                <label class="check">
+                  <input name="notify_enabled" type="checkbox" />
+                  启用 Telegram 通知
+                </label>
+                <label>
+                  最低级别
+                  <select name="notify_min_level">
+                    <option value="info">info（全部）</option>
+                    <option value="warn" selected>warn（推荐）</option>
+                    <option value="danger">danger（仅严重）</option>
+                  </select>
+                </label>
+                <label>
+                  去重冷却(秒)
+                  <input name="notify_cooldown_sec" type="number" min="30" max="86400" value="180" />
+                </label>
+                <label class="wide">
+                  Bot Token
+                  <input name="notify_telegram_bot_token" type="password" autocomplete="off" placeholder="123456:ABC-DEF..." />
+                </label>
+                <label>
+                  Chat ID
+                  <input name="notify_telegram_chat_id" placeholder="个人 ID 或 -100 群组 ID" />
+                </label>
+                <label>
+                  成功里程碑
+                  <input name="notify_milestone_success" placeholder="10,50,100,200,500" />
+                </label>
+              </div>
+              <div class="notify-actions">
+                <button type="button" class="ghost-btn" id="notifyTestBtn">发送测试消息</button>
+                <small id="notifyStatusText" class="hint-inline">保存配置后再测试</small>
+              </div>
+              <p class="hint">
+                1) BotFather 创建 bot 拿 token · 2) 先私聊 bot 或把 bot 拉进群 ·
+                3) Chat ID 可用 <code>@userinfobot</code> / 群组 -100… ·
+                4) 默认不推每次成功，只推里程碑与异常。
+              </p>
+            </section>
+
             <section class="config-section" data-config-section="grok2api">
               <div class="section-copy">
                 <p class="section-kicker">grok2api</p>

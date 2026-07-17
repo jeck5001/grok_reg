@@ -216,6 +216,18 @@ function formPayload() {
   if (form.elements.email_webhook_enabled) {
     data.email_webhook_enabled = form.elements.email_webhook_enabled.checked;
   }
+  if (form.elements.notify_enabled) {
+    data.notify_enabled = form.elements.notify_enabled.checked;
+  }
+  if (form.elements.notify_cooldown_sec) {
+    data.notify_cooldown_sec = Number(form.elements.notify_cooldown_sec.value || 180);
+  }
+  if (form.elements.notify_milestone_success) {
+    data.notify_milestone_success = String(form.elements.notify_milestone_success.value || "")
+      .split(/[,，\s]+/)
+      .map((x) => Number(x))
+      .filter((n) => Number.isFinite(n) && n > 0);
+  }
   // 手动分组：textarea 每行一组
   if (form.elements.mail_domain_groups_text) {
     const lines = String(form.elements.mail_domain_groups_text.value || "")
@@ -249,6 +261,10 @@ function applyConfig(config) {
     if (!field) continue;
     if (field.type === "checkbox") {
       field.checked = Boolean(value);
+    } else if (key === "notify_milestone_success" && Array.isArray(value)) {
+      field.value = value.join(",");
+    } else if (key === "notify_events") {
+      continue;
     } else {
       field.value = value ?? "";
     }
@@ -256,6 +272,9 @@ function applyConfig(config) {
   if (form.elements.mail_domain_groups_text) {
     const groups = Array.isArray(config.mail_domain_groups) ? config.mail_domain_groups : [];
     form.elements.mail_domain_groups_text.value = groups.filter(Boolean).join("\n");
+  }
+  if (form.elements.notify_milestone_success && Array.isArray(config.notify_milestone_success)) {
+    form.elements.notify_milestone_success.value = config.notify_milestone_success.join(",");
   }
   const paths = [
     config.cloudflare_path_domains,
@@ -1020,9 +1039,9 @@ function renderEconomics(econ) {
     ["秒/成功", e.sec_per_success != null ? `${e.sec_per_success}s` : "—"],
     ["尝试/成功", e.attempts_per_success != null ? String(e.attempts_per_success) : "—"],
     ["邮箱已耗~", e.mail_spent_est != null ? String(e.mail_spent_est) : "—"],
-    ["再要 N 个", e.remain != null ? String(e.remain) : "—"],
-    ["再耗邮箱~", e.est_more_mail != null ? String(e.est_more_mail) : "—"],
-    ["ETA", e.eta_more_sec != null ? formatDuration(e.eta_more_sec) : "—"],
+    ["再要 N 个", e.terminal ? "—" : (e.remain != null ? String(e.remain) : "—")],
+    ["再耗邮箱~", e.terminal ? "—" : (e.est_more_mail != null ? String(e.est_more_mail) : "—")],
+    ["ETA", e.terminal ? "已结束" : (e.eta_more_sec != null ? formatDuration(e.eta_more_sec) : "—")],
     ["Solver 失败信号", e.solver_fail_hits != null ? String(e.solver_fail_hits) : "—"],
     ["产能/min", e.rate_per_min != null ? String(e.rate_per_min) : "—"],
   ];
@@ -1195,7 +1214,9 @@ function renderWarRoom(data) {
   if (warProgressSub) {
     const rate = thr.success_rate != null ? `${thr.success_rate}%` : "—";
     const elapsed = thr.elapsed_sec != null ? formatDuration(thr.elapsed_sec) : "—";
-    warProgressSub.textContent = `成功率 ${rate} · 已运行 ${elapsed}`;
+    warProgressSub.textContent = thr.terminal
+      ? `成功率 ${rate} · 总耗时 ${elapsed}`
+      : `成功率 ${rate} · 已运行 ${elapsed}`;
   }
   const progressBar = document.querySelector("#warProgressBar");
   if (progressBar) {
@@ -1207,7 +1228,11 @@ function renderWarRoom(data) {
       thr.rate_per_min != null ? `产能 ${thr.rate_per_min}/min` : "产能 —";
   }
   if (warEtaText) {
-    warEtaText.textContent = thr.eta_sec != null ? `ETA ${formatDuration(thr.eta_sec)}` : "ETA —";
+    if (thr.terminal) {
+      warEtaText.textContent = "已结束";
+    } else {
+      warEtaText.textContent = thr.eta_sec != null ? `ETA ${formatDuration(thr.eta_sec)}` : "ETA —";
+    }
   }
 
   dashboardMetricValue(dashboardTotalAccounts, inv.total || 0);
@@ -1950,6 +1975,31 @@ if (warAutopilotToggle) {
 if (warAutopilotOnceBtn) {
   warAutopilotOnceBtn.addEventListener("click", () => {
     runAutopilotOnce().catch((error) => setMessage(error.message));
+  });
+}
+
+const notifyTestBtn = document.querySelector("#notifyTestBtn");
+const notifyStatusText = document.querySelector("#notifyStatusText");
+if (notifyTestBtn) {
+  notifyTestBtn.addEventListener("click", () => {
+    (async () => {
+      notifyTestBtn.disabled = true;
+      try {
+        await saveConfig().catch(() => {});
+        const result = await requestJson("/api/notify/test", { method: "POST" });
+        if (notifyStatusText) {
+          notifyStatusText.textContent = result.ok
+            ? `已发送（${result.latency_ms || "?"}ms）`
+            : "发送失败";
+        }
+        setMessage("Telegram 测试消息已发送");
+      } catch (error) {
+        if (notifyStatusText) notifyStatusText.textContent = error.message;
+        setMessage(`通知测试失败：${error.message}`);
+      } finally {
+        notifyTestBtn.disabled = false;
+      }
+    })();
   });
 }
 

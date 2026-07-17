@@ -22,6 +22,7 @@ SENSITIVE_KEYS = {
     "yyds_api_key",
     "yyds_jwt",
     "email_webhook_secret",
+    "notify_telegram_bot_token",
 }
 
 _FAIL_REASON_RULES = (
@@ -423,6 +424,20 @@ def _current_job_payload():
                     pass
                 st = job.status()
                 running = False
+                try:
+                    import notify_hub
+
+                    notify_hub.emit(
+                        "job.interrupted",
+                        title="任务异常中断",
+                        body=f"成功 {st.get('success_count', 0)} / 失败 {st.get('fail_count', 0)}（进程可能已重启）",
+                        level="danger",
+                        job_id=job.id,
+                        dedupe_key=f"job.interrupted|{job.id}",
+                        settings=reg.load_config(),
+                    )
+                except Exception:
+                    pass
             return {
                 "job_id": job.id,
                 "has_job": True,
@@ -446,6 +461,20 @@ def _current_job_payload():
         disk_status = str(st.get("status") or meta.get("status") or "finished")
         if disk_status in {"pending", "running"}:
             disk_status = "interrupted"
+            try:
+                import notify_hub
+
+                notify_hub.emit(
+                    "job.interrupted",
+                    title="任务异常中断",
+                    body=f"成功 {st.get('success_count') or meta.get('success_count') or 0} / 失败 {st.get('fail_count') or meta.get('fail_count') or 0}",
+                    level="danger",
+                    job_id=job_id,
+                    dedupe_key=f"job.interrupted|{job_id}",
+                    settings=reg.load_config(),
+                )
+            except Exception:
+                pass
         return {
             "job_id": job_id,
             "has_job": True,
@@ -536,21 +565,43 @@ def _throughput_estimate(job, signals):
     fail = int((job or {}).get("fail_count") or 0)
     target = int((job or {}).get("register_count") or 0)
     started = str((job or {}).get("started_at") or "").strip()
+    finished = str((job or {}).get("finished_at") or "").strip()
+    status = str((job or {}).get("status") or "").strip().lower()
+    running = bool((job or {}).get("running"))
+    terminal = (not running) and status in {
+        "completed",
+        "stopped",
+        "failed",
+        "interrupted",
+        "idle",
+    }
     elapsed_sec = None
     if started:
         try:
             from datetime import datetime
 
             started_dt = datetime.fromisoformat(started)
-            elapsed_sec = max(1, int((datetime.now() - started_dt).total_seconds()))
+            end_dt = None
+            if finished:
+                try:
+                    end_dt = datetime.fromisoformat(finished)
+                except Exception:
+                    end_dt = None
+            if end_dt is None and not terminal:
+                end_dt = datetime.now()
+            elif end_dt is None and terminal:
+                end_dt = started_dt
+            elapsed_sec = max(0, int((end_dt - started_dt).total_seconds()))
+            if success > 0 and elapsed_sec <= 0:
+                elapsed_sec = 1
         except Exception:
             elapsed_sec = None
     rate_per_min = None
     eta_sec = None
+    remain = max(0, target - success)
     if elapsed_sec and success > 0:
         rate_per_min = round((success / elapsed_sec) * 60.0, 2)
-        remain = max(0, target - success)
-        if rate_per_min > 0 and remain > 0:
+        if (not terminal) and rate_per_min > 0 and remain > 0:
             eta_sec = int((remain / rate_per_min) * 60)
     done = success + fail
     success_rate = round((success / done) * 100, 1) if done else None
@@ -559,6 +610,7 @@ def _throughput_estimate(job, signals):
         "rate_per_min": rate_per_min,
         "eta_sec": eta_sec,
         "success_rate": success_rate,
+        "terminal": terminal,
         "log_success_hits": int((signals or {}).get("success_hits") or 0),
         "log_fail_hits": int((signals or {}).get("fail_hits") or 0),
     }
@@ -693,6 +745,7 @@ def _economics_snapshot(job, throughput, signals, settings=None):
     target = int((job or {}).get("register_count") or 0)
     done = success + fail
     elapsed = (throughput or {}).get("elapsed_sec")
+    terminal = bool((throughput or {}).get("terminal"))
     sec_per_success = None
     if success > 0 and elapsed:
         sec_per_success = round(float(elapsed) / success, 1)
@@ -702,13 +755,13 @@ def _economics_snapshot(job, throughput, signals, settings=None):
     reasons = {r.get("reason"): int(r.get("count") or 0) for r in ((signals or {}).get("reasons") or [])}
     turnstile_fails = int(reasons.get("turnstile") or 0)
     remain = max(0, target - success)
-    eta_more = (throughput or {}).get("eta_sec")
+    eta_more = None if terminal else (throughput or {}).get("eta_sec")
     est_more_attempts = None
     est_more_mail = None
-    if remain > 0 and attempts_per_success:
+    if (not terminal) and remain > 0 and attempts_per_success:
         est_more_attempts = int(round(remain * attempts_per_success))
         est_more_mail = est_more_attempts
-    elif remain > 0:
+    elif (not terminal) and remain > 0:
         est_more_attempts = remain
         est_more_mail = remain
     threads = int((settings or {}).get("register_threads") or (job or {}).get("register_threads") or 1)
@@ -717,7 +770,7 @@ def _economics_snapshot(job, throughput, signals, settings=None):
         "fail": fail,
         "done": done,
         "target": target,
-        "remain": remain,
+        "remain": 0 if terminal else remain,
         "sec_per_success": sec_per_success,
         "attempts_per_success": attempts_per_success,
         "mail_spent_est": mail_est,
@@ -727,30 +780,49 @@ def _economics_snapshot(job, throughput, signals, settings=None):
         "est_more_attempts": est_more_attempts,
         "est_more_mail": est_more_mail,
         "threads": threads,
+        "terminal": terminal,
         "rate_per_min": (throughput or {}).get("rate_per_min"),
         "success_rate": (throughput or {}).get("success_rate"),
         "blurb": _economics_blurb(
             success=success,
-            remain=remain,
+            remain=0 if terminal else remain,
             sec_per_success=sec_per_success,
             est_more_mail=est_more_mail,
             eta_more=eta_more,
             success_rate=(throughput or {}).get("success_rate"),
+            terminal=terminal,
+            shortfall=remain if terminal else 0,
         ),
     }
 
 
-def _economics_blurb(*, success, remain, sec_per_success, est_more_mail, eta_more, success_rate):
+def _economics_blurb(
+    *,
+    success,
+    remain,
+    sec_per_success,
+    est_more_mail,
+    eta_more,
+    success_rate,
+    terminal=False,
+    shortfall=0,
+):
     parts = []
     if sec_per_success is not None:
         parts.append(f"约 {sec_per_success}s/成功号")
     if success_rate is not None:
         parts.append(f"成功率 {success_rate}%")
-    if remain > 0 and eta_more is not None:
-        m = max(1, int(round(eta_more / 60)))
-        parts.append(f"再要 {remain} 个约 {m} 分钟")
-    if remain > 0 and est_more_mail is not None:
-        parts.append(f"预计再耗邮箱 ~{est_more_mail}")
+    if terminal:
+        if shortfall > 0:
+            parts.append(f"任务已结束（差 {shortfall} 个）")
+        else:
+            parts.append("任务已结束")
+    else:
+        if remain > 0 and eta_more is not None:
+            m = max(1, int(round(eta_more / 60)))
+            parts.append(f"再要 {remain} 个约 {m} 分钟")
+        if remain > 0 and est_more_mail is not None:
+            parts.append(f"预计再耗邮箱 ~{est_more_mail}")
     if not parts:
         if success <= 0:
             return "尚无成功样本，跑起来后估算产能与邮箱消耗"
@@ -1122,6 +1194,38 @@ def ops_war_room(log_tail: int = Query(200, ge=20, le=800)):
                 }
             )
             settings = reg.load_config()
+            try:
+                import notify_hub
+
+                lines = [
+                    f"{a.get('key')} → {a.get('value')}"
+                    if a.get("type") == "set"
+                    else str(a.get("type") or "action")
+                    for a in (result.get("applied") or [])[:6]
+                ]
+                notify_hub.emit(
+                    "autopilot.applied",
+                    title=f"Auto Pilot 调整 {len(result['applied'])} 项",
+                    body="\n".join(lines),
+                    level="info",
+                    dedupe_key=f"autopilot|{stamp}",
+                    settings=settings,
+                )
+            except Exception:
+                pass
+
+    try:
+        import notify_hub
+
+        notify_hub.observe_runtime_edges(
+            solver_reachable=bool(solver.get("reachable")) if solver.get("enabled") else None,
+            domain_available=domains.get("available_count"),
+            domain_total=domains.get("total_count"),
+            domain_cooldown=domains.get("cooldown_count"),
+            settings=settings,
+        )
+    except Exception:
+        pass
 
     mode = "auto"
     try:
@@ -1194,6 +1298,46 @@ def apply_ops_preset(preset_id: str):
         "config": mask_config(validated),
         "patch": preset["patch"],
     }
+
+
+@app.get("/api/notify/status")
+def notify_status():
+    try:
+        import notify_hub
+
+        settings = reg.load_config()
+        return {"ok": True, **notify_hub.status(settings)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/notify/history")
+def notify_history(limit: int = Query(30, ge=1, le=100)):
+    try:
+        import notify_hub
+
+        return {"ok": True, "items": notify_hub.history(limit)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/notify/test")
+def notify_test():
+    try:
+        import notify_hub
+
+        settings = reg.load_config()
+        result = notify_hub.emit_test(settings)
+        if not result.get("ok"):
+            raise HTTPException(
+                status_code=400,
+                detail=result.get("error") or result.get("skipped") or "发送失败",
+            )
+        return {"ok": True, **result}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/api/ops/autopilot")

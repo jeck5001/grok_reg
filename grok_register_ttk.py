@@ -164,6 +164,26 @@ DEFAULT_CONFIG = {
     # openai-cpa-email Worker webhook 收件（本地内存池）
     "email_webhook_enabled": False,
     "email_webhook_secret": "",
+    "notify_enabled": False,
+    "notify_min_level": "warn",
+    "notify_cooldown_sec": 180,
+    "notify_telegram_bot_token": "",
+    "notify_telegram_chat_id": "",
+    "notify_milestone_success": [10, 50, 100, 200, 500],
+    "notify_events": {
+        "job.started": True,
+        "job.completed": True,
+        "job.stopped": True,
+        "job.failed": True,
+        "job.interrupted": True,
+        "job.circuit_break": True,
+        "milestone.success_n": True,
+        "domain.pool_exhausted": True,
+        "domain.half_cooling": True,
+        "solver.down": True,
+        "solver.recovered": True,
+        "autopilot.applied": False,
+    },
     "show_tutorial_on_start": True,
     "cloudmail_url": "",
     "cloudmail_admin_email": "",
@@ -5248,6 +5268,7 @@ def validate_registration_config(settings):
         "mail_domain_prefer_low_failure",
         "enable_mail_domain_grouping",
         "email_webhook_enabled",
+        "notify_enabled",
     ):
         raw_bool = normalized.get(bool_key)
         if isinstance(raw_bool, str):
@@ -5255,6 +5276,21 @@ def validate_registration_config(settings):
         else:
             normalized[bool_key] = bool(raw_bool)
     normalized["email_webhook_secret"] = str(normalized.get("email_webhook_secret") or "").strip()
+    try:
+        import notify_hub as _notify_hub
+
+        normalized.update(_notify_hub.normalize_notify_settings(normalized))
+    except Exception:
+        normalized["notify_telegram_bot_token"] = str(
+            normalized.get("notify_telegram_bot_token") or ""
+        ).strip()
+        normalized["notify_telegram_chat_id"] = str(
+            normalized.get("notify_telegram_chat_id") or ""
+        ).strip()
+        level = str(normalized.get("notify_min_level") or "warn").strip().lower()
+        if level not in {"info", "warn", "danger"}:
+            level = "warn"
+        normalized["notify_min_level"] = level
     signup_mode = str(normalized.get("signup_mode") or "auto").strip().lower()
     if signup_mode not in {"auto", "http", "api", "browser"}:
         signup_mode = "auto"
@@ -5604,6 +5640,23 @@ class RegistrationJob:
         self._persist_status()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
+        try:
+            import notify_hub
+
+            notify_hub.emit(
+                "job.started",
+                title="注册任务已开始",
+                body=(
+                    f"目标 {self.settings.get('register_count', 1)} · "
+                    f"并发 {self.settings.get('register_threads', 1)}"
+                ),
+                level="info",
+                job_id=self.id,
+                dedupe_key=f"job.started|{self.id}",
+                settings=self.settings,
+            )
+        except Exception:
+            pass
         return self
 
     def stop(self):
@@ -5657,6 +5710,23 @@ class RegistrationJob:
                 f"[!] 连续 {consecutive} 个账号出现封禁信号，触发熔断停止剩余任务。"
                 "请更换代理/出口 IP 或降低并发后重试。"
             )
+            try:
+                import notify_hub
+
+                notify_hub.emit(
+                    "job.circuit_break",
+                    title="连续封禁熔断",
+                    body=(
+                        f"连续 {consecutive} 个账号出现封禁信号，任务已停止。"
+                        "请更换代理/出口后重试。"
+                    ),
+                    level="danger",
+                    job_id=self.id,
+                    dedupe_key=f"job.circuit_break|{self.id}",
+                    settings=self.settings,
+                )
+            except Exception:
+                pass
         elif blocked and logf and threshold:
             logf(f"[!] 检测到账号封禁信号（连续 {consecutive}/{threshold}）")
         return hit_threshold
@@ -5934,6 +6004,16 @@ class RegistrationJob:
         except Exception:
             pass
         logf(f"[+] 注册成功: {email}")
+        try:
+            import notify_hub
+
+            notify_hub.maybe_milestone(
+                self.id,
+                int(self.success_count or 0),
+                settings=self.settings,
+            )
+        except Exception:
+            pass
 
     def _worker_loop(self, worker_id, total, task_queue):
         prefix = f"[T{worker_id}]"
@@ -6051,6 +6131,46 @@ class RegistrationJob:
             self.log("[*] 任务结束")
             try:
                 self._persist_status()
+            except Exception:
+                pass
+            try:
+                import notify_hub
+
+                status = self.status_value
+                body = (
+                    f"成功 {self.success_count} / 失败 {self.fail_count}"
+                    f" · 目标 {self.settings.get('register_count', 1)}"
+                )
+                if status == "completed":
+                    notify_hub.emit(
+                        "job.completed",
+                        title="注册任务完成",
+                        body=body,
+                        level="info",
+                        job_id=self.id,
+                        dedupe_key=f"job.completed|{self.id}",
+                        settings=self.settings,
+                    )
+                elif status == "stopped":
+                    notify_hub.emit(
+                        "job.stopped",
+                        title="注册任务已停止",
+                        body=body,
+                        level="warn",
+                        job_id=self.id,
+                        dedupe_key=f"job.stopped|{self.id}",
+                        settings=self.settings,
+                    )
+                elif status == "failed":
+                    notify_hub.emit(
+                        "job.failed",
+                        title="注册任务失败",
+                        body=body,
+                        level="danger",
+                        job_id=self.id,
+                        dedupe_key=f"job.failed|{self.id}",
+                        settings=self.settings,
+                    )
             except Exception:
                 pass
 

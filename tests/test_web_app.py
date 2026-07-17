@@ -593,12 +593,14 @@ def test_economics_and_autopilot_plan():
         "register_count": 30,
         "register_threads": 3,
         "running": True,
+        "status": "running",
     }
     thr = {
         "elapsed_sec": 600,
         "rate_per_min": 1.0,
         "eta_sec": 1200,
         "success_rate": 66.7,
+        "terminal": False,
     }
     signals = {
         "fail_hits": 5,
@@ -613,11 +615,72 @@ def test_economics_and_autopilot_plan():
     assert econ["est_more_mail"] is not None
     assert "成功率" in econ["blurb"] or "s/成功" in econ["blurb"]
 
+    thr_done = {
+        "elapsed_sec": 600,
+        "rate_per_min": 1.0,
+        "eta_sec": 1200,
+        "success_rate": 80.0,
+        "terminal": True,
+    }
+    econ_done = web._economics_snapshot(
+        {
+            "success_count": 8,
+            "fail_count": 2,
+            "register_count": 10,
+            "running": False,
+            "status": "completed",
+        },
+        thr_done,
+        signals,
+        {},
+    )
+    assert econ_done["remain"] == 0
+    assert econ_done["eta_more_sec"] is None
+    assert "任务已结束" in econ_done["blurb"]
+
+
+def test_throughput_freezes_after_finish():
+    import web_app as web
+
+    thr = web._throughput_estimate(
+        {
+            "success_count": 8,
+            "fail_count": 2,
+            "register_count": 10,
+            "started_at": "2026-07-17T10:00:00",
+            "finished_at": "2026-07-17T10:05:38",
+            "status": "completed",
+            "running": False,
+        },
+        {},
+    )
+    assert thr["terminal"] is True
+    assert thr["elapsed_sec"] == 338
+    assert thr["eta_sec"] is None
+    assert thr["rate_per_min"] == round((8 / 338) * 60.0, 2)
+
+
+def test_autopilot_plan_actions():
+    import web_app as web
+
     plan = web._evaluate_autopilot(
-        job,
+        {
+            "success_count": 10,
+            "fail_count": 5,
+            "register_count": 30,
+            "register_threads": 3,
+            "running": True,
+            "status": "running",
+        },
         {"available_count": 2, "total_count": 4, "cooldown_count": 1},
         {"enabled": True, "reachable": True, "url": "http://x"},
-        signals,
+        {
+            "fail_hits": 5,
+            "reasons": [
+                {"reason": "domain_rejected", "count": 3},
+                {"reason": "turnstile", "count": 2},
+            ],
+        },
         {
             "register_threads": 3,
             "mail_domain_fail_threshold": 3,

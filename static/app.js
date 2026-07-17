@@ -169,6 +169,33 @@ function activateTab(name) {
   }
 }
 
+const CONFIG_GROUP_PREF_KEY = "grok-reg.config.group";
+const configSubnavButtons = Array.from(document.querySelectorAll("[data-config-group].config-subnav-btn"));
+const configSections = Array.from(document.querySelectorAll("#configForm .config-section[data-config-group]"));
+
+function activateConfigGroup(group) {
+  const name = ["task", "mail", "push", "notify"].includes(group) ? group : "task";
+  configSubnavButtons.forEach((button) => {
+    button.classList.toggle("active", button.dataset.configGroup === name);
+  });
+  configSections.forEach((section) => {
+    section.hidden = section.dataset.configGroup !== name;
+  });
+  try {
+    localStorage.setItem(CONFIG_GROUP_PREF_KEY, name);
+  } catch (e) {}
+}
+
+function restoreConfigGroup() {
+  let group = "task";
+  try {
+    group = localStorage.getItem(CONFIG_GROUP_PREF_KEY) || "task";
+  } catch (e) {
+    group = "task";
+  }
+  activateConfigGroup(group);
+}
+
 function formPayload() {
   const data = {};
   new FormData(form).forEach((value, key) => {
@@ -2077,6 +2104,11 @@ deleteAccountsBtn.addEventListener("click", () => {
 tabButtons.forEach((button) => {
   button.addEventListener("click", () => activateTab(button.dataset.tabTarget));
 });
+
+configSubnavButtons.forEach((button) => {
+  button.addEventListener("click", () => activateConfigGroup(button.dataset.configGroup));
+});
+restoreConfigGroup();
 
 if (warRefreshBtn) {
   warRefreshBtn.addEventListener("click", () => {

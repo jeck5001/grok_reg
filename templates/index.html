@@ -195,8 +195,15 @@
 
           <section id="tab-register" class="tab-panel" data-tab-panel="register">
             <div class="register-layout">
+          <div class="config-workspace">
+            <nav class="config-subnav" aria-label="配置分组">
+              <button type="button" class="config-subnav-btn active" data-config-group="task">任务与过盾</button>
+              <button type="button" class="config-subnav-btn" data-config-group="mail">邮箱与域名</button>
+              <button type="button" class="config-subnav-btn" data-config-group="push">下游推送</button>
+              <button type="button" class="config-subnav-btn" data-config-group="notify">通知</button>
+            </nav>
           <form id="configForm" class="config-stack">
-            <section class="config-section preset-section" data-config-section="任务菜谱">
+            <section class="config-section preset-section" data-config-group="task" data-config-section="任务菜谱">
               <div class="section-copy">
                 <p class="section-kicker">Presets</p>
                 <h2>任务菜谱</h2>
@@ -204,7 +211,7 @@
               </div>
               <div class="preset-row" id="presetRow"></div>
             </section>
-            <section class="config-section" data-config-section="基础注册">
+            <section class="config-section" data-config-group="task" data-config-section="基础注册">
               <div class="section-copy">
                 <p class="section-kicker">基础注册</p>
                 <h2>任务规模和运行入口</h2>
@@ -256,7 +263,7 @@
               <p class="hint">建议：并发先 1，代理用干净住宅 IP，账号间隔 10–20 秒；连续封禁时自动熔断，避免同出口继续送死。</p>
             </section>
 
-            <section class="config-section" data-config-section="Turnstile">
+            <section class="config-section" data-config-group="task" data-config-section="Turnstile">
               <div class="section-copy">
                 <p class="section-kicker">Cloudflare</p>
                 <h2>Turnstile Solver（推荐）</h2>
@@ -319,7 +326,7 @@
               </p>
             </section>
 
-            <section class="config-section" data-config-section="邮箱服务">
+            <section class="config-section" data-config-group="mail" data-config-section="邮箱服务">
               <div class="section-copy">
                 <p class="section-kicker">邮箱服务</p>
                 <h2>DuckMail 和 YYDS 凭证</h2>
@@ -340,7 +347,7 @@
               </div>
             </section>
 
-            <section class="config-section" data-config-section="Cloudflare/CloudMail">
+            <section class="config-section" data-config-group="mail" data-config-section="Cloudflare/CloudMail">
               <div class="section-copy">
                 <p class="section-kicker">Cloudflare / CloudMail</p>
                 <h2>自建邮箱后端</h2>
@@ -390,7 +397,7 @@
               </div>
             </section>
 
-            <section class="config-section" data-config-section="域名池">
+            <section class="config-section" data-config-group="mail" data-config-section="域名池">
               <div class="section-copy">
                 <p class="section-kicker">域名池</p>
                 <h2>多级域名 / 黄金矿工 / 冷却（降 CF 日限额触发）</h2>
@@ -469,7 +476,7 @@
               </p>
             </section>
 
-            <section class="config-section" data-config-section="Webhook收件">
+            <section class="config-section" data-config-group="mail" data-config-section="Webhook收件">
               <div class="section-copy">
                 <p class="section-kicker">openai-cpa-email</p>
                 <h2>CF Worker → 本地 webhook 收件</h2>
@@ -492,7 +499,7 @@
               </p>
             </section>
 
-            <section class="config-section" data-config-section="Telegram通知">
+            <section class="config-section" data-config-group="notify" data-config-section="Telegram通知">
               <div class="section-copy">
                 <p class="section-kicker">Notify</p>
                 <h2>Telegram 通知</h2>
@@ -538,7 +545,7 @@
               </p>
             </section>
 
-            <section class="config-section" data-config-section="grok2api">
+            <section class="config-section" data-config-group="push" data-config-section="grok2api">
               <div class="section-copy">
                 <p class="section-kicker">grok2api</p>
                 <h2>本地和远端入池</h2>
@@ -574,7 +581,7 @@
               </div>
             </section>
 
-            <section class="config-section" data-config-section="sub2api">
+            <section class="config-section" data-config-group="push" data-config-section="sub2api">
               <div class="section-copy">
                 <p class="section-kicker">sub2api</p>
                 <h2>Refresh Token 推送目标</h2>
@@ -630,7 +637,7 @@
               </div>
             </section>
 
-            <section class="config-section" data-config-section="CPA">
+            <section class="config-section" data-config-group="push" data-config-section="CPA">
               <div class="section-copy">
                 <p class="section-kicker">CPA</p>
                 <h2>Management API 凭证推送</h2>
@@ -659,6 +666,7 @@
               </div>
             </section>
           </form>
+          </div>
 
           <aside class="control-panel">
             <p class="section-kicker">任务控制</p>

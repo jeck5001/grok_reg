@@ -1141,6 +1141,48 @@ h2 {
   }
 }
 
+.config-workspace {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.config-subnav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.config-subnav-btn {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 140ms ease, background 140ms ease, border-color 140ms ease;
+}
+
+.config-subnav-btn:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+  filter: none;
+  transform: none;
+}
+
+.config-subnav-btn.active {
+  color: var(--text);
+  border-color: var(--line-strong);
+  background: var(--accent-dim);
+}
+
 .config-stack {
   display: grid;
   gap: 14px;
@@ -1153,6 +1195,10 @@ h2 {
   background:
     linear-gradient(180deg, var(--panel-soft), transparent 58%),
     var(--panel);
+}
+
+.config-section[hidden] {
+  display: none !important;
 }
 
 .section-copy {
@@ -1563,6 +1609,15 @@ td.empty {
 
   .register-layout {
     grid-template-columns: 1fr;
+  }
+
+  .config-subnav {
+    overflow-x: auto;
+    flex-wrap: nowrap;
+  }
+
+  .config-subnav-btn {
+    flex: 0 0 auto;
   }
 
   .dashboard-hero.war-command {

@@ -1397,6 +1397,49 @@ td.status-failed {
   overflow: auto;
 }
 
+.th-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.th-sort:hover {
+  color: var(--accent);
+  filter: none;
+  transform: none;
+}
+
+.th-sort.active {
+  color: var(--accent);
+}
+
+.sort-mark {
+  font-style: normal;
+  font-size: 11px;
+  opacity: 0.65;
+  font-weight: 500;
+}
+
+.th-sort.active .sort-mark {
+  opacity: 1;
+}
+
+.time-column {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+
 table {
   width: 100%;
   min-width: 1240px;

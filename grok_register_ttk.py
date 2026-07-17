@@ -618,7 +618,36 @@ def _account_id(source, line_no, email, sso):
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
 
 
-def parse_registered_account_line(line, source="", line_no=0, include_sso=True):
+_ACCOUNT_FILE_TS_RE = re.compile(
+    r"^accounts_(\d{8})_(\d{6})(?:_[^.]+)?\.txt$"
+)
+
+
+def parse_account_file_created_at(source_name, path=None):
+    """从 accounts_YYYYMMDD_HHMMSS_*.txt 解析创建时间；失败则用文件 mtime。"""
+    name = str(source_name or "").strip()
+    match = _ACCOUNT_FILE_TS_RE.match(name)
+    if match:
+        try:
+            dt = datetime.datetime.strptime(
+                f"{match.group(1)}{match.group(2)}", "%Y%m%d%H%M%S"
+            )
+            return dt.isoformat(timespec="seconds")
+        except Exception:
+            pass
+    if path and os.path.isfile(path):
+        try:
+            return datetime.datetime.fromtimestamp(os.path.getmtime(path)).isoformat(
+                timespec="seconds"
+            )
+        except Exception:
+            pass
+    return ""
+
+
+def parse_registered_account_line(
+    line, source="", line_no=0, include_sso=True, created_at=""
+):
     parts = str(line or "").rstrip("\n").split("----", 3)
     if len(parts) not in {3, 4}:
         return None
@@ -636,6 +665,7 @@ def parse_registered_account_line(line, source="", line_no=0, include_sso=True):
         "has_refresh_token": bool(refresh_token),
         "source_file": source,
         "line_no": line_no,
+        "created_at": str(created_at or ""),
     }
     if include_sso:
         account["sso"] = sso
@@ -822,11 +852,16 @@ def list_registered_accounts(include_sso=True):
         path = os.path.join(data_dir, name)
         if not os.path.isfile(path):
             continue
+        created_at = parse_account_file_created_at(name, path)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 for line_no, line in enumerate(f, start=1):
                     account = parse_registered_account_line(
-                        line, source=name, line_no=line_no, include_sso=include_sso
+                        line,
+                        source=name,
+                        line_no=line_no,
+                        include_sso=include_sso,
+                        created_at=created_at,
                     )
                     if account:
                         attach_account_status(account, statuses)

@@ -74,24 +74,27 @@ const tabButtons = Array.from(document.querySelectorAll("[data-tab-target]"));
 const tabPanels = Array.from(document.querySelectorAll("[data-tab-panel]"));
 
 const ACCOUNT_TABLE_PREFS_KEY = "grok-reg.accounts.table";
-const ACCOUNT_TABLE_PREFS_VERSION = 3;
+const ACCOUNT_TABLE_PREFS_VERSION = 4;
 const ACCOUNT_COLUMNS = [
   { key: "select", label: "选择", locked: true },
-  { key: "email", label: "邮箱", className: "email-column" },
-  { key: "sso", label: "SSO 摘要", className: "token-column" },
-  { key: "refresh", label: "Refresh Token", className: "token-column" },
-  { key: "source", label: "来源文件", className: "source-column" },
-  { key: "index", label: "序号" },
-  { key: "password", label: "密码" },
-  { key: "health", label: "健康状态", className: "status-column" },
-  { key: "grok2api", label: "grok2api", className: "status-column" },
-  { key: "sub2api", label: "sub2api", className: "status-column" },
-  { key: "cpa", label: "CPA", className: "status-column" },
+  { key: "created", label: "创建时间", className: "time-column", sortable: true, sortType: "time" },
+  { key: "email", label: "邮箱", className: "email-column", sortable: true, sortType: "string" },
+  { key: "sso", label: "SSO 摘要", className: "token-column", sortable: true, sortType: "string" },
+  { key: "refresh", label: "Refresh Token", className: "token-column", sortable: true, sortType: "string" },
+  { key: "source", label: "来源文件", className: "source-column", sortable: true, sortType: "string" },
+  { key: "index", label: "序号", sortable: true, sortType: "number" },
+  { key: "password", label: "密码", sortable: true, sortType: "string" },
+  { key: "health", label: "健康状态", className: "status-column", sortable: true, sortType: "string" },
+  { key: "grok2api", label: "grok2api", className: "status-column", sortable: true, sortType: "string" },
+  { key: "sub2api", label: "sub2api", className: "status-column", sortable: true, sortType: "string" },
+  { key: "cpa", label: "CPA", className: "status-column", sortable: true, sortType: "string" },
 ];
 const STATUS_COLUMN_KEYS = new Set(["health", "grok2api", "sub2api", "cpa"]);
 const DEFAULT_ACCOUNT_TABLE_PREFS = {
   visibleColumns: ACCOUNT_COLUMNS.map((column) => column.key),
   pageSize: 20,
+  sortKey: "created",
+  sortDir: "desc",
   version: ACCOUNT_TABLE_PREFS_VERSION,
 };
 
@@ -103,6 +106,8 @@ let accountPage = 1;
 let accountSearchQuery = "";
 let accountPushFilterValue = "all";
 let accountTablePrefs = loadAccountTablePrefs();
+let accountSortKey = accountTablePrefs.sortKey || "created";
+let accountSortDir = accountTablePrefs.sortDir === "asc" ? "asc" : "desc";
 let selectedAccountIdsSet = new Set();
 let accountHealthStatus = {};
 let accountPushStatus = {};
@@ -579,19 +584,30 @@ function loadAccountTablePrefs() {
       ? saved.visibleColumns
           .map((key) => (key === "line" ? "index" : key))
           .filter((key) => allowedColumns.has(key))
-      : DEFAULT_ACCOUNT_TABLE_PREFS.visibleColumns;
+      : DEFAULT_ACCOUNT_TABLE_PREFS.visibleColumns.slice();
     if (Number(saved.version || 1) < 2 && !visibleColumns.includes("health")) {
       visibleColumns.push("health");
     }
     if (Number(saved.version || 1) < 3 && !visibleColumns.includes("cpa")) {
       visibleColumns.push("cpa");
     }
+    if (Number(saved.version || 1) < 4 && !visibleColumns.includes("created")) {
+      const emailIdx = visibleColumns.indexOf("email");
+      if (emailIdx >= 0) visibleColumns.splice(emailIdx, 0, "created");
+      else visibleColumns.push("created");
+    }
     const pageSize = [10, 20, 50, 100].includes(Number(saved.pageSize))
       ? Number(saved.pageSize)
       : DEFAULT_ACCOUNT_TABLE_PREFS.pageSize;
+    const sortKey = allowedColumns.has(saved.sortKey) && saved.sortKey !== "select"
+      ? saved.sortKey
+      : DEFAULT_ACCOUNT_TABLE_PREFS.sortKey;
+    const sortDir = saved.sortDir === "asc" ? "asc" : "desc";
     return {
       visibleColumns: visibleColumns.includes("select") ? visibleColumns : ["select", ...visibleColumns],
       pageSize,
+      sortKey,
+      sortDir,
       version: ACCOUNT_TABLE_PREFS_VERSION,
     };
   } catch (error) {
@@ -600,6 +616,9 @@ function loadAccountTablePrefs() {
 }
 
 function saveAccountTablePrefs() {
+  accountTablePrefs.sortKey = accountSortKey;
+  accountTablePrefs.sortDir = accountSortDir;
+  accountTablePrefs.version = ACCOUNT_TABLE_PREFS_VERSION;
   localStorage.setItem(ACCOUNT_TABLE_PREFS_KEY, JSON.stringify(accountTablePrefs));
 }
 
@@ -641,14 +660,94 @@ function accountHasPushFailure(account) {
   return false;
 }
 
+function formatAccountCreatedAt(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "—";
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(raw)) {
+    return raw.replace("T", " ").slice(0, 19);
+  }
+  return raw;
+}
+
+function accountSortValue(account, key) {
+  if (key === "created") return String(account.created_at || "");
+  if (key === "email") return String(account.email || "").toLowerCase();
+  if (key === "sso") return String(account.sso_preview || "").toLowerCase();
+  if (key === "refresh") {
+    return account.has_refresh_token
+      ? `1:${String(account.refresh_token_preview || "").toLowerCase()}`
+      : "0:";
+  }
+  if (key === "source") return String(account.source_file || "").toLowerCase();
+  if (key === "index") return Number(account.line_no || 0);
+  if (key === "password") return account.password ? "1" : "0";
+  if (key === "health") {
+    return String(accountHealthStatus[account.id] || account.health_status_text || account.health_status || "").toLowerCase();
+  }
+  if (key === "grok2api") {
+    return String(
+      accountGrok2apiPushStatus[account.id] ||
+        account.grok2api_status_text ||
+        account.grok2api_status ||
+        ""
+    ).toLowerCase();
+  }
+  if (key === "sub2api") {
+    return String(
+      accountPushStatus[account.id] || account.sub2api_status_text || account.sub2api_status || ""
+    ).toLowerCase();
+  }
+  if (key === "cpa") {
+    return String(
+      accountCpaPushStatus[account.id] || account.cpa_status_text || account.cpa_status || ""
+    ).toLowerCase();
+  }
+  return "";
+}
+
+function compareAccountSort(a, b, key, dir) {
+  const col = ACCOUNT_COLUMNS.find((c) => c.key === key);
+  const type = (col && col.sortType) || "string";
+  const av = accountSortValue(a, key);
+  const bv = accountSortValue(b, key);
+  let cmp = 0;
+  if (type === "number") {
+    cmp = Number(av || 0) - Number(bv || 0);
+  } else if (type === "time") {
+    cmp = String(av || "").localeCompare(String(bv || ""));
+  } else {
+    cmp = String(av || "").localeCompare(String(bv || ""), "zh-CN", { numeric: true, sensitivity: "base" });
+  }
+  if (cmp === 0) {
+    const t = String(a.created_at || "").localeCompare(String(b.created_at || ""));
+    if (t !== 0) cmp = t;
+    else cmp = Number(b.line_no || 0) - Number(a.line_no || 0);
+  }
+  return dir === "asc" ? cmp : -cmp;
+}
+
+function setAccountSort(key) {
+  if (!key || key === "select") return;
+  if (accountSortKey === key) {
+    accountSortDir = accountSortDir === "asc" ? "desc" : "asc";
+  } else {
+    accountSortKey = key;
+    accountSortDir = key === "created" || key === "index" ? "desc" : "asc";
+  }
+  saveAccountTablePrefs();
+  accountPage = 1;
+  renderAccounts();
+}
+
 function filteredAccounts() {
   const q = String(accountSearchQuery || "").trim().toLowerCase();
   const filter = accountPushFilterValue || "all";
-  return accounts.filter((account) => {
+  const list = accounts.filter((account) => {
     if (q) {
       const hay = [
         account.email,
         account.source_file,
+        account.created_at,
         account.sso_preview,
         account.grok2api_status_text,
         account.sub2api_status_text,
@@ -683,6 +782,9 @@ function filteredAccounts() {
     if (filter === "failed") return accountHasPushFailure(account);
     return true;
   });
+  const key = accountSortKey || "created";
+  const dir = accountSortDir === "asc" ? "asc" : "desc";
+  return list.slice().sort((a, b) => compareAccountSort(a, b, key, dir));
 }
 
 function accountTotalPages() {
@@ -727,8 +829,28 @@ function renderAccountsHead() {
   const row = document.createElement("tr");
   for (const column of visibleAccountColumns()) {
     const cell = document.createElement("th");
-    cell.textContent = column.label;
     if (column.className) cell.className = column.className;
+    if (column.sortable) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "th-sort";
+      if (accountSortKey === column.key) {
+        btn.classList.add("active");
+        btn.dataset.dir = accountSortDir;
+      }
+      const label = document.createElement("span");
+      label.textContent = column.label;
+      const mark = document.createElement("i");
+      mark.className = "sort-mark";
+      mark.textContent =
+        accountSortKey === column.key ? (accountSortDir === "asc" ? "↑" : "↓") : "↕";
+      btn.append(label, mark);
+      btn.title = "点击排序";
+      btn.addEventListener("click", () => setAccountSort(column.key));
+      cell.appendChild(btn);
+    } else {
+      cell.textContent = column.label;
+    }
     row.appendChild(cell);
   }
   accountsHead.innerHTML = "";
@@ -748,11 +870,12 @@ function accountCellValue(account, key, rowNumber) {
   const persistedHealthStatus = account.health_status_text || "未检查";
   const healthStatus = accountHealthStatus[account.id] || persistedHealthStatus;
   const values = {
+    created: formatAccountCreatedAt(account.created_at),
     email: account.email,
     sso: account.sso_preview || "",
     refresh: refreshStatus,
     source: account.source_file || "",
-    index: rowNumber,
+    index: key === "index" ? Number(account.line_no || rowNumber) : rowNumber,
     password: account.password ? "已保存" : "-",
     health: healthStatus,
     grok2api: grok2apiStatus,
@@ -1618,6 +1741,9 @@ function renderAccounts() {
         }
       } else {
         cell.textContent = rawText;
+        if (column.key === "created" && account.created_at) {
+          cell.title = account.created_at;
+        }
       }
       if (column.className) cell.className = `${cell.className} ${column.className}`.trim();
       row.appendChild(cell);

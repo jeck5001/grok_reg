@@ -883,6 +883,16 @@ def test_list_registered_accounts_reads_accounts_files(monkeypatch, tmp_path):
     assert accounts[1]["refresh_token_preview"] == "refres...oken-2"
     assert accounts[0]["line_no"] == 1
     assert accounts[1]["line_no"] == 3
+    assert accounts[0]["created_at"] == "2026-06-30T14:00:00"
+    assert accounts[1]["created_at"] == "2026-06-30T14:00:00"
+
+
+def test_parse_account_file_created_at_from_name():
+    assert (
+        reg.parse_account_file_created_at("accounts_20260715_101204_6217b28c.txt")
+        == "2026-07-15T10:12:04"
+    )
+    assert reg.parse_account_file_created_at("notes.txt") == ""
 
 
 def test_list_registered_accounts_merges_persisted_sub2api_status(monkeypatch, tmp_path):

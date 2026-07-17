@@ -471,3 +471,95 @@ def test_job_status_and_logs(monkeypatch, tmp_path):
     tail = client.get(f"/api/jobs/{job_id}/logs", params={"offset": payload["next_offset"]})
     assert tail.status_code == 200
     assert tail.json()["lines"] == []
+
+
+def test_ops_war_room_shape(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    import mail_domain_pool as mdp
+    import web_app as web
+
+    mdp.reset_runtime()
+    monkeypatch.setattr(
+        web.reg,
+        "load_config",
+        lambda: {
+            "email_provider": "cloudmail",
+            "mail_domains": "a.example,b.example",
+            "enable_mail_domain_runtime_control": True,
+            "turnstile_solver_enabled": True,
+            "turnstile_solver_url": "http://127.0.0.1:5072",
+            "turnstile_solver_fallback_click": True,
+            "register_count": 3,
+            "register_threads": 1,
+            "signup_mode": "http",
+            "proxy": "",
+        },
+    )
+    monkeypatch.setattr(web.reg, "list_registered_accounts", lambda include_sso=False: [])
+    monkeypatch.setattr(
+        web.reg,
+        "probe_local_turnstile_solver",
+        lambda force=False, timeout=2.0: False,
+    )
+    monkeypatch.setattr(
+        web.reg,
+        "normalize_turnstile_solver_url",
+        lambda url=None: "http://127.0.0.1:5072",
+    )
+    monkeypatch.setattr(
+        web,
+        "_current_job_payload",
+        lambda: {
+            "has_job": False,
+            "job_id": None,
+            "status": "idle",
+            "running": False,
+            "success_count": 0,
+            "fail_count": 0,
+            "register_count": 3,
+        },
+    )
+
+    client = TestClient(web.app)
+    response = client.get("/api/ops/war-room")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert "job" in payload
+    assert "inventory" in payload
+    assert "domains" in payload
+    assert "solver" in payload
+    assert "failures" in payload
+    assert "charts" in payload
+    assert "alerts" in payload
+    assert "runtime" in payload
+    assert payload["solver"]["enabled"] is True
+    assert payload["solver"]["reachable"] is False
+    assert payload["domains"]["ok"] is True
+    assert payload["domains"]["total_count"] == 2
+    assert payload["runtime"]["signup_mode"] in {"http", "api", "browser", "auto"}
+    assert "timeline" in payload["charts"]
+    assert "fail_stack" in payload["charts"]
+    assert "reason_keys" in payload["charts"]
+
+
+def test_build_chart_series_from_logs():
+    import web_app as web
+
+    lines = [
+        "[10:00:01] [+] 注册成功: a@x.com",
+        "[10:00:12] [-] 注册失败: 未收到验证码",
+        "[10:00:20] [+] 注册成功: b@x.com",
+        "[10:01:05] [!] 域名被拒，仅冷却主域: bad.com",
+        "[10:01:08] [-] 注册失败: Turnstile Solver 不可达",
+        "[10:01:30] [+] 注册成功: c@x.com",
+    ]
+    charts = web._build_chart_series(lines)
+    assert charts["event_count"] == 6
+    assert len(charts["timeline"]) == 6
+    assert charts["timeline"][-1]["cum_success"] == 3
+    assert charts["timeline"][-1]["cum_fail"] == 3
+    assert charts["timeline"][-1]["success_rate"] == 50.0
+    assert charts["reason_keys"]
+    assert charts["fail_stack"]
+    assert any(row.get("total", 0) > 0 for row in charts["fail_stack"])

@@ -27,6 +27,33 @@ const dashboardPipeline = document.querySelector("#dashboardPipeline");
 const dashboardHealthMix = document.querySelector("#dashboardHealthMix");
 const dashboardPushMix = document.querySelector("#dashboardPushMix");
 const dashboardSources = document.querySelector("#dashboardSources");
+const warAlerts = document.querySelector("#warAlerts");
+const warFailMix = document.querySelector("#warFailMix");
+const warDomainHeat = document.querySelector("#warDomainHeat");
+const warFailFeed = document.querySelector("#warFailFeed");
+const warRuntimeChips = document.querySelector("#warRuntimeChips");
+const warRecentLogs = document.querySelector("#warRecentLogs");
+const warProgressText = document.querySelector("#warProgressText");
+const warProgressSub = document.querySelector("#warProgressSub");
+const warRateChart = document.querySelector("#warRateChart");
+const warStackChart = document.querySelector("#warStackChart");
+const warRateChartMeta = document.querySelector("#warRateChartMeta");
+const warStackChartMeta = document.querySelector("#warStackChartMeta");
+const warStackLegend = document.querySelector("#warStackLegend");
+const warInventorySub = document.querySelector("#warInventorySub");
+const warSolverState = document.querySelector("#warSolverState");
+const warSolverSub = document.querySelector("#warSolverSub");
+const warSolverTile = document.querySelector("#warSolverTile");
+const warDomainAvailable = document.querySelector("#warDomainAvailable");
+const warDomainSub = document.querySelector("#warDomainSub");
+const warDomainTile = document.querySelector("#warDomainTile");
+const warDomainPin = document.querySelector("#warDomainPin");
+const warThroughputText = document.querySelector("#warThroughputText");
+const warEtaText = document.querySelector("#warEtaText");
+const warGeneratedAt = document.querySelector("#warGeneratedAt");
+const warRefreshBtn = document.querySelector("#warRefreshBtn");
+const warStopBtn = document.querySelector("#warStopBtn");
+const warResetDomainsBtn = document.querySelector("#warResetDomainsBtn");
 const selectPageAccounts = document.querySelector("#selectPageAccounts");
 const accountPageSize = document.querySelector("#accountPageSize");
 const accountSearchInput = document.querySelector("#accountSearchInput");
@@ -77,6 +104,34 @@ let accountCpaPushStatus = {};
 let pushingToSub2api = false;
 let pushingToGrok2api = false;
 let pushingToCpa = false;
+let warRoomTimer = null;
+let warRoomSnapshot = null;
+
+const FAIL_REASON_LABELS = {
+  domain_rejected: "域名拒收",
+  otp_missing: "验证码缺失",
+  create_code: "发码失败",
+  turnstile: "Turnstile",
+  blocked: "账号封禁",
+  rate_limited: "限流 429",
+  session_lost: "会话丢失",
+  network: "网络/超时",
+  email_provider: "邮箱服务",
+  other: "其他",
+};
+
+const FAIL_REASON_COLORS = {
+  domain_rejected: "#ff6d4d",
+  otp_missing: "#ff9f43",
+  create_code: "#feca57",
+  turnstile: "#54a0ff",
+  blocked: "#ff3838",
+  rate_limited: "#a55eea",
+  session_lost: "#2e86de",
+  network: "#10ac84",
+  email_provider: "#48dbfb",
+  other: "#8395a7",
+};
 
 function setMessage(text) {
   message.textContent = text || "";
@@ -93,6 +148,12 @@ function activateTab(name) {
   });
   if (name === "accounts" || name === "dashboard") {
     loadAccounts().catch((error) => setMessage(error.message));
+  }
+  if (name === "dashboard") {
+    startWarRoomPolling();
+    loadWarRoom().catch((error) => setMessage(error.message));
+  } else {
+    stopWarRoomPolling();
   }
 }
 
@@ -425,7 +486,7 @@ async function pollJob() {
     pollTimer = null;
     loadAccounts().catch((error) => setMessage(error.message));
   }
-  renderDashboard();
+  loadWarRoom({ silent: true }).catch(() => renderDashboard());
 }
 
 async function restoreCurrentJob({ silent = false } = {}) {
@@ -777,7 +838,469 @@ function renderMixRow(parent, label, value, total, tone = "") {
   parent.appendChild(row);
 }
 
+function formatDuration(sec) {
+  const n = Number(sec);
+  if (!Number.isFinite(n) || n < 0) return "—";
+  if (n < 60) return `${Math.round(n)}s`;
+  if (n < 3600) return `${Math.floor(n / 60)}m ${Math.round(n % 60)}s`;
+  const h = Math.floor(n / 3600);
+  const m = Math.floor((n % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+
+function chartEmpty(el, text) {
+  if (!el) return;
+  el.innerHTML = "";
+  const p = document.createElement("p");
+  p.className = "dashboard-empty chart-empty";
+  p.textContent = text;
+  el.appendChild(p);
+}
+
+function renderSuccessRateChart(timeline) {
+  if (!warRateChart) return;
+  const points = Array.isArray(timeline) ? timeline : [];
+  if (!points.length) {
+    chartEmpty(warRateChart, "暂无注册事件，跑任务后显示成功率曲线");
+    if (warRateChartMeta) warRateChartMeta.textContent = "0 事件";
+    return;
+  }
+  const w = 560;
+  const h = 200;
+  const padL = 36;
+  const padR = 12;
+  const padT = 16;
+  const padB = 28;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+  const n = points.length;
+  const xs = points.map((_, i) => padL + (n === 1 ? plotW / 2 : (i / (n - 1)) * plotW));
+  const ys = points.map((p) => {
+    const rate = Math.max(0, Math.min(100, Number(p.success_rate) || 0));
+    return padT + plotH * (1 - rate / 100);
+  });
+  const line = xs.map((x, i) => `${i === 0 ? "M" : "L"}${x.toFixed(1)},${ys[i].toFixed(1)}`).join(" ");
+  const area = `${line} L${xs[n - 1].toFixed(1)},${(padT + plotH).toFixed(1)} L${xs[0].toFixed(1)},${(padT + plotH).toFixed(1)} Z`;
+  const last = points[n - 1];
+  const gridY = [0, 25, 50, 75, 100]
+    .map((v) => {
+      const y = padT + plotH * (1 - v / 100);
+      return `<line x1="${padL}" y1="${y}" x2="${w - padR}" y2="${y}" class="chart-grid"/>
+        <text x="${padL - 6}" y="${y + 3}" class="chart-axis" text-anchor="end">${v}</text>`;
+    })
+    .join("");
+  const dots = xs
+    .map((x, i) => {
+      const kind = points[i].kind === "success" ? "ok" : "bad";
+      return `<circle cx="${x.toFixed(1)}" cy="${ys[i].toFixed(1)}" r="3.2" class="chart-dot ${kind}"><title>${points[i].t} · ${points[i].success_rate}% · ${points[i].kind}</title></circle>`;
+    })
+    .join("");
+  const labelIdx = [0, Math.floor((n - 1) / 2), n - 1].filter((v, i, a) => a.indexOf(v) === i);
+  const xLabels = labelIdx
+    .map((i) => {
+      const label = String(points[i].t || "").slice(0, 8);
+      return `<text x="${xs[i].toFixed(1)}" y="${h - 8}" class="chart-axis" text-anchor="middle">${label}</text>`;
+    })
+    .join("");
+
+  warRateChart.innerHTML = `
+    <svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" class="chart-svg">
+      ${gridY}
+      <path d="${area}" class="chart-area"/>
+      <path d="${line}" class="chart-line"/>
+      ${dots}
+      ${xLabels}
+    </svg>`;
+  if (warRateChartMeta) {
+    warRateChartMeta.textContent = `${n} 事件 · 当前 ${last.success_rate}% · ✓${last.cum_success} / ✗${last.cum_fail}`;
+  }
+}
+
+function renderFailStackChart(stack, reasonKeys) {
+  if (!warStackChart) return;
+  const rows = Array.isArray(stack) ? stack : [];
+  const keys = Array.isArray(reasonKeys) && reasonKeys.length
+    ? reasonKeys
+    : Array.from(
+        new Set(
+          rows.flatMap((r) => Object.keys(r).filter((k) => k !== "bucket" && k !== "total"))
+        )
+      );
+  if (!rows.length || !keys.length) {
+    chartEmpty(warStackChart, "暂无失败堆叠数据");
+    if (warStackChartMeta) warStackChartMeta.textContent = "0 桶";
+    if (warStackLegend) warStackLegend.innerHTML = "";
+    return;
+  }
+  const w = 560;
+  const h = 200;
+  const padL = 28;
+  const padR = 12;
+  const padT = 12;
+  const padB = 28;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+  const maxTotal = Math.max(1, ...rows.map((r) => Number(r.total) || 0));
+  const gap = 4;
+  const barW = Math.max(8, (plotW - gap * Math.max(0, rows.length - 1)) / rows.length);
+  const bars = rows
+    .map((row, i) => {
+      const x = padL + i * (barW + gap);
+      let y = padT + plotH;
+      const segs = [];
+      for (const key of keys) {
+        const count = Number(row[key] || 0);
+        if (!count) continue;
+        const segH = (count / maxTotal) * plotH;
+        y -= segH;
+        const color = FAIL_REASON_COLORS[key] || FAIL_REASON_COLORS.other;
+        segs.push(
+          `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(1, segH).toFixed(1)}" fill="${color}" rx="2"><title>${row.bucket} · ${FAIL_REASON_LABELS[key] || key}: ${count}</title></rect>`
+        );
+      }
+      const label = String(row.bucket || "").slice(0, 5);
+      const showLabel = rows.length <= 12 || i % Math.ceil(rows.length / 6) === 0 || i === rows.length - 1;
+      const text = showLabel
+        ? `<text x="${(x + barW / 2).toFixed(1)}" y="${h - 8}" class="chart-axis" text-anchor="middle">${label}</text>`
+        : "";
+      return segs.join("") + text;
+    })
+    .join("");
+  const grid = [0, 0.5, 1]
+    .map((f) => {
+      const y = padT + plotH * (1 - f);
+      const val = Math.round(maxTotal * f);
+      return `<line x1="${padL}" y1="${y}" x2="${w - padR}" y2="${y}" class="chart-grid"/>
+        <text x="${padL - 4}" y="${y + 3}" class="chart-axis" text-anchor="end">${val}</text>`;
+    })
+    .join("");
+
+  warStackChart.innerHTML = `
+    <svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" class="chart-svg">
+      ${grid}
+      ${bars}
+    </svg>`;
+  if (warStackChartMeta) {
+    const totalFails = rows.reduce((s, r) => s + (Number(r.total) || 0), 0);
+    warStackChartMeta.textContent = `${rows.length} 桶 · ${totalFails} 次失败`;
+  }
+  if (warStackLegend) {
+    warStackLegend.innerHTML = "";
+    for (const key of keys) {
+      const item = document.createElement("span");
+      item.className = "legend-item";
+      const sw = document.createElement("i");
+      sw.style.background = FAIL_REASON_COLORS[key] || FAIL_REASON_COLORS.other;
+      const lab = document.createElement("em");
+      lab.textContent = FAIL_REASON_LABELS[key] || key;
+      item.append(sw, lab);
+      warStackLegend.appendChild(item);
+    }
+  }
+}
+
+function renderWarCharts(data) {
+  const charts = (data && data.charts) || (data && data.failures && data.failures.charts) || {};
+  renderSuccessRateChart(charts.timeline || []);
+  renderFailStackChart(charts.fail_stack || [], charts.reason_keys || []);
+}
+
+function startWarRoomPolling() {
+  if (warRoomTimer) clearInterval(warRoomTimer);
+  warRoomTimer = setInterval(() => {
+    loadWarRoom({ silent: true }).catch(() => {});
+  }, 2500);
+}
+
+function stopWarRoomPolling() {
+  if (warRoomTimer) {
+    clearInterval(warRoomTimer);
+    warRoomTimer = null;
+  }
+}
+
+async function loadWarRoom({ silent = false } = {}) {
+  const data = await requestJson("/api/ops/war-room");
+  warRoomSnapshot = data;
+  renderWarRoom(data);
+  if (!silent && data.job && data.job.job_id && data.job.running) {
+    rememberJobId(data.job.job_id);
+  }
+  return data;
+}
+
+function renderWarRoom(data) {
+  if (!data || !data.ok) return;
+  const job = data.job || {};
+  const inv = data.inventory || {};
+  const thr = data.throughput || {};
+  const solver = data.solver || {};
+  const domains = data.domains || {};
+  const failures = data.failures || {};
+  const runtime = data.runtime || {};
+
+  const success = Number(job.success_count || 0);
+  const fail = Number(job.fail_count || 0);
+  const target = Number(job.register_count || runtime.register_count || 0);
+  const running = Boolean(job.running);
+
+  if (dashboardStatusText) {
+    dashboardStatusText.textContent = job.status || statusText.textContent || "idle";
+    dashboardStatusText.classList.toggle("is-running", running);
+  }
+  if (dashboardRunNote) {
+    dashboardRunNote.textContent = `成功 ${success} / 失败 ${fail}${target ? ` · 目标 ${target}` : ""}`;
+  }
+  if (statusText && job.status) statusText.textContent = job.status;
+  if (statsText) statsText.textContent = `成功 ${success} / 失败 ${fail}`;
+  if (warStopBtn) warStopBtn.disabled = !running;
+
+  if (warProgressText) warProgressText.textContent = `${success}/${target || "—"}`;
+  if (warProgressSub) {
+    const rate = thr.success_rate != null ? `${thr.success_rate}%` : "—";
+    const elapsed = thr.elapsed_sec != null ? formatDuration(thr.elapsed_sec) : "—";
+    warProgressSub.textContent = `成功率 ${rate} · 已运行 ${elapsed}`;
+  }
+  if (warThroughputText) {
+    warThroughputText.textContent =
+      thr.rate_per_min != null ? `产能 ${thr.rate_per_min}/min` : "产能 —";
+  }
+  if (warEtaText) {
+    warEtaText.textContent = thr.eta_sec != null ? `ETA ${formatDuration(thr.eta_sec)}` : "ETA —";
+  }
+
+  dashboardMetricValue(dashboardTotalAccounts, inv.total || 0);
+  dashboardMetricValue(dashboardRefreshAccounts, inv.refresh || 0);
+  dashboardMetricValue(dashboardHealthyAccounts, inv.healthy || 0);
+  dashboardMetricValue(dashboardNeedActionAccounts, inv.need_action || 0);
+  if (warInventorySub) {
+    warInventorySub.textContent = `Refresh ${inv.refresh || 0} · 需处理 ${inv.need_action || 0}`;
+  }
+
+  if (warSolverState) {
+    if (!solver.enabled) warSolverState.textContent = "关";
+    else warSolverState.textContent = solver.reachable ? "在线" : "离线";
+  }
+  if (warSolverSub) {
+    const lat = solver.latency_ms != null ? `${solver.latency_ms}ms` : "—";
+    warSolverSub.textContent = solver.enabled
+      ? `${solver.reachable ? "可达" : "不可达"} · ${lat}`
+      : "已禁用";
+  }
+  if (warSolverTile) {
+    warSolverTile.classList.toggle("metric-ok", Boolean(solver.enabled && solver.reachable));
+    warSolverTile.classList.toggle("metric-alert", Boolean(solver.enabled && !solver.reachable));
+  }
+
+  if (warDomainAvailable) warDomainAvailable.textContent = String(domains.available_count ?? 0);
+  if (warDomainSub) {
+    warDomainSub.textContent = `冷却 ${domains.cooldown_count || 0} · 禁用 ${domains.disabled_count || 0}`;
+  }
+  if (warDomainTile) {
+    const avail = Number(domains.available_count || 0);
+    const total = Number(domains.total_count || 0);
+    warDomainTile.classList.toggle("metric-alert", total > 0 && avail === 0);
+    warDomainTile.classList.toggle("metric-ok", avail > 0);
+  }
+  if (warDomainPin) {
+    warDomainPin.textContent = domains.pinpoint_domain
+      ? `黄金矿工: ${domains.pinpoint_domain}`
+      : domains.grouping
+        ? "分组调度开启"
+        : "";
+  }
+  if (warGeneratedAt) warGeneratedAt.textContent = data.generated_at || "";
+
+  if (warAlerts) {
+    warAlerts.innerHTML = "";
+    for (const alert of data.alerts || []) {
+      const el = document.createElement("div");
+      el.className = `alert-chip level-${alert.level || "info"}`;
+      el.textContent = alert.text || "";
+      warAlerts.appendChild(el);
+    }
+    if (!(data.alerts || []).length) {
+      const el = document.createElement("div");
+      el.className = "alert-chip level-ok";
+      el.textContent = "态势正常";
+      warAlerts.appendChild(el);
+    }
+  }
+
+  if (dashboardPipeline) {
+    dashboardPipeline.innerHTML = "";
+    const total = Number(inv.total || 0);
+    const flow = [
+      ["注册账号", total, "账号池总量"],
+      ["Refresh Token", inv.refresh || 0, "可推送 sub2api"],
+      ["健康可用", inv.healthy || 0, "最近检查通过"],
+      ["grok2api", inv.grok2api || 0, "远端已入池"],
+      ["sub2api", inv.sub2api || 0, "远端已导入"],
+    ];
+    for (const [label, value, caption] of flow) {
+      const step = document.createElement("div");
+      step.className = "flow-step";
+      step.style.setProperty("--flow-percent", percentText(value, total));
+      const name = document.createElement("span");
+      name.textContent = label;
+      const number = document.createElement("strong");
+      number.textContent = String(value);
+      const note = document.createElement("small");
+      note.textContent = `${caption} · ${percentText(value, total)}`;
+      const line = document.createElement("i");
+      step.append(name, number, note, line);
+      dashboardPipeline.appendChild(step);
+    }
+  }
+
+  if (warFailMix) {
+    warFailMix.innerHTML = "";
+    const reasons = failures.reasons || [];
+    if (!reasons.length) {
+      const empty = document.createElement("p");
+      empty.className = "dashboard-empty";
+      empty.textContent = "暂无失败信号（运行任务后根据日志归因）";
+      warFailMix.appendChild(empty);
+    } else {
+      const totalFail = reasons.reduce((s, r) => s + Number(r.count || 0), 0);
+      for (const row of reasons) {
+        const label = FAIL_REASON_LABELS[row.reason] || row.reason;
+        renderMixRow(warFailMix, label, row.count, totalFail, "bad");
+      }
+    }
+  }
+
+  if (dashboardHealthMix) {
+    dashboardHealthMix.innerHTML = "";
+    const total = Number(inv.total || 0);
+    renderMixRow(dashboardHealthMix, "可用", inv.healthy || 0, total, "ok");
+    renderMixRow(dashboardHealthMix, "未检查", inv.untested || 0, total);
+    renderMixRow(dashboardHealthMix, "资料不完整", inv.incomplete || 0, total, "warn");
+    renderMixRow(dashboardHealthMix, "失效", inv.unhealthy || 0, total, "bad");
+  }
+
+  if (dashboardPushMix) {
+    dashboardPushMix.innerHTML = "";
+    const total = Number(inv.total || 0);
+    renderMixRow(dashboardPushMix, "grok2api 已推送", inv.grok2api || 0, total, "ok");
+    renderMixRow(dashboardPushMix, "sub2api 已推送", inv.sub2api || 0, total, "ok");
+    renderMixRow(dashboardPushMix, "CPA 已推送", inv.cpa || 0, total, "ok");
+    renderMixRow(dashboardPushMix, "Refresh Token 覆盖", inv.refresh || 0, total);
+  }
+
+  if (warDomainHeat) {
+    warDomainHeat.innerHTML = "";
+    const rows = domains.domains || [];
+    if (!rows.length) {
+      const empty = document.createElement("p");
+      empty.className = "dashboard-empty";
+      empty.textContent = domains.ok === false
+        ? `域名池读取失败: ${domains.error || "unknown"}`
+        : "未配置 mail_domains / defaultDomains，或池为空";
+      warDomainHeat.appendChild(empty);
+    } else {
+      for (const d of rows) {
+        const card = document.createElement("button");
+        card.type = "button";
+        card.className = "domain-chip";
+        if (d.is_disabled) card.classList.add("is-disabled");
+        else if ((d.cooldown_remaining_sec || 0) > 0) card.classList.add("is-cool");
+        else if (d.is_available) card.classList.add("is-ok");
+        else card.classList.add("is-bad");
+        const title = document.createElement("strong");
+        title.textContent = d.domain || "—";
+        const meta = document.createElement("span");
+        const cool = Number(d.cooldown_remaining_sec || 0);
+        meta.textContent = cool > 0
+          ? `冷却 ${formatDuration(cool)} · 成功 ${d.success_count || 0}`
+          : `✓${d.success_count || 0}  ✗${d.fail_count || 0}  pick ${d.pick_count || 0}`;
+        card.append(title, meta);
+        card.title = "点击清除该域计数/冷却";
+        card.addEventListener("click", () => {
+          clearWarDomain(d.domain).catch((error) => setMessage(error.message));
+        });
+        warDomainHeat.appendChild(card);
+      }
+    }
+  }
+
+  if (warFailFeed) {
+    warFailFeed.innerHTML = "";
+    const items = failures.recent_fails || [];
+    if (!items.length) {
+      const empty = document.createElement("p");
+      empty.className = "dashboard-empty";
+      empty.textContent = "暂无失败条目";
+      warFailFeed.appendChild(empty);
+    } else {
+      for (const item of items.slice().reverse()) {
+        const row = document.createElement("div");
+        row.className = "fail-item";
+        const tag = document.createElement("span");
+        tag.className = "fail-tag";
+        tag.textContent = FAIL_REASON_LABELS[item.reason] || item.reason || "other";
+        const line = document.createElement("code");
+        line.textContent = item.line || "";
+        row.append(tag, line);
+        warFailFeed.appendChild(row);
+      }
+    }
+  }
+
+  if (warRuntimeChips) {
+    warRuntimeChips.innerHTML = "";
+    const chips = [
+      ["模式", runtime.signup_mode || "—"],
+      ["邮箱", runtime.email_provider || "—"],
+      ["并发", String(runtime.register_threads ?? "—")],
+      ["代理", runtime.proxy_configured ? "已配" : "直连"],
+      ["Solver", runtime.turnstile_solver_enabled ? "开" : "关"],
+      ["Job", job.job_id ? String(job.job_id).slice(0, 8) : "—"],
+    ];
+    for (const [k, v] of chips) {
+      const chip = document.createElement("div");
+      chip.className = "runtime-chip";
+      chip.innerHTML = `<span>${k}</span><strong>${v}</strong>`;
+      warRuntimeChips.appendChild(chip);
+    }
+  }
+
+  if (dashboardSources) {
+    dashboardSources.innerHTML = "";
+    const sources = inv.sources || [];
+    if (!sources.length) {
+      const empty = document.createElement("p");
+      empty.className = "dashboard-empty";
+      empty.textContent = "暂无账号批次";
+      dashboardSources.appendChild(empty);
+    } else {
+      for (const src of sources) {
+        const item = document.createElement("div");
+        item.className = "source-item";
+        const name = document.createElement("span");
+        name.textContent = src.source || "未知";
+        const value = document.createElement("strong");
+        value.textContent = `${src.count || 0} 个`;
+        item.append(name, value);
+        dashboardSources.appendChild(item);
+      }
+    }
+  }
+
+  if (warRecentLogs) {
+    const lines = data.recent_logs || [];
+    warRecentLogs.textContent = lines.length ? lines.join("\n") : "暂无任务日志";
+    warRecentLogs.scrollTop = warRecentLogs.scrollHeight;
+  }
+
+  renderWarCharts(data);
+}
+
 function renderDashboard() {
+  if (warRoomSnapshot) {
+    renderWarRoom(warRoomSnapshot);
+    return;
+  }
   if (!dashboardTotalAccounts) return;
   const stats = accountDashboardStats();
   dashboardMetricValue(dashboardTotalAccounts, stats.total);
@@ -786,74 +1309,25 @@ function renderDashboard() {
   dashboardMetricValue(dashboardNeedActionAccounts, stats.needAction);
   if (dashboardStatusText) dashboardStatusText.textContent = statusText.textContent || "就绪";
   if (dashboardRunNote) dashboardRunNote.textContent = statsText.textContent || "成功 0 / 失败 0";
-
-  if (dashboardPipeline) {
-    dashboardPipeline.innerHTML = "";
-    const flow = [
-      ["注册账号", stats.total, "账号池总量"],
-      ["Refresh Token", stats.refresh, "可推送 sub2api"],
-      ["健康可用", stats.healthy, "最近检查通过"],
-      ["grok2api", stats.grok2api, "远端已入池"],
-      ["sub2api", stats.sub2api, "远端已导入"],
-    ];
-    for (const [label, value, caption] of flow) {
-      const step = document.createElement("div");
-      step.className = "flow-step";
-      step.style.setProperty("--flow-percent", percentText(value, stats.total));
-      const name = document.createElement("span");
-      name.textContent = label;
-      const number = document.createElement("strong");
-      number.textContent = String(value);
-      const note = document.createElement("small");
-      note.textContent = `${caption} · ${percentText(value, stats.total)}`;
-      const line = document.createElement("i");
-      step.append(name, number, note, line);
-      dashboardPipeline.appendChild(step);
-    }
+  if (warInventorySub) {
+    warInventorySub.textContent = `Refresh ${stats.refresh} · 需处理 ${stats.needAction}`;
   }
+}
 
-  if (dashboardHealthMix) {
-    dashboardHealthMix.innerHTML = "";
-    renderMixRow(dashboardHealthMix, "可用", stats.healthy, stats.total, "ok");
-    renderMixRow(dashboardHealthMix, "未检查", stats.untested, stats.total);
-    renderMixRow(dashboardHealthMix, "资料不完整", stats.incomplete, stats.total, "warn");
-    renderMixRow(dashboardHealthMix, "失效", stats.unhealthy, stats.total, "bad");
-  }
+async function clearWarDomain(domain) {
+  if (!domain) return;
+  await requestJson("/api/mail-domain-pool/clear-domain", {
+    method: "POST",
+    body: JSON.stringify({ domain }),
+  });
+  setMessage(`已清除域名计数: ${domain}`);
+  await loadWarRoom();
+}
 
-  if (dashboardPushMix) {
-    dashboardPushMix.innerHTML = "";
-    renderMixRow(dashboardPushMix, "grok2api 已推送", stats.grok2api, stats.total, "ok");
-    renderMixRow(dashboardPushMix, "sub2api 已推送", stats.sub2api, stats.total, "ok");
-    renderMixRow(dashboardPushMix, "Refresh Token 覆盖", stats.refresh, stats.total);
-  }
-
-  if (dashboardSources) {
-    dashboardSources.innerHTML = "";
-    const sourceCounts = new Map();
-    for (const account of accounts) {
-      const source = account.source_file || "未知来源";
-      sourceCounts.set(source, (sourceCounts.get(source) || 0) + 1);
-    }
-    const sources = Array.from(sourceCounts.entries())
-      .sort((a, b) => b[1] - a[1] || b[0].localeCompare(a[0]))
-      .slice(0, 5);
-    if (!sources.length) {
-      const empty = document.createElement("p");
-      empty.className = "dashboard-empty";
-      empty.textContent = "暂无账号批次，注册成功后这里会显示来源文件。";
-      dashboardSources.appendChild(empty);
-    }
-    for (const [source, count] of sources) {
-      const item = document.createElement("div");
-      item.className = "source-item";
-      const name = document.createElement("span");
-      name.textContent = source;
-      const value = document.createElement("strong");
-      value.textContent = `${count} 个`;
-      item.append(name, value);
-      dashboardSources.appendChild(item);
-    }
-  }
+async function resetWarDomains() {
+  await requestJson("/api/mail-domain-pool/reset", { method: "POST" });
+  setMessage("域名池运行时状态已重置");
+  await loadWarRoom();
 }
 
 function syncSelectPageAccounts() {
@@ -1306,7 +1780,24 @@ tabButtons.forEach((button) => {
   button.addEventListener("click", () => activateTab(button.dataset.tabTarget));
 });
 
+if (warRefreshBtn) {
+  warRefreshBtn.addEventListener("click", () => {
+    loadWarRoom().catch((error) => setMessage(error.message));
+  });
+}
+if (warStopBtn) {
+  warStopBtn.addEventListener("click", () => {
+    stopJob().catch((error) => setMessage(error.message));
+  });
+}
+if (warResetDomainsBtn) {
+  warResetDomainsBtn.addEventListener("click", () => {
+    resetWarDomains().catch((error) => setMessage(error.message));
+  });
+}
+
 loadConfig().catch((error) => setMessage(error.message));
 loadAccounts().catch((error) => setMessage(error.message));
-// 刷新页面后自动恢复运行中/最近任务与日志
+startWarRoomPolling();
+loadWarRoom({ silent: true }).catch(() => {});
 restoreCurrentJob().catch((error) => setMessage(error.message));

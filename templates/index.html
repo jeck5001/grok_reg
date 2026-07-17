@@ -23,77 +23,140 @@
       <div class="app-layout">
         <nav class="side-nav" aria-label="主功能">
           <p class="section-kicker">菜单</p>
-          <button class="tab-button active" type="button" data-tab-target="dashboard">运营看板</button>
+          <button class="tab-button active" type="button" data-tab-target="dashboard">作战室</button>
           <button class="tab-button" type="button" data-tab-target="register">注册控制台</button>
           <button class="tab-button" type="button" data-tab-target="accounts">账号管理</button>
           <button class="tab-button" type="button" data-tab-target="logs">实时日志</button>
         </nav>
 
         <div class="main-panel">
-          <section id="tab-dashboard" class="tab-panel active dashboard" data-tab-panel="dashboard">
-            <div class="dashboard-hero">
+          <section id="tab-dashboard" class="tab-panel active dashboard war-room" data-tab-panel="dashboard">
+            <div class="dashboard-hero war-hero">
               <div class="dashboard-title">
-                <p class="section-kicker">运营看板</p>
-                <h2>账号资产和推送链路</h2>
-                <p>集中查看账号总量、Refresh Token 覆盖、健康状态和两个远端服务的推送进度。</p>
+                <p class="section-kicker">Ops War Room</p>
+                <h2>注册作战室</h2>
+                <p>任务态势、域名池热力、Turnstile Solver、失败归因与账号库存，一屏掌握。</p>
               </div>
-              <div class="dashboard-live">
-                <span>当前任务</span>
+              <div class="dashboard-live war-live">
+                <span>任务状态</span>
                 <strong id="dashboardStatusText">就绪</strong>
                 <small id="dashboardRunNote">成功 0 / 失败 0</small>
+                <div class="war-live-meta">
+                  <span id="warThroughputText">产能 —</span>
+                  <span id="warEtaText">ETA —</span>
+                </div>
+                <div class="war-actions">
+                  <button type="button" class="ghost-btn" id="warRefreshBtn">刷新</button>
+                  <button type="button" class="ghost-btn danger-btn" id="warStopBtn" disabled>熔断停止</button>
+                  <button type="button" class="ghost-btn" id="warResetDomainsBtn">重置域名池</button>
+                </div>
               </div>
             </div>
 
-            <div class="dashboard-metrics">
+            <div class="alert-strip" id="warAlerts" aria-live="polite"></div>
+
+            <div class="dashboard-metrics war-metrics">
               <div class="metric-tile metric-primary">
-                <span>账号总量</span>
+                <span>目标进度</span>
+                <strong id="warProgressText">0/0</strong>
+                <small id="warProgressSub">成功率 —</small>
+              </div>
+              <div class="metric-tile">
+                <span>账号库存</span>
                 <strong id="dashboardTotalAccounts">0</strong>
-                <small>data 目录已收录账号</small>
+                <small id="warInventorySub">Refresh 0 · 需处理 0</small>
               </div>
-              <div class="metric-tile">
-                <span>Refresh 可用基础</span>
-                <strong id="dashboardRefreshAccounts">0</strong>
-                <small>可推送 sub2api 的账号</small>
+              <div class="metric-tile" id="warSolverTile">
+                <span>Turnstile Solver</span>
+                <strong id="warSolverState">—</strong>
+                <small id="warSolverSub">探测中</small>
               </div>
-              <div class="metric-tile">
-                <span>健康可用</span>
-                <strong id="dashboardHealthyAccounts">0</strong>
-                <small>最近检查为可用</small>
-              </div>
-              <div class="metric-tile metric-alert">
-                <span>需要处理</span>
-                <strong id="dashboardNeedActionAccounts">0</strong>
-                <small>缺 Refresh / 失效 / 推送失败</small>
+              <div class="metric-tile" id="warDomainTile">
+                <span>域名池可用</span>
+                <strong id="warDomainAvailable">0</strong>
+                <small id="warDomainSub">冷却 0 · 禁用 0</small>
               </div>
             </div>
 
             <div class="dashboard-flow" id="dashboardPipeline" aria-label="账号链路状态"></div>
 
-            <div class="dashboard-grid">
+            <div class="chart-row">
+              <section class="dashboard-panel chart-panel">
+                <div class="panel-head">
+                  <p class="section-kicker">成功率</p>
+                  <h2>累计成功率折线</h2>
+                  <small id="warRateChartMeta">—</small>
+                </div>
+                <div class="chart-canvas" id="warRateChart" role="img" aria-label="成功率折线图"></div>
+              </section>
+              <section class="dashboard-panel chart-panel">
+                <div class="panel-head">
+                  <p class="section-kicker">失败堆叠</p>
+                  <h2>按时间桶的失败原因</h2>
+                  <small id="warStackChartMeta">—</small>
+                </div>
+                <div class="chart-canvas" id="warStackChart" role="img" aria-label="失败堆叠图"></div>
+                <div class="chart-legend" id="warStackLegend"></div>
+              </section>
+            </div>
+
+            <div class="dashboard-grid war-grid">
               <section class="dashboard-panel">
                 <div class="panel-head">
-                  <p class="section-kicker">健康状态</p>
-                  <h2>Refresh Token 检查分布</h2>
+                  <p class="section-kicker">失败归因</p>
+                  <h2>日志信号拆解</h2>
                 </div>
-                <div class="mix-list" id="dashboardHealthMix"></div>
+                <div class="mix-list" id="warFailMix"></div>
               </section>
 
               <section class="dashboard-panel">
                 <div class="panel-head">
-                  <p class="section-kicker">远端推送</p>
-                  <h2>grok2api / sub2api 覆盖</h2>
+                  <p class="section-kicker">健康 / 推送</p>
+                  <h2>库存健康度</h2>
                 </div>
+                <div class="mix-list" id="dashboardHealthMix"></div>
                 <div class="mix-list" id="dashboardPushMix"></div>
               </section>
 
               <section class="dashboard-panel dashboard-panel-wide">
                 <div class="panel-head">
-                  <p class="section-kicker">来源文件</p>
-                  <h2>最近账号批次</h2>
+                  <p class="section-kicker">域名热力</p>
+                  <h2>主域可用 · 成功 · 失败 · 冷却</h2>
+                  <small id="warDomainPin"></small>
                 </div>
+                <div class="domain-heat" id="warDomainHeat"></div>
+              </section>
+
+              <section class="dashboard-panel">
+                <div class="panel-head">
+                  <p class="section-kicker">最近失败</p>
+                  <h2>尾部异常日志</h2>
+                </div>
+                <div class="fail-feed" id="warFailFeed"></div>
+              </section>
+
+              <section class="dashboard-panel">
+                <div class="panel-head">
+                  <p class="section-kicker">运行参数</p>
+                  <h2>当前配置快照</h2>
+                </div>
+                <div class="runtime-chips" id="warRuntimeChips"></div>
                 <div class="source-list" id="dashboardSources"></div>
               </section>
+
+              <section class="dashboard-panel dashboard-panel-wide">
+                <div class="panel-head">
+                  <p class="section-kicker">作战日志</p>
+                  <h2>最近 40 行</h2>
+                  <small id="warGeneratedAt"></small>
+                </div>
+                <pre class="war-log" id="warRecentLogs"></pre>
+              </section>
             </div>
+
+            <span class="sr-only" id="dashboardRefreshAccounts">0</span>
+            <span class="sr-only" id="dashboardHealthyAccounts">0</span>
+            <span class="sr-only" id="dashboardNeedActionAccounts">0</span>
           </section>
 
           <section id="tab-register" class="tab-panel" data-tab-panel="register">

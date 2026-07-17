@@ -563,3 +563,87 @@ def test_build_chart_series_from_logs():
     assert charts["reason_keys"]
     assert charts["fail_stack"]
     assert any(row.get("total", 0) > 0 for row in charts["fail_stack"])
+
+
+def test_presets_list_and_apply(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    import web_app as web
+
+    client = TestClient(web.app)
+    listed = client.get("/api/ops/presets")
+    assert listed.status_code == 200
+    presets = listed.json()["presets"]
+    assert any(p["id"] == "safe_first" for p in presets)
+
+    applied = client.post("/api/ops/presets/safe_first/apply")
+    assert applied.status_code == 200
+    body = applied.json()
+    assert body["ok"] is True
+    assert body["config"]["register_count"] == 1
+    assert body["config"]["register_threads"] == 1
+    assert body["config"]["signup_mode"] in {"browser", "http", "api", "auto"}
+
+
+def test_economics_and_autopilot_plan():
+    import web_app as web
+
+    job = {
+        "success_count": 10,
+        "fail_count": 5,
+        "register_count": 30,
+        "register_threads": 3,
+        "running": True,
+    }
+    thr = {
+        "elapsed_sec": 600,
+        "rate_per_min": 1.0,
+        "eta_sec": 1200,
+        "success_rate": 66.7,
+    }
+    signals = {
+        "fail_hits": 5,
+        "reasons": [
+            {"reason": "domain_rejected", "count": 3},
+            {"reason": "turnstile", "count": 2},
+        ],
+    }
+    econ = web._economics_snapshot(job, thr, signals, {"register_threads": 3})
+    assert econ["sec_per_success"] == 60.0
+    assert econ["remain"] == 20
+    assert econ["est_more_mail"] is not None
+    assert "成功率" in econ["blurb"] or "s/成功" in econ["blurb"]
+
+    plan = web._evaluate_autopilot(
+        job,
+        {"available_count": 2, "total_count": 4, "cooldown_count": 1},
+        {"enabled": True, "reachable": True, "url": "http://x"},
+        signals,
+        {
+            "register_threads": 3,
+            "mail_domain_fail_threshold": 3,
+            "mail_domain_fail_cooldown_sec": 600,
+            "mail_domain_pinpoint_burst": False,
+            "mail_domain_prefer_low_failure": True,
+            "turnstile_solver_timeout": 120,
+            "turnstile_solver_fallback_click": True,
+            "signup_mode": "http",
+        },
+    )
+    assert plan["actions"]
+    keys = {a.get("key") for a in plan["actions"] if a.get("type") == "set"}
+    assert "mail_domain_fail_threshold" in keys or "register_threads" in keys
+
+
+def test_autopilot_toggle_api(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    import web_app as web
+
+    client = TestClient(web.app)
+    off = client.get("/api/ops/autopilot")
+    assert off.status_code == 200
+    on = client.post("/api/ops/autopilot", json={"enabled": True})
+    assert on.status_code == 200
+    assert on.json()["enabled"] is True
+    state = client.get("/api/ops/autopilot")
+    assert state.json()["enabled"] is True
+    client.post("/api/ops/autopilot", json={"enabled": False})

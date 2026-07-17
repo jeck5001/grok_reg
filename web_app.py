@@ -564,6 +564,480 @@ def _throughput_estimate(job, signals):
     }
 
 
+TASK_PRESETS = {
+    "safe_first": {
+        "id": "safe_first",
+        "name": "稳妥首跑",
+        "blurb": "1 线程 / browser / 大间隔，验证链路",
+        "patch": {
+            "register_count": 1,
+            "register_threads": 1,
+            "signup_mode": "browser",
+            "thread_start_interval": 3.0,
+            "account_interval_seconds": 20,
+            "account_interval_jitter_seconds": 10,
+            "stop_on_consecutive_blocks": 2,
+            "turnstile_solver_enabled": True,
+            "turnstile_solver_fallback_click": True,
+            "enable_mail_domain_runtime_control": True,
+            "mail_domain_prefer_low_failure": True,
+            "mail_domain_pinpoint_burst": False,
+            "enable_mail_domain_grouping": False,
+            "mail_domain_fail_threshold": 2,
+            "mail_domain_fail_cooldown_sec": 900,
+        },
+    },
+    "docker_burst": {
+        "id": "docker_burst",
+        "name": "Docker 冲量",
+        "blurb": "http 纯协议 + 多线程，适合 NAS",
+        "patch": {
+            "register_count": 50,
+            "register_threads": 3,
+            "signup_mode": "http",
+            "thread_start_interval": 2.0,
+            "account_interval_seconds": 12,
+            "account_interval_jitter_seconds": 8,
+            "stop_on_consecutive_blocks": 3,
+            "turnstile_solver_enabled": True,
+            "turnstile_solver_fallback_click": False,
+            "enable_mail_domain_runtime_control": True,
+            "mail_domain_prefer_low_failure": True,
+            "mail_domain_pinpoint_burst": False,
+            "enable_mail_domain_grouping": False,
+            "mail_domain_fail_threshold": 3,
+            "mail_domain_fail_cooldown_sec": 600,
+        },
+    },
+    "gold_rush": {
+        "id": "gold_rush",
+        "name": "淘金模式",
+        "blurb": "pinpoint 粘住稳域，短冷却",
+        "patch": {
+            "register_count": 30,
+            "register_threads": 2,
+            "signup_mode": "http",
+            "thread_start_interval": 2.0,
+            "account_interval_seconds": 10,
+            "account_interval_jitter_seconds": 6,
+            "stop_on_consecutive_blocks": 3,
+            "turnstile_solver_enabled": True,
+            "enable_mail_domain_runtime_control": True,
+            "mail_domain_pinpoint_burst": True,
+            "mail_domain_prefer_low_failure": False,
+            "enable_mail_domain_grouping": False,
+            "mail_domain_fail_threshold": 2,
+            "mail_domain_fail_cooldown_sec": 300,
+        },
+    },
+    "multi_vendor": {
+        "id": "multi_vendor",
+        "name": "多供应商隔离",
+        "blurb": "域名分组 exhaust，风险隔离",
+        "patch": {
+            "register_count": 40,
+            "register_threads": 2,
+            "signup_mode": "http",
+            "thread_start_interval": 2.0,
+            "account_interval_seconds": 12,
+            "account_interval_jitter_seconds": 8,
+            "stop_on_consecutive_blocks": 3,
+            "turnstile_solver_enabled": True,
+            "enable_mail_domain_runtime_control": True,
+            "mail_domain_prefer_low_failure": True,
+            "mail_domain_pinpoint_burst": False,
+            "enable_mail_domain_grouping": True,
+            "mail_domain_group_mode": "auto",
+            "mail_domain_group_count": 2,
+            "mail_domain_group_strategy": "exhaust_then_next",
+            "mail_domain_fail_threshold": 3,
+            "mail_domain_fail_cooldown_sec": 600,
+        },
+    },
+}
+
+_autopilot_state = {
+    "enabled": False,
+    "last_eval_at": None,
+    "last_actions": [],
+    "history": [],
+}
+_autopilot_lock = Lock()
+
+
+def _list_task_presets():
+    return [
+        {
+            "id": p["id"],
+            "name": p["name"],
+            "blurb": p["blurb"],
+            "keys": sorted(p["patch"].keys()),
+        }
+        for p in TASK_PRESETS.values()
+    ]
+
+
+def _apply_task_preset(preset_id: str, base_settings=None):
+    preset = TASK_PRESETS.get(str(preset_id or "").strip())
+    if not preset:
+        raise ValueError(f"未知菜谱: {preset_id}")
+    current = dict(base_settings if base_settings is not None else reg.load_config())
+    merged = {**current, **preset["patch"]}
+    validated = reg.validate_registration_config(merged)
+    return validated, preset
+
+
+def _economics_snapshot(job, throughput, signals, settings=None):
+    success = int((job or {}).get("success_count") or 0)
+    fail = int((job or {}).get("fail_count") or 0)
+    target = int((job or {}).get("register_count") or 0)
+    done = success + fail
+    elapsed = (throughput or {}).get("elapsed_sec")
+    sec_per_success = None
+    if success > 0 and elapsed:
+        sec_per_success = round(float(elapsed) / success, 1)
+    attempts_per_success = round(done / success, 2) if success > 0 else None
+    mail_est = done
+    fail_hits = int((signals or {}).get("fail_hits") or fail)
+    reasons = {r.get("reason"): int(r.get("count") or 0) for r in ((signals or {}).get("reasons") or [])}
+    turnstile_fails = int(reasons.get("turnstile") or 0)
+    remain = max(0, target - success)
+    eta_more = (throughput or {}).get("eta_sec")
+    est_more_attempts = None
+    est_more_mail = None
+    if remain > 0 and attempts_per_success:
+        est_more_attempts = int(round(remain * attempts_per_success))
+        est_more_mail = est_more_attempts
+    elif remain > 0:
+        est_more_attempts = remain
+        est_more_mail = remain
+    threads = int((settings or {}).get("register_threads") or (job or {}).get("register_threads") or 1)
+    return {
+        "success": success,
+        "fail": fail,
+        "done": done,
+        "target": target,
+        "remain": remain,
+        "sec_per_success": sec_per_success,
+        "attempts_per_success": attempts_per_success,
+        "mail_spent_est": mail_est,
+        "solver_fail_hits": turnstile_fails,
+        "fail_signal_hits": fail_hits,
+        "eta_more_sec": eta_more,
+        "est_more_attempts": est_more_attempts,
+        "est_more_mail": est_more_mail,
+        "threads": threads,
+        "rate_per_min": (throughput or {}).get("rate_per_min"),
+        "success_rate": (throughput or {}).get("success_rate"),
+        "blurb": _economics_blurb(
+            success=success,
+            remain=remain,
+            sec_per_success=sec_per_success,
+            est_more_mail=est_more_mail,
+            eta_more=eta_more,
+            success_rate=(throughput or {}).get("success_rate"),
+        ),
+    }
+
+
+def _economics_blurb(*, success, remain, sec_per_success, est_more_mail, eta_more, success_rate):
+    parts = []
+    if sec_per_success is not None:
+        parts.append(f"约 {sec_per_success}s/成功号")
+    if success_rate is not None:
+        parts.append(f"成功率 {success_rate}%")
+    if remain > 0 and eta_more is not None:
+        m = max(1, int(round(eta_more / 60)))
+        parts.append(f"再要 {remain} 个约 {m} 分钟")
+    if remain > 0 and est_more_mail is not None:
+        parts.append(f"预计再耗邮箱 ~{est_more_mail}")
+    if not parts:
+        if success <= 0:
+            return "尚无成功样本，跑起来后估算产能与邮箱消耗"
+        return "产能数据收集中"
+    return " · ".join(parts)
+
+
+def _reason_count(signals, reason: str) -> int:
+    for row in (signals or {}).get("reasons") or []:
+        if row.get("reason") == reason:
+            return int(row.get("count") or 0)
+    return 0
+
+
+def _evaluate_autopilot(job, domains, solver, signals, settings):
+    actions = []
+    suggestions = []
+    running = bool((job or {}).get("running"))
+    fail = int((job or {}).get("fail_count") or 0)
+    success = int((job or {}).get("success_count") or 0)
+    done = success + fail
+    threads = int((settings or {}).get("register_threads") or 1)
+    threshold = int((settings or {}).get("mail_domain_fail_threshold") or 3)
+    cooldown = int((settings or {}).get("mail_domain_fail_cooldown_sec") or 600)
+    pinpoint = bool((settings or {}).get("mail_domain_pinpoint_burst"))
+    low_fail = bool((settings or {}).get("mail_domain_prefer_low_failure", True))
+
+    domain_rej = _reason_count(signals, "domain_rejected")
+    turnstile = _reason_count(signals, "turnstile")
+    blocked = _reason_count(signals, "blocked")
+    otp = _reason_count(signals, "otp_missing")
+    create_code = _reason_count(signals, "create_code")
+
+    avail = int((domains or {}).get("available_count") or 0)
+    total_dom = int((domains or {}).get("total_count") or 0)
+    cool = int((domains or {}).get("cooldown_count") or 0)
+
+    if (job or {}).get("block_stop_triggered") or blocked >= 3:
+        suggestions.append(
+            {
+                "id": "circuit_block",
+                "level": "danger",
+                "text": "封禁信号偏多：建议停任务并更换代理/出口",
+            }
+        )
+        if running and threads > 1:
+            actions.append(
+                {
+                    "id": "drop_threads_block",
+                    "type": "set",
+                    "key": "register_threads",
+                    "value": 1,
+                    "reason": "连续封禁风险，降并发至 1",
+                }
+            )
+
+    if domain_rej >= 2 or (done >= 5 and domain_rej / max(1, done) >= 0.3):
+        if threshold > 1:
+            actions.append(
+                {
+                    "id": "domain_threshold",
+                    "type": "set",
+                    "key": "mail_domain_fail_threshold",
+                    "value": 1,
+                    "reason": "域名拒收偏多，失败 1 次即冷却",
+                }
+            )
+        if cooldown < 1200:
+            actions.append(
+                {
+                    "id": "domain_cooldown",
+                    "type": "set",
+                    "key": "mail_domain_fail_cooldown_sec",
+                    "value": min(1800, max(900, cooldown * 2)),
+                    "reason": "拉长域名冷却，减少反复撞拒",
+                }
+            )
+        if pinpoint:
+            actions.append(
+                {
+                    "id": "disable_pinpoint",
+                    "type": "set",
+                    "key": "mail_domain_pinpoint_burst",
+                    "value": False,
+                    "reason": "拒收多时关闭黄金矿工",
+                }
+            )
+            actions.append(
+                {
+                    "id": "enable_low_fail",
+                    "type": "set",
+                    "key": "mail_domain_prefer_low_failure",
+                    "value": True,
+                    "reason": "改低失败优先轮换域名",
+                }
+            )
+        elif not low_fail:
+            actions.append(
+                {
+                    "id": "enable_low_fail2",
+                    "type": "set",
+                    "key": "mail_domain_prefer_low_failure",
+                    "value": True,
+                    "reason": "开启低失败优先",
+                }
+            )
+
+    if turnstile >= 2 or (solver.get("enabled") and not solver.get("reachable")):
+        if threads > 2:
+            actions.append(
+                {
+                    "id": "drop_threads_ts",
+                    "type": "set",
+                    "key": "register_threads",
+                    "value": max(1, threads - 1),
+                    "reason": "Turnstile/Solver 压力大，降并发",
+                }
+            )
+        timeout = float((settings or {}).get("turnstile_solver_timeout") or 120)
+        if timeout < 180:
+            actions.append(
+                {
+                    "id": "solver_timeout",
+                    "type": "set",
+                    "key": "turnstile_solver_timeout",
+                    "value": 180,
+                    "reason": "提高 Solver 超时到 180s",
+                }
+            )
+        if not bool((settings or {}).get("turnstile_solver_fallback_click", True)):
+            mode = str((settings or {}).get("signup_mode") or "")
+            if mode in {"browser", "api", "auto"}:
+                actions.append(
+                    {
+                        "id": "fallback_click",
+                        "type": "set",
+                        "key": "turnstile_solver_fallback_click",
+                        "value": True,
+                        "reason": "开启 Turnstile 点选回退",
+                    }
+                )
+        if solver.get("enabled") and not solver.get("reachable"):
+            suggestions.append(
+                {
+                    "id": "solver_down",
+                    "level": "warn",
+                    "text": f"Solver 不可达: {solver.get('url') or '—'}",
+                }
+            )
+
+    if (otp + create_code) >= 3 and threads > 2:
+        actions.append(
+            {
+                "id": "drop_threads_mail",
+                "type": "set",
+                "key": "register_threads",
+                "value": max(1, min(2, threads - 1)),
+                "reason": "验证码/发码失败多，略降并发",
+            }
+        )
+
+    if total_dom > 0 and avail == 0:
+        suggestions.append(
+            {
+                "id": "domains_exhausted",
+                "level": "danger",
+                "text": "邮件主域全部不可用，建议重置冷却或补充域名",
+            }
+        )
+        actions.append(
+            {
+                "id": "reset_domain_pool",
+                "type": "reset_domain_pool",
+                "reason": "域名全冷却，尝试重置运行时池",
+            }
+        )
+    elif total_dom > 0 and cool / total_dom >= 0.5:
+        suggestions.append(
+            {
+                "id": "domains_half_cool",
+                "level": "warn",
+                "text": f"过半域名冷却中（{cool}/{total_dom}）",
+            }
+        )
+
+    if success >= 8 and fail <= 1 and not pinpoint and avail >= 1:
+        actions.append(
+            {
+                "id": "enable_pinpoint_hot",
+                "type": "set",
+                "key": "mail_domain_pinpoint_burst",
+                "value": True,
+                "reason": "近期很稳，开启黄金矿工吃满稳域",
+            }
+        )
+        actions.append(
+            {
+                "id": "disable_low_fail_hot",
+                "type": "set",
+                "key": "mail_domain_prefer_low_failure",
+                "value": False,
+                "reason": "与黄金矿工互斥，关闭低失败优先",
+            }
+        )
+
+    seen_keys = set()
+    deduped = []
+    for act in reversed(actions):
+        if act.get("type") == "set":
+            k = act.get("key")
+            if k in seen_keys:
+                continue
+            seen_keys.add(k)
+        deduped.append(act)
+    deduped.reverse()
+
+    return {
+        "actions": deduped,
+        "suggestions": suggestions,
+        "signals": {
+            "domain_rejected": domain_rej,
+            "turnstile": turnstile,
+            "blocked": blocked,
+            "otp_missing": otp,
+            "create_code": create_code,
+            "domain_available": avail,
+            "domain_cooldown": cool,
+        },
+    }
+
+
+def _apply_autopilot_actions(actions, settings=None):
+    applied = []
+    skipped = []
+    current = dict(settings if settings is not None else reg.load_config())
+    patch = {}
+    reset_pool = False
+    for act in actions or []:
+        if act.get("type") == "reset_domain_pool":
+            reset_pool = True
+            applied.append(act)
+            continue
+        if act.get("type") != "set":
+            skipped.append({**act, "skip": "unsupported"})
+            continue
+        key = act.get("key")
+        value = act.get("value")
+        if key is None:
+            skipped.append({**act, "skip": "no_key"})
+            continue
+        if current.get(key) == value:
+            skipped.append({**act, "skip": "unchanged"})
+            continue
+        patch[key] = value
+        applied.append(act)
+
+    if reset_pool:
+        try:
+            import mail_domain_pool as mdp
+
+            mdp.reset_runtime()
+        except Exception as exc:
+            skipped.append({"id": "reset_domain_pool", "skip": str(exc)[:120]})
+
+    new_settings = current
+    if patch:
+        merged = {**current, **patch}
+        new_settings = reg.validate_registration_config(merged)
+        reg.config = new_settings
+        reg.save_config()
+        with _job_lock:
+            job_id = _active_job_id
+            job = _jobs.get(job_id) if job_id else None
+            if job is not None and hasattr(job, "settings"):
+                try:
+                    job.settings = {**dict(job.settings or {}), **patch}
+                except Exception:
+                    pass
+
+    return {
+        "applied": applied,
+        "skipped": skipped,
+        "settings": mask_config(new_settings),
+        "patch": patch,
+    }
+
+
 @app.get("/api/ops/war-room")
 def ops_war_room(log_tail: int = Query(200, ge=20, le=800)):
     settings = reg.load_config()
@@ -585,6 +1059,8 @@ def ops_war_room(log_tail: int = Query(200, ge=20, le=800)):
     domains = _mail_domain_snapshot(settings)
     solver = _solver_status_snapshot(settings)
     throughput = _throughput_estimate(job, signals)
+    economics = _economics_snapshot(job, throughput, signals, settings)
+    plan = _evaluate_autopilot(job, domains, solver, signals, settings)
 
     alerts = []
     if job.get("running"):
@@ -611,6 +1087,41 @@ def ops_war_room(log_tail: int = Query(200, ge=20, le=800)):
                 "text": f"{inventory['need_action']} 个账号需要处理（缺 Refresh / 失效 / 推送失败）",
             }
         )
+    for sug in plan.get("suggestions") or []:
+        alerts.append({"level": sug.get("level") or "info", "text": sug.get("text") or ""})
+
+    with _autopilot_lock:
+        ap_enabled = bool(_autopilot_state.get("enabled"))
+        ap_history = list(_autopilot_state.get("history") or [])[-8:]
+        ap_last = list(_autopilot_state.get("last_actions") or [])
+
+    if ap_enabled and job.get("running") and plan.get("actions"):
+        result = _apply_autopilot_actions(plan["actions"], settings)
+        stamp = __import__("datetime").datetime.now().isoformat(timespec="seconds")
+        with _autopilot_lock:
+            _autopilot_state["last_eval_at"] = stamp
+            _autopilot_state["last_actions"] = result.get("applied") or []
+            if result.get("applied"):
+                _autopilot_state["history"] = (
+                    list(_autopilot_state.get("history") or [])
+                    + [
+                        {
+                            "at": stamp,
+                            "applied": result.get("applied"),
+                            "patch": result.get("patch"),
+                        }
+                    ]
+                )[-20:]
+            ap_history = list(_autopilot_state.get("history") or [])[-8:]
+            ap_last = list(_autopilot_state.get("last_actions") or [])
+        if result.get("applied"):
+            alerts.append(
+                {
+                    "level": "info",
+                    "text": f"Auto Pilot 已执行 {len(result['applied'])} 项调整",
+                }
+            )
+            settings = reg.load_config()
 
     mode = "auto"
     try:
@@ -628,6 +1139,7 @@ def ops_war_room(log_tail: int = Query(200, ge=20, le=800)):
         "generated_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
         "job": job,
         "throughput": throughput,
+        "economics": economics,
         "failures": signals,
         "charts": (signals or {}).get("charts")
         or {"timeline": [], "fail_stack": [], "reason_keys": [], "event_count": 0},
@@ -636,6 +1148,15 @@ def ops_war_room(log_tail: int = Query(200, ge=20, le=800)):
         "solver": solver,
         "inventory": inventory,
         "alerts": alerts,
+        "presets": _list_task_presets(),
+        "autopilot": {
+            "enabled": ap_enabled,
+            "pending_actions": plan.get("actions") or [],
+            "suggestions": plan.get("suggestions") or [],
+            "signals": plan.get("signals") or {},
+            "last_actions": ap_last,
+            "history": ap_history,
+        },
         "runtime": {
             "signup_mode": mode,
             "email_provider": settings.get("email_provider") or "",
@@ -643,7 +1164,99 @@ def ops_war_room(log_tail: int = Query(200, ge=20, le=800)):
             "register_threads": settings.get("register_threads"),
             "proxy_configured": bool(str(settings.get("proxy") or "").strip()),
             "turnstile_solver_enabled": bool(settings.get("turnstile_solver_enabled", True)),
+            "mail_domain_pinpoint_burst": bool(settings.get("mail_domain_pinpoint_burst")),
+            "mail_domain_prefer_low_failure": bool(
+                settings.get("mail_domain_prefer_low_failure", True)
+            ),
+            "mail_domain_fail_threshold": settings.get("mail_domain_fail_threshold"),
         },
+    }
+
+
+@app.get("/api/ops/presets")
+def list_ops_presets():
+    return {"ok": True, "presets": _list_task_presets()}
+
+
+@app.post("/api/ops/presets/{preset_id}/apply")
+def apply_ops_preset(preset_id: str):
+    try:
+        validated, preset = _apply_task_preset(preset_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    reg.config = validated
+    reg.save_config()
+    return {
+        "ok": True,
+        "preset": {"id": preset["id"], "name": preset["name"], "blurb": preset["blurb"]},
+        "config": mask_config(validated),
+        "patch": preset["patch"],
+    }
+
+
+@app.get("/api/ops/autopilot")
+def get_autopilot():
+    with _autopilot_lock:
+        return {
+            "ok": True,
+            "enabled": bool(_autopilot_state.get("enabled")),
+            "last_eval_at": _autopilot_state.get("last_eval_at"),
+            "last_actions": list(_autopilot_state.get("last_actions") or []),
+            "history": list(_autopilot_state.get("history") or [])[-12:],
+        }
+
+
+@app.post("/api/ops/autopilot")
+def set_autopilot(payload: dict):
+    enabled = bool((payload or {}).get("enabled"))
+    with _autopilot_lock:
+        _autopilot_state["enabled"] = enabled
+        if not enabled:
+            _autopilot_state["last_actions"] = []
+    return {"ok": True, "enabled": enabled}
+
+
+@app.post("/api/ops/autopilot/evaluate")
+def evaluate_autopilot(payload: dict = None):
+    apply_now = bool((payload or {}).get("apply"))
+    settings = reg.load_config()
+    job = _current_job_payload()
+    job_id = str(job.get("job_id") or "").strip()
+    log_lines = []
+    if job_id:
+        try:
+            log_lines = (reg.read_job_log_lines(job_id, offset=0) or [])[-400:]
+        except Exception:
+            log_lines = []
+    signals = _parse_job_log_signals(log_lines)
+    domains = _mail_domain_snapshot(settings)
+    solver = _solver_status_snapshot(settings)
+    plan = _evaluate_autopilot(job, domains, solver, signals, settings)
+    result = None
+    if apply_now and plan.get("actions"):
+        result = _apply_autopilot_actions(plan["actions"], settings)
+        stamp = __import__("datetime").datetime.now().isoformat(timespec="seconds")
+        with _autopilot_lock:
+            _autopilot_state["last_eval_at"] = stamp
+            _autopilot_state["last_actions"] = (result or {}).get("applied") or []
+            if (result or {}).get("applied"):
+                _autopilot_state["history"] = (
+                    list(_autopilot_state.get("history") or [])
+                    + [
+                        {
+                            "at": stamp,
+                            "applied": result.get("applied"),
+                            "patch": result.get("patch"),
+                        }
+                    ]
+                )[-20:]
+    return {
+        "ok": True,
+        "plan": plan,
+        "applied": result,
+        "enabled": bool(_autopilot_state.get("enabled")),
     }
 
 

@@ -54,6 +54,13 @@ const warGeneratedAt = document.querySelector("#warGeneratedAt");
 const warRefreshBtn = document.querySelector("#warRefreshBtn");
 const warStopBtn = document.querySelector("#warStopBtn");
 const warResetDomainsBtn = document.querySelector("#warResetDomainsBtn");
+const warEconBlurb = document.querySelector("#warEconBlurb");
+const warEconGrid = document.querySelector("#warEconGrid");
+const warApStatus = document.querySelector("#warApStatus");
+const warApActions = document.querySelector("#warApActions");
+const warAutopilotToggle = document.querySelector("#warAutopilotToggle");
+const warAutopilotOnceBtn = document.querySelector("#warAutopilotOnceBtn");
+const presetRow = document.querySelector("#presetRow");
 const selectPageAccounts = document.querySelector("#selectPageAccounts");
 const accountPageSize = document.querySelector("#accountPageSize");
 const accountSearchInput = document.querySelector("#accountSearchInput");
@@ -1005,6 +1012,135 @@ function renderWarCharts(data) {
   renderFailStackChart(charts.fail_stack || [], charts.reason_keys || []);
 }
 
+function renderEconomics(econ) {
+  if (!warEconGrid) return;
+  const e = econ || {};
+  if (warEconBlurb) warEconBlurb.textContent = e.blurb || "产能数据收集中";
+  const cells = [
+    ["秒/成功", e.sec_per_success != null ? `${e.sec_per_success}s` : "—"],
+    ["尝试/成功", e.attempts_per_success != null ? String(e.attempts_per_success) : "—"],
+    ["邮箱已耗~", e.mail_spent_est != null ? String(e.mail_spent_est) : "—"],
+    ["再要 N 个", e.remain != null ? String(e.remain) : "—"],
+    ["再耗邮箱~", e.est_more_mail != null ? String(e.est_more_mail) : "—"],
+    ["ETA", e.eta_more_sec != null ? formatDuration(e.eta_more_sec) : "—"],
+    ["Solver 失败信号", e.solver_fail_hits != null ? String(e.solver_fail_hits) : "—"],
+    ["产能/min", e.rate_per_min != null ? String(e.rate_per_min) : "—"],
+  ];
+  warEconGrid.innerHTML = "";
+  for (const [k, v] of cells) {
+    const cell = document.createElement("div");
+    cell.className = "econ-cell";
+    cell.innerHTML = `<span>${k}</span><strong>${v}</strong>`;
+    warEconGrid.appendChild(cell);
+  }
+}
+
+function renderAutopilot(ap) {
+  const data = ap || {};
+  if (warAutopilotToggle) {
+    warAutopilotToggle.checked = Boolean(data.enabled);
+  }
+  if (warApStatus) {
+    warApStatus.textContent = data.enabled ? "已开启 · 运行中自动应用" : "关闭 · 仅展示建议";
+  }
+  if (!warApActions) return;
+  warApActions.innerHTML = "";
+  const pending = data.pending_actions || [];
+  const last = data.last_actions || [];
+  if (!pending.length && !last.length) {
+    const empty = document.createElement("p");
+    empty.className = "dashboard-empty";
+    empty.textContent = "暂无建议动作（有失败信号后出现）";
+    warApActions.appendChild(empty);
+    return;
+  }
+  if (pending.length) {
+    const title = document.createElement("div");
+    title.className = "ap-group-title";
+    title.textContent = "待执行 / 建议";
+    warApActions.appendChild(title);
+    for (const act of pending) {
+      const row = document.createElement("div");
+      row.className = "ap-item";
+      const main = act.type === "set"
+        ? `${act.key} → ${JSON.stringify(act.value)}`
+        : act.type || "action";
+      row.innerHTML = `<strong>${main}</strong><span>${act.reason || ""}</span>`;
+      warApActions.appendChild(row);
+    }
+  }
+  if (last.length) {
+    const title = document.createElement("div");
+    title.className = "ap-group-title";
+    title.textContent = "最近已应用";
+    warApActions.appendChild(title);
+    for (const act of last.slice(-6).reverse()) {
+      const row = document.createElement("div");
+      row.className = "ap-item applied";
+      const main = act.type === "set"
+        ? `${act.key} → ${JSON.stringify(act.value)}`
+        : act.type || "action";
+      row.innerHTML = `<strong>${main}</strong><span>${act.reason || ""}</span>`;
+      warApActions.appendChild(row);
+    }
+  }
+}
+
+function renderPresets(list) {
+  if (!presetRow) return;
+  const presets = Array.isArray(list) ? list : [];
+  if (!presets.length) {
+    presetRow.innerHTML = `<p class="dashboard-empty">菜谱加载中…</p>`;
+    return;
+  }
+  presetRow.innerHTML = "";
+  for (const p of presets) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "preset-chip";
+    btn.dataset.presetId = p.id;
+    btn.innerHTML = `<strong>${p.name}</strong><span>${p.blurb || ""}</span>`;
+    btn.addEventListener("click", () => {
+      applyPreset(p.id).catch((error) => setMessage(error.message));
+    });
+    presetRow.appendChild(btn);
+  }
+}
+
+async function loadPresets() {
+  const data = await requestJson("/api/ops/presets");
+  renderPresets(data.presets || []);
+}
+
+async function applyPreset(presetId) {
+  const data = await requestJson(`/api/ops/presets/${presetId}/apply`, { method: "POST" });
+  if (data.config) applyConfig(data.config);
+  setMessage(`已应用菜谱：${(data.preset && data.preset.name) || presetId}`);
+  loadWarRoom({ silent: true }).catch(() => {});
+}
+
+async function setAutopilotEnabled(enabled) {
+  await requestJson("/api/ops/autopilot", {
+    method: "POST",
+    body: JSON.stringify({ enabled: Boolean(enabled) }),
+  });
+  setMessage(enabled ? "Auto Pilot 已开启" : "Auto Pilot 已关闭");
+  await loadWarRoom({ silent: true });
+}
+
+async function runAutopilotOnce() {
+  const data = await requestJson("/api/ops/autopilot/evaluate", {
+    method: "POST",
+    body: JSON.stringify({ apply: true }),
+  });
+  const n = (((data.applied || {}).applied) || []).length;
+  setMessage(n ? `Auto Pilot 已应用 ${n} 项` : "评估完成：无需调整或信号不足");
+  if (data.applied && data.applied.settings) {
+    applyConfig(data.applied.settings);
+  }
+  await loadWarRoom({ silent: true });
+}
+
 function startWarRoomPolling() {
   if (warRoomTimer) clearInterval(warRoomTimer);
   warRoomTimer = setInterval(() => {
@@ -1299,6 +1435,12 @@ function renderWarRoom(data) {
   }
 
   renderWarCharts(data);
+  renderEconomics(data.economics);
+  renderAutopilot(data.autopilot);
+  if (data.presets && data.presets.length && presetRow && !presetRow.dataset.ready) {
+    renderPresets(data.presets);
+    presetRow.dataset.ready = "1";
+  }
 }
 
 function renderDashboard() {
@@ -1800,8 +1942,19 @@ if (warResetDomainsBtn) {
     resetWarDomains().catch((error) => setMessage(error.message));
   });
 }
+if (warAutopilotToggle) {
+  warAutopilotToggle.addEventListener("change", () => {
+    setAutopilotEnabled(warAutopilotToggle.checked).catch((error) => setMessage(error.message));
+  });
+}
+if (warAutopilotOnceBtn) {
+  warAutopilotOnceBtn.addEventListener("click", () => {
+    runAutopilotOnce().catch((error) => setMessage(error.message));
+  });
+}
 
 loadConfig().catch((error) => setMessage(error.message));
+loadPresets().catch(() => {});
 loadAccounts().catch((error) => setMessage(error.message));
 startWarRoomPolling();
 loadWarRoom({ silent: true }).catch(() => {});

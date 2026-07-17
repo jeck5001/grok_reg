@@ -50,6 +50,11 @@
                 </div>
               </div>
               <div class="war-actions">
+                <label class="ap-toggle" title="根据失败信号自动调参">
+                  <input type="checkbox" id="warAutopilotToggle" />
+                  Auto Pilot
+                </label>
+                <button type="button" class="ghost-btn" id="warAutopilotOnceBtn">评估并应用</button>
                 <button type="button" class="ghost-btn" id="warRefreshBtn">刷新</button>
                 <button type="button" class="ghost-btn danger-btn" id="warStopBtn" disabled>熔断停止</button>
                 <button type="button" class="ghost-btn" id="warResetDomainsBtn">重置域名池</button>
@@ -57,6 +62,25 @@
             </div>
 
             <div class="alert-strip" id="warAlerts" aria-live="polite"></div>
+
+            <div class="ops-secondary-row">
+              <section class="dashboard-panel econ-panel">
+                <div class="panel-head">
+                  <p class="section-kicker">成本产能</p>
+                  <h2>Economics</h2>
+                </div>
+                <p class="econ-blurb" id="warEconBlurb">尚无成功样本</p>
+                <div class="econ-grid" id="warEconGrid"></div>
+              </section>
+              <section class="dashboard-panel ap-panel">
+                <div class="panel-head">
+                  <p class="section-kicker">Auto Pilot</p>
+                  <h2>建议动作</h2>
+                  <small id="warApStatus">关闭</small>
+                </div>
+                <div class="ap-actions" id="warApActions"></div>
+              </section>
+            </div>
 
             <div class="dashboard-metrics war-metrics">
               <div class="metric-tile metric-primary">
@@ -172,6 +196,14 @@
           <section id="tab-register" class="tab-panel" data-tab-panel="register">
             <div class="register-layout">
           <form id="configForm" class="config-stack">
+            <section class="config-section preset-section" data-config-section="任务菜谱">
+              <div class="section-copy">
+                <p class="section-kicker">Presets</p>
+                <h2>任务菜谱</h2>
+                <p class="hint-inline">一键写入常用参数，仍可再改后保存/开跑。</p>
+              </div>
+              <div class="preset-row" id="presetRow"></div>
+            </section>
             <section class="config-section" data-config-section="基础注册">
               <div class="section-copy">
                 <p class="section-kicker">基础注册</p>

@@ -541,7 +541,8 @@
               <p class="hint">
                 1) BotFather 创建 bot 拿 token · 2) 先私聊 bot 或把 bot 拉进群 ·
                 3) Chat ID 可用 <code>@userinfobot</code> / 群组 -100… ·
-                4) 默认不推每次成功，只推里程碑与异常。
+                4) 默认不推每次成功；里程碑（10/50/…）与任务完成会推送，不受「最低级别 warn」拦截 ·
+                5) 异常类（熔断/失败/Solver 宕机）仍受最低级别控制。
               </p>
             </section>
 

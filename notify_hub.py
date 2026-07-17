@@ -33,6 +33,13 @@ DEFAULT_EVENTS = {
     "autopilot.applied": False,
 }
 
+MIN_LEVEL_BYPASS_EVENTS = {
+    "milestone.success_n",
+    "job.started",
+    "job.completed",
+    "solver.recovered",
+}
+
 _LOCK = threading.RLock()
 _HISTORY: List[Dict[str, Any]] = []
 _COOLDOWN: Dict[str, float] = {}
@@ -315,7 +322,12 @@ def emit(
         lvl = str(level or "info").strip().lower()
         if lvl not in LEVEL_RANK:
             lvl = "info"
-        if not force and not _level_ok(lvl, str(s.get("notify_min_level") or "warn")):
+        event_name = str(event_type or "custom")
+        if (
+            not force
+            and event_name not in MIN_LEVEL_BYPASS_EVENTS
+            and not _level_ok(lvl, str(s.get("notify_min_level") or "warn"))
+        ):
             return {"ok": False, "skipped": "level"}
         if not telegram_configured(s):
             return {"ok": False, "skipped": "not_configured"}
@@ -364,27 +376,48 @@ def emit_test(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
 def maybe_milestone(job_id: str, success_count: int, settings: Optional[Dict[str, Any]] = None) -> None:
     s = normalize_notify_settings(settings or {})
-    marks = s.get("notify_milestone_success") or []
+    # 任务启动时的 settings 可能缺 notify 字段；尽量补全 token/开关
+    try:
+        import grok_register_ttk as reg
+
+        live = normalize_notify_settings(reg.load_config() or {})
+        for key in (
+            "notify_enabled",
+            "notify_min_level",
+            "notify_cooldown_sec",
+            "notify_telegram_bot_token",
+            "notify_telegram_chat_id",
+            "notify_milestone_success",
+            "notify_events",
+        ):
+            if key.startswith("notify_telegram_") and s.get(key):
+                continue
+            if live.get(key) not in (None, "", [], {}):
+                s[key] = live.get(key)
+        s = normalize_notify_settings(s)
+    except Exception:
+        pass
+
+    marks = list(s.get("notify_milestone_success") or [])
     jid = str(job_id or "job")
+    count = int(success_count or 0)
+    hits: List[int] = []
     with _LOCK:
         seen = _MILESTONE_SEEN.setdefault(jid, set())
-        hit = None
         for m in marks:
-            if success_count >= m and m not in seen:
-                seen.add(m)
-                hit = m
-                break
-    if hit is None:
-        return
-    emit(
-        "milestone.success_n",
-        title=f"成功达到 {hit}",
-        body=f"任务累计成功 {success_count} 个账号。",
-        level="info",
-        job_id=jid,
-        dedupe_key=f"milestone|{jid}|{hit}",
-        settings=s,
-    )
+            if count >= int(m) and int(m) not in seen:
+                seen.add(int(m))
+                hits.append(int(m))
+    for hit in hits:
+        emit(
+            "milestone.success_n",
+            title=f"成功达到 {hit}",
+            body=f"任务累计成功 {count} 个账号。",
+            level="info",
+            job_id=jid,
+            dedupe_key=f"milestone|{jid}|{hit}",
+            settings=s,
+        )
 
 
 def observe_runtime_edges(

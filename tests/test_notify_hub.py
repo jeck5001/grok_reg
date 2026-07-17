@@ -41,7 +41,23 @@ def test_emit_respects_disabled_and_level(monkeypatch):
     assert nh.emit("job.failed", title="x", level="danger", settings=settings)["skipped"] == "disabled"
 
     settings["notify_enabled"] = True
-    assert nh.emit("job.started", title="start", level="info", settings=settings)["skipped"] == "level"
+    settings["notify_events"] = {
+        **nh.DEFAULT_EVENTS,
+        "autopilot.applied": True,
+    }
+    assert (
+        nh.emit("autopilot.applied", title="ap", level="info", settings=settings)["skipped"]
+        == "level"
+    )
+    r_ms = nh.emit(
+        "milestone.success_n",
+        title="成功达到 10",
+        level="info",
+        settings=settings,
+        sync=True,
+        dedupe_key="ms-test",
+    )
+    assert r_ms.get("ok") is True
 
     r = nh.emit(
         "job.failed",

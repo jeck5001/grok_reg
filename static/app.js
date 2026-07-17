@@ -1061,6 +1061,11 @@ function renderWarRoom(data) {
     const elapsed = thr.elapsed_sec != null ? formatDuration(thr.elapsed_sec) : "—";
     warProgressSub.textContent = `成功率 ${rate} · 已运行 ${elapsed}`;
   }
+  const progressBar = document.querySelector("#warProgressBar");
+  if (progressBar) {
+    const pct = target > 0 ? Math.min(100, Math.round((success / target) * 100)) : 0;
+    progressBar.style.setProperty("--metric-pct", `${pct}%`);
+  }
   if (warThroughputText) {
     warThroughputText.textContent =
       thr.rate_per_min != null ? `产能 ${thr.rate_per_min}/min` : "产能 —";

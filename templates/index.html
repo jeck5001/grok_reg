@@ -31,25 +31,28 @@
 
         <div class="main-panel">
           <section id="tab-dashboard" class="tab-panel active dashboard war-room" data-tab-panel="dashboard">
-            <div class="dashboard-hero war-hero">
-              <div class="dashboard-title">
-                <p class="section-kicker">War Room</p>
-                <h2>注册作战室</h2>
-                <p>任务 · 域名池 · Solver · 失败归因 · 库存</p>
+            <div class="dashboard-hero war-hero war-command">
+              <div class="war-command-main">
+                <div class="war-command-brand">
+                  <p class="section-kicker">War Room</p>
+                  <h2>注册作战室</h2>
+                </div>
+                <div class="war-status-cluster">
+                  <div class="war-status-pill">
+                    <span>任务</span>
+                    <strong id="dashboardStatusText">就绪</strong>
+                  </div>
+                  <div class="war-command-stats">
+                    <small id="dashboardRunNote">成功 0 / 失败 0</small>
+                    <span id="warThroughputText">产能 —</span>
+                    <span id="warEtaText">ETA —</span>
+                  </div>
+                </div>
               </div>
-              <div class="dashboard-live war-live">
-                <span>任务状态</span>
-                <strong id="dashboardStatusText">就绪</strong>
-                <small id="dashboardRunNote">成功 0 / 失败 0</small>
-                <div class="war-live-meta">
-                  <span id="warThroughputText">产能 —</span>
-                  <span id="warEtaText">ETA —</span>
-                </div>
-                <div class="war-actions">
-                  <button type="button" class="ghost-btn" id="warRefreshBtn">刷新</button>
-                  <button type="button" class="ghost-btn danger-btn" id="warStopBtn" disabled>熔断停止</button>
-                  <button type="button" class="ghost-btn" id="warResetDomainsBtn">重置域名池</button>
-                </div>
+              <div class="war-actions">
+                <button type="button" class="ghost-btn" id="warRefreshBtn">刷新</button>
+                <button type="button" class="ghost-btn danger-btn" id="warStopBtn" disabled>熔断停止</button>
+                <button type="button" class="ghost-btn" id="warResetDomainsBtn">重置域名池</button>
               </div>
             </div>
 
@@ -60,6 +63,7 @@
                 <span>目标进度</span>
                 <strong id="warProgressText">0/0</strong>
                 <small id="warProgressSub">成功率 —</small>
+                <i class="metric-bar" id="warProgressBar" style="--metric-pct: 0%"></i>
               </div>
               <div class="metric-tile">
                 <span>账号库存</span>
@@ -78,7 +82,13 @@
               </div>
             </div>
 
-            <div class="dashboard-flow" id="dashboardPipeline" aria-label="账号链路状态"></div>
+            <div class="pipeline-wrap">
+              <div class="panel-head pipeline-head">
+                <p class="section-kicker">资产链路</p>
+                <h2>注册 → Refresh → 健康 → 下游</h2>
+              </div>
+              <div class="dashboard-flow" id="dashboardPipeline" aria-label="账号链路状态"></div>
+            </div>
 
             <div class="chart-row">
               <section class="dashboard-panel chart-panel">

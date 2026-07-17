@@ -121,16 +121,16 @@ const FAIL_REASON_LABELS = {
 };
 
 const FAIL_REASON_COLORS = {
-  domain_rejected: "#ff6d4d",
-  otp_missing: "#ff9f43",
-  create_code: "#feca57",
-  turnstile: "#54a0ff",
-  blocked: "#ff3838",
-  rate_limited: "#a55eea",
-  session_lost: "#2e86de",
-  network: "#10ac84",
-  email_provider: "#48dbfb",
-  other: "#8395a7",
+  domain_rejected: "#fb7185",
+  otp_missing: "#fb923c",
+  create_code: "#fbbf24",
+  turnstile: "#7dd3fc",
+  blocked: "#f43f5e",
+  rate_limited: "#c084fc",
+  session_lost: "#38bdf8",
+  network: "#34d399",
+  email_provider: "#67e8f9",
+  other: "#94a3b8",
 };
 
 function setMessage(text) {

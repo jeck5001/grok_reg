@@ -455,6 +455,16 @@ async function startJob() {
   startPolling();
 }
 
+function isActiveJobStatus(status) {
+  if (!status) return false;
+  const name = String(status.status || "").toLowerCase();
+  if (["interrupted", "stopped", "completed", "failed", "idle"].includes(name)) return false;
+  if (status.from_disk) return false;
+  // stopping 仍算活跃：线程在收尾，禁止重复启动，并继续轮询
+  if (Boolean(status.running) || Boolean(status.stop_requested)) return true;
+  return ["pending", "running", "stopping"].includes(name);
+}
+
 async function stopJob() {
   // 优先当前 id；失败则停服务端 active
   const id = currentJobId;
@@ -470,16 +480,26 @@ async function stopJob() {
     } else {
       result = await requestJson(`/api/jobs/stop`, { method: "POST" });
     }
-    if (pollTimer) {
+    if (result.job_id) rememberJobId(result.job_id);
+    statusText.textContent = result.status || "stopping";
+    // 协作式停止：可能仍在收尾，继续轮询直到真正 stopped
+    const stillActive = isActiveJobStatus(result) || result.status === "stopping" || result.stop_requested;
+    startBtn.disabled = stillActive;
+    stopBtn.disabled = true;
+    setMessage(
+      result.message ||
+        (stillActive
+          ? "已请求停止，等待当前步骤结束（验证码/过盾/网络请求完成后才会真正停下）"
+          : "任务已停止")
+    );
+    if (stillActive) {
+      startPolling();
+    } else if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
     }
-    statusText.textContent = result.status || "stopped";
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
-    if (result.job_id) rememberJobId(result.job_id);
-    setMessage(result.message || "已请求停止任务");
     renderDashboard();
+    loadWarRoom({ silent: true }).catch(() => {});
   } catch (error) {
     // 最终失败也清前端状态，避免卡在 running
     if (pollTimer) {
@@ -523,12 +543,11 @@ async function pollJob() {
   }
   statusText.textContent = status.status;
   statsText.textContent = `成功 ${status.success_count || 0} / 失败 ${status.fail_count || 0}`;
-  const running = Boolean(status.running) || ["pending", "running"].includes(status.status);
-  // from_disk / interrupted 不算 running
-  const trulyRunning =
-    running && !status.from_disk && !["interrupted", "stopped", "completed", "failed", "idle"].includes(status.status);
+  const trulyRunning = isActiveJobStatus(status);
+  const stopping = status.status === "stopping" || Boolean(status.stop_requested);
   startBtn.disabled = trulyRunning;
-  stopBtn.disabled = !trulyRunning;
+  // 停止中只允许点一次；结束后放开启动、禁用停止
+  stopBtn.disabled = !trulyRunning || stopping;
 
   if (currentJobId) {
     const logs = await requestJson(`/api/jobs/${currentJobId}/logs?offset=${logOffset}`);
@@ -558,9 +577,10 @@ async function restoreCurrentJob({ silent = false } = {}) {
       rememberJobId(jobId);
       statusText.textContent = current.status || "-";
       statsText.textContent = `成功 ${current.success_count || 0} / 失败 ${current.fail_count || 0}`;
-      const running = Boolean(current.running) || ["pending", "running"].includes(current.status);
+      const running = isActiveJobStatus(current);
+      const stopping = current.status === "stopping" || Boolean(current.stop_requested);
       startBtn.disabled = running;
-      stopBtn.disabled = !running;
+      stopBtn.disabled = !running || stopping;
       // 拉全量日志
       logOffset = 0;
       logBox.textContent = "";
@@ -571,7 +591,13 @@ async function restoreCurrentJob({ silent = false } = {}) {
         logOffset = logs.next_offset;
       }
       if (running) {
-        if (!silent) setMessage("已恢复运行中的注册任务");
+        if (!silent) {
+          setMessage(
+            stopping
+              ? "已恢复停止中的任务（等待当前步骤结束）"
+              : "已恢复运行中的注册任务"
+          );
+        }
         startPolling();
       } else if (!silent) {
         setMessage("已恢复最近一次任务记录（已结束）");
@@ -594,7 +620,7 @@ async function restoreCurrentJob({ silent = false } = {}) {
     logOffset = 0;
     logBox.textContent = "";
     await pollJob();
-    const running = ["pending", "running"].includes(statusText.textContent);
+    const running = ["pending", "running", "stopping"].includes(statusText.textContent);
     if (running) startPolling();
     return true;
   } catch (error) {
@@ -1347,7 +1373,8 @@ function renderWarRoom(data) {
   const success = Number(job.success_count || 0);
   const fail = Number(job.fail_count || 0);
   const target = Number(job.register_count || runtime.register_count || 0);
-  const running = Boolean(job.running);
+  const running = isActiveJobStatus(job);
+  const stopping = job.status === "stopping" || Boolean(job.stop_requested);
 
   if (dashboardStatusText) {
     dashboardStatusText.textContent = job.status || statusText.textContent || "idle";
@@ -1358,7 +1385,8 @@ function renderWarRoom(data) {
   }
   if (statusText && job.status) statusText.textContent = job.status;
   if (statsText) statsText.textContent = `成功 ${success} / 失败 ${fail}`;
-  if (warStopBtn) warStopBtn.disabled = !running;
+  // 停止中禁用再次点击；真正结束后也禁用
+  if (warStopBtn) warStopBtn.disabled = !running || stopping;
 
   if (warProgressText) warProgressText.textContent = `${success}/${target || "—"}`;
   if (warProgressSub) {

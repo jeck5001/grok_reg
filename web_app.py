@@ -43,6 +43,8 @@ app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 _jobs = {}
 _active_job_id = None
 _job_lock = Lock()
+# pending/running 正常执行；stopping 已请求停止但仍在收尾
+_ACTIVE_JOB_STATUSES = frozenset({"pending", "running", "stopping"})
 
 
 def mask_config(settings):
@@ -70,11 +72,16 @@ def active_job_running():
     if not job:
         return False
     try:
-        if job.status().get("status") not in {"pending", "running"}:
+        st = job.status()
+        # stopping 仍视为占用中，避免重复启动
+        if st.get("status") not in _ACTIVE_JOB_STATUSES and not st.get("running"):
             return False
         return bool(job.thread and job.thread.is_alive())
     except Exception:
-        return job.status().get("status") in {"pending", "running"}
+        try:
+            return job.status().get("status") in _ACTIVE_JOB_STATUSES
+        except Exception:
+            return False
 
 
 @app.get("/")
@@ -411,9 +418,9 @@ def _current_job_payload():
             try:
                 alive = bool(job.thread and job.thread.is_alive())
             except Exception:
-                alive = st.get("status") in {"pending", "running"}
-            running = st.get("status") in {"pending", "running"} and alive
-            if st.get("status") in {"pending", "running"} and not alive:
+                alive = st.get("status") in _ACTIVE_JOB_STATUSES
+            running = st.get("status") in _ACTIVE_JOB_STATUSES and alive
+            if st.get("status") in _ACTIVE_JOB_STATUSES and not alive:
                 try:
                     job.status_value = "interrupted"
                     job.finished_at = job.finished_at or __import__(
@@ -438,12 +445,13 @@ def _current_job_payload():
                     )
                 except Exception:
                     pass
-            return {
+            payload = {
                 "job_id": job.id,
                 "has_job": True,
-                "running": running,
                 **st,
             }
+            payload["running"] = running
+            return payload
 
         meta = reg.load_current_job_meta()
         if not meta:
@@ -459,7 +467,7 @@ def _current_job_payload():
             }
         st = dict(snapshot) if isinstance(snapshot, dict) else {}
         disk_status = str(st.get("status") or meta.get("status") or "finished")
-        if disk_status in {"pending", "running"}:
+        if disk_status in _ACTIVE_JOB_STATUSES:
             disk_status = "interrupted"
             try:
                 import notify_hub
@@ -1590,10 +1598,10 @@ def get_current_job():
             try:
                 alive = bool(job.thread and job.thread.is_alive())
             except Exception:
-                alive = st.get("status") in {"pending", "running"}
-            running = st.get("status") in {"pending", "running"} and alive
-            # 线程已死但状态还是 running：纠正
-            if st.get("status") in {"pending", "running"} and not alive:
+                alive = st.get("status") in _ACTIVE_JOB_STATUSES
+            running = st.get("status") in _ACTIVE_JOB_STATUSES and alive
+            # 线程已死但状态还是 running/stopping：纠正
+            if st.get("status") in _ACTIVE_JOB_STATUSES and not alive:
                 try:
                     job.status_value = "interrupted"
                     job.finished_at = job.finished_at or __import__("datetime").datetime.now().isoformat(timespec="seconds")
@@ -1602,12 +1610,13 @@ def get_current_job():
                     pass
                 st = job.status()
                 running = False
-            return {
+            payload = {
                 "job_id": job.id,
                 "has_job": True,
-                "running": running,
                 **st,
             }
+            payload["running"] = running
+            return payload
 
         # 内存没有：读落盘 current（只读历史，不能当 running）
         meta = reg.load_current_job_meta()
@@ -1619,8 +1628,8 @@ def get_current_job():
             return {"has_job": False, "job_id": job_id or None, "status": "idle", "running": False}
         st = dict(snapshot) if isinstance(snapshot, dict) else {}
         disk_status = str(st.get("status") or meta.get("status") or "finished")
-        # 进程重启后磁盘上的 running 是僵尸状态
-        if disk_status in {"pending", "running"}:
+        # 进程重启后磁盘上的 running/stopping 是僵尸状态
+        if disk_status in _ACTIVE_JOB_STATUSES:
             disk_status = "interrupted"
             try:
                 st["status"] = "interrupted"
@@ -1681,7 +1690,11 @@ def start_job(payload: dict):
 
 
 def _do_stop_job(job_id: str = None):
-    """停止任务：优先指定 id，否则停当前 active；找不到则清理僵尸状态。"""
+    """停止任务：优先指定 id，否则停当前 active；找不到则清理僵尸状态。
+
+    协作式停止：立即返回 status=stopping / stop_requested=true。
+    工作线程需等到当前可取消点才会真正退出。
+    """
     global _active_job_id
     with _job_lock:
         target_id = str(job_id or "").strip() or str(_active_job_id or "").strip()
@@ -1692,7 +1705,17 @@ def _do_stop_job(job_id: str = None):
                 target_id = _active_job_id
         if job is not None:
             job.stop()
-            st = job.status()
+            st = dict(job.status())
+            # 线程仍存活时明确返回 stopping，避免前端误以为已停完
+            try:
+                alive = bool(job.thread and job.thread.is_alive())
+            except Exception:
+                alive = st.get("status") in _ACTIVE_JOB_STATUSES
+            if alive and st.get("status") not in {"stopped", "failed", "completed", "interrupted"}:
+                st["status"] = "stopping"
+                st["running"] = True
+                st["stop_requested"] = True
+                st["message"] = "已请求停止，等待当前步骤结束"
             return {"ok": True, "job_id": target_id, **st}
 
         meta = reg.load_current_job_meta() or {}
@@ -1750,19 +1773,21 @@ def get_job(job_id: str):
         st = dict(job) if isinstance(job, dict) else {}
         st.setdefault("id", job_id)
         st["from_disk"] = True
-        # 磁盘上的 running 不可信
-        if str(st.get("status") or "") in {"pending", "running"}:
+        # 磁盘上的 running/stopping 不可信
+        if str(st.get("status") or "") in _ACTIVE_JOB_STATUSES:
             st["status"] = "interrupted"
             st["running"] = False
         return st
-    st = job.status()
+    st = dict(job.status())
     try:
         alive = bool(job.thread and job.thread.is_alive())
     except Exception:
-        alive = st.get("status") in {"pending", "running"}
-    if st.get("status") in {"pending", "running"} and not alive:
-        st = dict(st)
+        alive = st.get("status") in _ACTIVE_JOB_STATUSES
+    if st.get("status") in _ACTIVE_JOB_STATUSES and not alive:
         st["status"] = "interrupted"
+        st["running"] = False
+    else:
+        st["running"] = bool(alive and st.get("status") in _ACTIVE_JOB_STATUSES)
     return st
 
 

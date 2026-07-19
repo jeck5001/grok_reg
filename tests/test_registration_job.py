@@ -450,10 +450,17 @@ def test_registration_job_stop_request_sets_stopped_status(monkeypatch, tmp_path
     job.start()
     time.sleep(0.05)
     job.stop()
+    # 立即进入 stopping，而不是仍显示 running
+    immediate = job.status()
+    assert immediate["stop_requested"] is True
+    assert immediate["status"] == "stopping"
+    assert immediate["running"] is True
+
     status = wait_for_job(job)
 
     assert status["status"] == "stopped"
     assert status["stop_requested"] is True
+    assert status["running"] is False
 
 
 def test_registration_job_stops_after_consecutive_account_blocks(monkeypatch, tmp_path):

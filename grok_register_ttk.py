@@ -5663,6 +5663,7 @@ class RegistrationJob:
         return mem
 
     def should_stop(self):
+        # stopping 表示已收到停止请求，工作线程应尽快退出
         return self.stop_requested or self.status_value not in {"pending", "running"}
 
     def start(self):
@@ -5695,8 +5696,15 @@ class RegistrationJob:
         return self
 
     def stop(self):
+        """协作式停止：立即标记 stopping，工作线程在下一个可取消点退出。
+
+        注意：不会强杀浏览器/HTTP；若卡在 page.get / requests / 启动浏览器等
+        硬阻塞调用，仍需等到该调用返回（最长可达几十秒）。
+        """
         self.stop_requested = True
-        self.log("[!] 用户停止注册")
+        if self.status_value in {"pending", "running"}:
+            self.status_value = "stopping"
+        self.log("[!] 用户停止注册（等待当前步骤结束…）")
         self._persist_status()
 
     def status(self):
@@ -5705,6 +5713,11 @@ class RegistrationJob:
             fail_count = self.fail_count
             consecutive_blocks = self.consecutive_blocks
             block_stop_triggered = self.block_stop_triggered
+        alive = False
+        try:
+            alive = bool(self.thread and self.thread.is_alive())
+        except Exception:
+            alive = self.status_value in {"pending", "running", "stopping"}
         return {
             "id": self.id,
             "status": self.status_value,
@@ -5715,6 +5728,8 @@ class RegistrationJob:
             "consecutive_blocks": consecutive_blocks,
             "block_stop_triggered": block_stop_triggered,
             "stop_requested": self.stop_requested,
+            # 线程仍在收尾时 running=True，便于前端继续轮询、禁止重复启动
+            "running": alive and self.status_value in {"pending", "running", "stopping"},
             "output_file": self.output_file,
             "created_at": self.created_at,
             "started_at": self.started_at,
@@ -5786,6 +5801,8 @@ class RegistrationJob:
         mail_ok = False
         max_mail_retry = 3
         signup_mode = resolve_signup_mode()
+        # 进入单账号流程前先响应停止，避免再开一轮耗时操作
+        raise_if_cancelled(self.should_stop)
 
         # 纯 HTTP：全程无浏览器
         if signup_mode == "http":
@@ -5838,6 +5855,7 @@ class RegistrationJob:
             logf("[*] 5. 已通过纯 HTTP 获取 sso")
         else:
             for mail_try in range(1, max_mail_retry + 1):
+                raise_if_cancelled(self.should_stop)
                 logf(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
                 open_signup_page(log_callback=logf, cancel_callback=self.should_stop)
                 logf("[*] 2. 创建邮箱并提交")
@@ -5915,6 +5933,7 @@ class RegistrationJob:
             else:
                 logf("[*] 5. 等待 sso cookie")
                 sso = wait_for_sso_cookie(log_callback=logf, cancel_callback=self.should_stop)
+        raise_if_cancelled(self.should_stop)
         if self.settings.get("enable_nsfw"):
             logf("[*] 6. 开启 NSFW")
             nsfw_ok, nsfw_message = enable_nsfw_for_token(sso, log_callback=logf)
@@ -5922,12 +5941,14 @@ class RegistrationJob:
                 logf("[*] NSFW 已开启")
             else:
                 logf(f"[!] NSFW 开启失败，继续注册流程: {nsfw_message}")
+        raise_if_cancelled(self.should_stop)
         logf("[*] 7. 获取 Refresh Token")
         refresh_token = fetch_xai_oauth_refresh_token(
             sso, log_callback=logf, cancel_callback=self.should_stop
         )
         cpa_push_item = None
         if self.settings.get("cpa_auto_push_remote"):
+            raise_if_cancelled(self.should_stop)
             logf("[*] 8. 推送 CPA 凭证")
             try:
                 cpa_result = export_and_push_cpa_credential(
@@ -9275,7 +9296,8 @@ def start_browser(log_callback=None):
                 pass
             _set_browser(None)
             _set_page(None)
-            time.sleep(min(1.5 * attempt, 4))
+            # 短睡切片，避免 stop 后仍卡在启动重试的整段 sleep
+            sleep_with_cancel(min(1.5 * attempt, 4))
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 

@@ -8909,9 +8909,10 @@ def register_via_pure_http(log_callback=None, cancel_callback=None):
 
     1) 创建临时邮箱
     2) GET sign-up 取 cookie + next-action
-    3) 并行解 signup/sign-in Turnstile
-    4) CreateEmailValidationCode → 收码 → VerifyEmailValidationCode
-    5) create_account + CreateSession + 返回 sso
+    3) CreateEmailValidationCode（失败则直接换号，不占 Solver）
+    4) 并行解 signup/sign-in Turnstile（与等邮件重叠）
+    5) 收码 → 立刻 VerifyEmailValidationCode（不等 Turnstile，验证码时效短）
+    6) 等 Turnstile → create_account + CreateSession + 返回 sso
     """
     raise_if_cancelled(cancel_callback)
     given_name, family_name, password = build_profile()
@@ -8987,36 +8988,7 @@ def register_via_pure_http(log_callback=None, cancel_callback=None):
             page=None,
         )
 
-        # 3) 并行 Turnstile（与等邮件重叠：先启动线程）
-        if log_callback:
-            log_callback("[*] 并行求解 signup/sign-in Turnstile...")
-        signup_token = {"value": "", "error": None}
-        signin_token = {"value": "", "error": None}
-
-        def _job_signup():
-            try:
-                signup_token["value"] = _solve_turnstile_quiet(
-                    signup_url, sitekey, "signup",
-                    log_callback=log_callback, cancel_callback=cancel_callback,
-                )
-            except Exception as exc:
-                signup_token["error"] = exc
-
-        def _job_signin():
-            try:
-                signin_token["value"] = _solve_turnstile_quiet(
-                    signin_url, sitekey, "sign-in",
-                    log_callback=log_callback, cancel_callback=cancel_callback,
-                )
-            except Exception as exc:
-                signin_token["error"] = exc
-
-        t1 = threading.Thread(target=_job_signup, name="http-ts-signup", daemon=True)
-        t2 = threading.Thread(target=_job_signin, name="http-ts-signin", daemon=True)
-        t1.start()
-        t2.start()
-
-        # 4) 发验证码（不重试：空 body 多半重试也失败，直接换号更快）
+        # 3) 先发验证码：失败直接换号，避免无用 Turnstile 占满 Semaphore(2)
         raise_if_cancelled(cancel_callback)
         send_res = _xai_grpc_call(
             session,
@@ -9039,34 +9011,75 @@ def register_via_pure_http(log_callback=None, cancel_callback=None):
                 f"grpc={send_res.get('grpc_status')} msg={msg!r} raw={(raw[:120])!r}"
             )
 
+        # 4) 发码成功后再解 Turnstile（与等邮件重叠）
+        if log_callback:
+            log_callback("[*] 并行求解 signup/sign-in Turnstile...")
+        signup_token = {"value": "", "error": None}
+        signin_token = {"value": "", "error": None}
+        # 本轮失败/取消时置位，后台线程尽快退出，不再写日志
+        ts_abort = {"v": False}
+
+        def _ts_cancelled():
+            if ts_abort["v"]:
+                return True
+            if cancel_callback:
+                try:
+                    return bool(cancel_callback())
+                except Exception:
+                    return False
+            return False
+
+        def _job_signup():
+            try:
+                signup_token["value"] = _solve_turnstile_quiet(
+                    signup_url, sitekey, "signup",
+                    log_callback=log_callback, cancel_callback=_ts_cancelled,
+                )
+            except Exception as exc:
+                signup_token["error"] = exc
+
+        def _job_signin():
+            try:
+                signin_token["value"] = _solve_turnstile_quiet(
+                    signin_url, sitekey, "sign-in",
+                    log_callback=log_callback, cancel_callback=_ts_cancelled,
+                )
+            except Exception as exc:
+                signin_token["error"] = exc
+
+        t1 = threading.Thread(target=_job_signup, name="http-ts-signup", daemon=True)
+        t2 = threading.Thread(target=_job_signin, name="http-ts-signin", daemon=True)
+        t1.start()
+        t2.start()
+
+        def _abort_turnstile_threads():
+            """换号/失败时中止本轮 Solver，释放并发槽位。"""
+            ts_abort["v"] = True
+            # 不无限 join：cancel 后 solver 应在下一次 poll 退出
+            t1.join(timeout=0.2)
+            t2.join(timeout=0.2)
+
         # 5) 收验证码
         if log_callback:
             log_callback("[*] 等待邮箱验证码...")
-        code = get_oai_code(
-            dev_token,
-            email,
-            log_callback=log_callback,
-            cancel_callback=cancel_callback,
-        )
+        try:
+            code = get_oai_code(
+                dev_token,
+                email,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
+        except Exception:
+            _abort_turnstile_threads()
+            raise
         if not code:
+            _abort_turnstile_threads()
             raise Exception("获取验证码失败")
         clean_code = str(code).replace("-", "").replace(" ", "").strip().upper()
         if log_callback:
             log_callback(f"[*] 验证码: {clean_code}")
 
-        # 等 Turnstile 完成
-        while t1.is_alive() or t2.is_alive():
-            raise_if_cancelled(cancel_callback)
-            t1.join(timeout=0.4)
-            t2.join(timeout=0.4)
-        if signup_token["error"] or len(str(signup_token["value"] or "")) < 80:
-            raise RuntimeError(f"signup Turnstile 失败: {signup_token['error'] or 'empty'}")
-        if signin_token["error"] or len(str(signin_token["value"] or "")) < 80:
-            if log_callback:
-                log_callback(f"[!] sign-in Turnstile 失败，CreateSession 将串行补解: {signin_token['error']}")
-            signin_token["value"] = ""
-
-        # 6) 立即 verify（验证码时效短）
+        # 6) 立刻 verify（验证码时效短；不先等 Turnstile）
         raise_if_cancelled(cancel_callback)
         vres = _xai_grpc_call(
             session,
@@ -9081,7 +9094,19 @@ def register_via_pure_http(log_callback=None, cancel_callback=None):
                 f"grpc={vres.get('grpc_status')}"
             )
 
-        # 7) create_account + CreateSession
+        # 7) 等 Turnstile 完成后再 create_account
+        while t1.is_alive() or t2.is_alive():
+            raise_if_cancelled(cancel_callback)
+            t1.join(timeout=0.4)
+            t2.join(timeout=0.4)
+        if signup_token["error"] or len(str(signup_token["value"] or "")) < 80:
+            raise RuntimeError(f"signup Turnstile 失败: {signup_token['error'] or 'empty'}")
+        if signin_token["error"] or len(str(signin_token["value"] or "")) < 80:
+            if log_callback:
+                log_callback(f"[!] sign-in Turnstile 失败，CreateSession 将串行补解: {signin_token['error']}")
+            signin_token["value"] = ""
+
+        # 8) create_account + CreateSession
         # 从 session 刷新 cookie 列表
         try:
             if hasattr(session.cookies, "jar"):

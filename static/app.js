@@ -101,6 +101,8 @@ const DEFAULT_ACCOUNT_TABLE_PREFS = {
 let currentJobId = null;
 let logOffset = 0;
 let pollTimer = null;
+/** 防止 setInterval 与 in-flight poll 重叠：同一 offset 被多次 append 导致日志刷屏 */
+let pollInFlight = false;
 let accounts = [];
 let accountPage = 1;
 let accountSearchQuery = "";
@@ -444,6 +446,7 @@ async function startJob() {
     method: "POST",
     body: JSON.stringify(formPayload()),
   });
+  // 换 job / 清屏：进行中的 poll 看到 jobId/offset 变化会丢弃结果
   rememberJobId(job.job_id);
   logOffset = 0;
   logBox.textContent = "";
@@ -517,115 +520,155 @@ async function stopJob() {
 
 async function pollJob() {
   if (!currentJobId) return;
-  let status;
+  // setInterval 不会等上一次 async 结束；重叠时两个请求用同一 logOffset，
+  // 会把同一段日志 append 多遍（用户看到整段流程刷屏）。
+  if (pollInFlight) return;
+  pollInFlight = true;
+  // 全程用快照：中途 start/restore 换 job 或重置 offset 时丢弃本轮结果
+  const jobId = currentJobId;
+  const requestedOffset = logOffset;
   try {
-    status = await requestJson(`/api/jobs/${currentJobId}`);
-  } catch (error) {
-    if (String(error.message || "").includes("404") || String(error.message || "").includes("不存在")) {
-      const current = await requestJson("/api/jobs/current").catch(() => null);
-      if (current && current.has_job && current.job_id) {
-        rememberJobId(current.job_id);
-        status = current;
-      } else {
-        if (pollTimer) {
-          clearInterval(pollTimer);
-          pollTimer = null;
+    let status;
+    try {
+      status = await requestJson(`/api/jobs/${jobId}`);
+    } catch (error) {
+      if (String(error.message || "").includes("404") || String(error.message || "").includes("不存在")) {
+        if (currentJobId !== jobId) return;
+        const current = await requestJson("/api/jobs/current").catch(() => null);
+        if (current && current.has_job && current.job_id) {
+          rememberJobId(current.job_id);
+          status = current;
+        } else {
+          if (pollTimer) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+          }
+          statusText.textContent = "idle";
+          startBtn.disabled = false;
+          stopBtn.disabled = true;
+          rememberJobId(null);
+          return;
         }
-        statusText.textContent = "idle";
-        startBtn.disabled = false;
-        stopBtn.disabled = true;
-        rememberJobId(null);
-        return;
+      } else {
+        throw error;
       }
-    } else {
-      throw error;
     }
-  }
-  statusText.textContent = status.status;
-  statsText.textContent = `成功 ${status.success_count || 0} / 失败 ${status.fail_count || 0}`;
-  const trulyRunning = isActiveJobStatus(status);
-  const stopping = status.status === "stopping" || Boolean(status.stop_requested);
-  startBtn.disabled = trulyRunning;
-  // 停止中只允许点一次；结束后放开启动、禁用停止
-  stopBtn.disabled = !trulyRunning || stopping;
+    if (currentJobId !== jobId) return;
 
-  if (currentJobId) {
-    const logs = await requestJson(`/api/jobs/${currentJobId}/logs?offset=${logOffset}`);
-    if (logs.lines && logs.lines.length) {
-      logBox.textContent += `${logs.lines.join("\n")}\n`;
-      logBox.scrollTop = logBox.scrollHeight;
-      logOffset = logs.next_offset;
+    statusText.textContent = status.status;
+    statsText.textContent = `成功 ${status.success_count || 0} / 失败 ${status.fail_count || 0}`;
+    const trulyRunning = isActiveJobStatus(status);
+    const stopping = status.status === "stopping" || Boolean(status.stop_requested);
+    startBtn.disabled = trulyRunning;
+    // 停止中只允许点一次；结束后放开启动、禁用停止
+    stopBtn.disabled = !trulyRunning || stopping;
+
+    if (currentJobId === jobId && logOffset === requestedOffset) {
+      const logs = await requestJson(`/api/jobs/${jobId}/logs?offset=${requestedOffset}`);
+      // 再次校验：避免 restore/start 已清屏后把旧片段 append 回来
+      if (
+        logs.lines &&
+        logs.lines.length &&
+        currentJobId === jobId &&
+        logOffset === requestedOffset
+      ) {
+        logBox.textContent += `${logs.lines.join("\n")}\n`;
+        logBox.scrollTop = logBox.scrollHeight;
+        logOffset =
+          typeof logs.next_offset === "number"
+            ? logs.next_offset
+            : requestedOffset + logs.lines.length;
+      }
     }
-  }
 
-  if (!trulyRunning && pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-    loadAccounts().catch((error) => setMessage(error.message));
+    if (currentJobId !== jobId) return;
+    if (!trulyRunning && pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+      loadAccounts().catch((error) => setMessage(error.message));
+    }
+    loadWarRoom({ silent: true }).catch(() => renderDashboard());
+  } finally {
+    pollInFlight = false;
   }
-  loadWarRoom({ silent: true }).catch(() => renderDashboard());
 }
 
 async function restoreCurrentJob({ silent = false } = {}) {
-  // 1) localStorage 记住的 job
-  let jobId = restoreRememberedJobId();
-  // 2) 服务端当前/最近任务
+  // 与 pollJob 互斥，避免恢复全量日志时 in-flight poll 再 append 一段。
+  // 注意：释放 pollInFlight 后再 startPolling/pollJob，且不要用 finally 统一清——
+  // 否则会把刚启动的 poll 的 inFlight 标志误清掉。
+  while (pollInFlight) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  pollInFlight = true;
+  let handoffToPoll = false;
   try {
-    const current = await requestJson("/api/jobs/current");
-    if (current && current.has_job && current.job_id) {
-      jobId = current.job_id;
+    // 1) localStorage 记住的 job
+    let jobId = restoreRememberedJobId();
+    // 2) 服务端当前/最近任务
+    try {
+      const current = await requestJson("/api/jobs/current");
+      if (current && current.has_job && current.job_id) {
+        jobId = current.job_id;
+        rememberJobId(jobId);
+        statusText.textContent = current.status || "-";
+        statsText.textContent = `成功 ${current.success_count || 0} / 失败 ${current.fail_count || 0}`;
+        const running = isActiveJobStatus(current);
+        const stopping = current.status === "stopping" || Boolean(current.stop_requested);
+        startBtn.disabled = running;
+        stopBtn.disabled = !running || stopping;
+        // 拉全量日志
+        logOffset = 0;
+        logBox.textContent = "";
+        const logs = await requestJson(`/api/jobs/${jobId}/logs?offset=0`);
+        if (logs.lines && logs.lines.length && currentJobId === jobId) {
+          logBox.textContent = `${logs.lines.join("\n")}\n`;
+          logBox.scrollTop = logBox.scrollHeight;
+          logOffset = logs.next_offset;
+        }
+        if (running) {
+          if (!silent) {
+            setMessage(
+              stopping
+                ? "已恢复停止中的任务（等待当前步骤结束）"
+                : "已恢复运行中的注册任务"
+            );
+          }
+          handoffToPoll = true;
+          pollInFlight = false;
+          startPolling();
+        } else if (!silent) {
+          setMessage("已恢复最近一次任务记录（已结束）");
+        }
+        renderDashboard();
+        return true;
+      }
+    } catch (error) {
+      if (!silent) setMessage(`恢复任务失败: ${error.message}`);
+    }
+    // 没有任务
+    if (!jobId) {
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      return false;
+    }
+    // 仅有本地 jobId：尝试拉取
+    try {
       rememberJobId(jobId);
-      statusText.textContent = current.status || "-";
-      statsText.textContent = `成功 ${current.success_count || 0} / 失败 ${current.fail_count || 0}`;
-      const running = isActiveJobStatus(current);
-      const stopping = current.status === "stopping" || Boolean(current.stop_requested);
-      startBtn.disabled = running;
-      stopBtn.disabled = !running || stopping;
-      // 拉全量日志
       logOffset = 0;
       logBox.textContent = "";
-      const logs = await requestJson(`/api/jobs/${jobId}/logs?offset=0`);
-      if (logs.lines && logs.lines.length) {
-        logBox.textContent = `${logs.lines.join("\n")}\n`;
-        logBox.scrollTop = logBox.scrollHeight;
-        logOffset = logs.next_offset;
-      }
-      if (running) {
-        if (!silent) {
-          setMessage(
-            stopping
-              ? "已恢复停止中的任务（等待当前步骤结束）"
-              : "已恢复运行中的注册任务"
-          );
-        }
-        startPolling();
-      } else if (!silent) {
-        setMessage("已恢复最近一次任务记录（已结束）");
-      }
-      renderDashboard();
+      handoffToPoll = true;
+      pollInFlight = false;
+      await pollJob();
+      const running = ["pending", "running", "stopping"].includes(statusText.textContent);
+      if (running) startPolling();
       return true;
+    } catch (error) {
+      rememberJobId(null);
+      return false;
     }
-  } catch (error) {
-    if (!silent) setMessage(`恢复任务失败: ${error.message}`);
-  }
-  // 没有任务
-  if (!jobId) {
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
-    return false;
-  }
-  // 仅有本地 jobId：尝试拉取
-  try {
-    rememberJobId(jobId);
-    logOffset = 0;
-    logBox.textContent = "";
-    await pollJob();
-    const running = ["pending", "running", "stopping"].includes(statusText.textContent);
-    if (running) startPolling();
-    return true;
-  } catch (error) {
-    rememberJobId(null);
-    return false;
+  } finally {
+    if (!handoffToPoll) pollInFlight = false;
   }
 }
 
@@ -2035,6 +2078,7 @@ async function importSelectedToCpa() {
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(() => {
+    // 重叠轮询直接跳过（pollInFlight）；不要在这里强制 await 以免卡死 interval
     pollJob().catch((error) => setMessage(error.message));
   }, 1200);
   pollJob().catch((error) => setMessage(error.message));

@@ -1933,6 +1933,90 @@ def test_yyds_code_polling_triggers_resend_callback(monkeypatch):
     assert resend_calls
 
 
+def test_yyds_code_polling_refreshes_token_on_401(monkeypatch):
+    """401 时刷新 mailbox token，随后能继续拉信并提取验证码。"""
+    now = [0.0]
+    tokens_seen = []
+    logs = []
+
+    monkeypatch.setattr(reg.time, "time", lambda: now[0])
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: now.__setitem__(0, now[0] + seconds))
+    monkeypatch.setattr(reg, "yyds_get_token", lambda address, api_key=None, jwt=None: "token-refreshed")
+
+    def fake_messages(address, token=None, jwt=None):
+        tokens_seen.append(token)
+        if token != "token-refreshed":
+            raise Exception("HTTP Error 401: Unauthorized")
+        return [
+            {
+                "id": "m1",
+                "to": [{"address": "user@example.com"}],
+            }
+        ]
+
+    def fake_detail(message_id, token=None, jwt=None):
+        return {
+            "subject": "SpaceXAI confirmation code: AB1-CD2",
+            "text": "Your code is AB1-CD2",
+            "html": [],
+        }
+
+    monkeypatch.setattr(reg, "yyds_get_messages", fake_messages)
+    monkeypatch.setattr(reg, "yyds_get_message_detail", fake_detail)
+
+    code = reg.yyds_get_oai_code(
+        "token-stale",
+        "user@example.com",
+        timeout=60,
+        poll_interval=1,
+        log_callback=logs.append,
+    )
+    assert code.replace("-", "") in {"AB1CD2", "AB1-CD2".replace("-", "")}
+    assert "token-refreshed" in tokens_seen
+    assert any("刷新邮箱 token" in line for line in logs)
+
+
+def test_yyds_code_polling_fails_fast_after_refresh_still_401(monkeypatch):
+    """刷新后仍持续 401 时快速失败，不傻等满 timeout。"""
+    now = [0.0]
+    logs = []
+    refresh_calls = []
+
+    monkeypatch.setattr(reg.time, "time", lambda: now[0])
+
+    def fake_sleep(seconds, cancel_callback=None):
+        now[0] += float(seconds)
+
+    monkeypatch.setattr(reg, "sleep_with_cancel", fake_sleep)
+
+    def fake_refresh(address, api_key=None, jwt=None):
+        refresh_calls.append(address)
+        return "token-still-bad"
+
+    monkeypatch.setattr(reg, "yyds_get_token", fake_refresh)
+    monkeypatch.setattr(
+        reg,
+        "yyds_get_messages",
+        lambda address, token=None, jwt=None: (_ for _ in ()).throw(Exception("HTTP Error 401:")),
+    )
+
+    with pytest.raises(Exception, match="鉴权持续失败"):
+        reg.yyds_get_oai_code(
+            "token-stale",
+            "user@example.com",
+            timeout=180,
+            poll_interval=1,
+            log_callback=logs.append,
+        )
+
+    assert refresh_calls
+    # 不应拖到接近 180s
+    assert now[0] < 60
+    # 降噪：不应每次都打满
+    auth_logs = [line for line in logs if "401/403" in line]
+    assert 1 <= len(auth_logs) <= 6
+
+
 def test_create_browser_options_loads_turnstile_extension_and_user_agent(monkeypatch):
     recorded = {"args": [], "extension": None, "user_agent": None, "prefs": {}}
 

@@ -6513,6 +6513,24 @@ def yyds_get_email_and_token(api_key=None, jwt=None):
     return address, temp_token
 
 
+def _yyds_is_auth_error(exc):
+    """识别 YYDS HTTP 401/403（token 失效/无权限）。"""
+    text = str(exc or "")
+    lower = text.lower()
+    if "401" in text or "403" in text:
+        return True
+    if "unauthorized" in lower or "forbidden" in lower:
+        return True
+    # curl_cffi / requests: HTTPError('401 ...') / status_code
+    code = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        if int(code) in (401, 403):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def yyds_get_oai_code(
     token,
     address,
@@ -6523,28 +6541,109 @@ def yyds_get_oai_code(
     cancel_callback=None,
     resend_callback=None,
 ):
+    """轮询 YYDS 收件箱提取验证码。
+
+    - 401/403：刷新 mailbox token 后重试；连续鉴权失败则快速失败（避免刷屏等满 timeout）
+    - 其它瞬时错误：降噪日志（首次 + 每 N 次），继续轮询到 deadline
+    """
     deadline = time.time() + timeout
     seen_ids = set()
     next_resend_at = time.time() + 60
+    current_token = token
+    auth_fail_streak = 0
+    soft_fail_streak = 0
+    last_list_err = ""
+    token_refreshed = False
+    # 刷新后仍 401 超过该次数 → 换号更快
+    max_auth_fails_after_refresh = 4
+    log_every_n_soft = 8
+
+    def _log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    def _refresh_mailbox_token():
+        nonlocal current_token, token_refreshed
+        try:
+            new_token = yyds_get_token(address, jwt=jwt)
+        except Exception as refresh_exc:
+            _log(f"[!] YYDS 刷新邮箱 token 失败: {refresh_exc}")
+            return False
+        if not new_token:
+            _log("[!] YYDS 刷新邮箱 token 返回空")
+            return False
+        if new_token == current_token and token_refreshed:
+            return False
+        current_token = new_token
+        token_refreshed = True
+        _log("[*] YYDS 已刷新邮箱 token，继续收信")
+        return True
+
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         if resend_callback and time.time() >= next_resend_at:
             try:
                 resend_callback()
-                if log_callback:
-                    log_callback("[*] 已触发重新发送验证码")
+                _log("[*] 已触发重新发送验证码")
             except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] 触发重发验证码失败: {exc}")
+                _log(f"[Debug] 触发重发验证码失败: {exc}")
             next_resend_at = time.time() + 60
+
+        messages = None
         try:
-            messages = yyds_get_messages(address, token=token, jwt=jwt)
+            messages = yyds_get_messages(address, token=current_token, jwt=jwt)
         except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] YYDS 拉取邮件列表失败: {exc}")
-            sleep_with_cancel(poll_interval, cancel_callback)
-            continue
-        for msg in messages:
+            err_text = str(exc)
+            if _yyds_is_auth_error(exc):
+                auth_fail_streak += 1
+                # 首次（或尚未成功刷新过）时尝试刷新 mailbox token
+                if not token_refreshed:
+                    if _refresh_mailbox_token():
+                        try:
+                            messages = yyds_get_messages(address, token=current_token, jwt=jwt)
+                        except Exception as retry_exc:
+                            exc = retry_exc
+                            err_text = str(retry_exc)
+                            messages = None
+                            if _yyds_is_auth_error(retry_exc):
+                                auth_fail_streak += 1
+                            else:
+                                soft_fail_streak += 1
+                        else:
+                            auth_fail_streak = 0
+                            soft_fail_streak = 0
+                            last_list_err = ""
+
+                if messages is None:
+                    if auth_fail_streak == 1 or auth_fail_streak % 3 == 0:
+                        _log(
+                            f"[Debug] YYDS list mail 401/403 "
+                            f"(streak={auth_fail_streak}, refreshed={token_refreshed}): {err_text}"
+                        )
+                    if token_refreshed and auth_fail_streak >= max_auth_fails_after_refresh:
+                        raise Exception(
+                            f"YYDS 邮箱鉴权持续失败 (HTTP 401/403)，已刷新 token 仍无效: {err_text}"
+                        )
+                    sleep_with_cancel(poll_interval, cancel_callback)
+                    continue
+            else:
+                soft_fail_streak += 1
+                if (
+                    soft_fail_streak == 1
+                    or soft_fail_streak % log_every_n_soft == 0
+                    or err_text != last_list_err
+                ):
+                    _log(f"[Debug] YYDS list mail failed (#{soft_fail_streak}): {err_text}")
+                last_list_err = err_text
+                sleep_with_cancel(poll_interval, cancel_callback)
+                continue
+
+        # 列表成功
+        auth_fail_streak = 0
+        soft_fail_streak = 0
+        last_list_err = ""
+
+        for msg in messages or []:
             msg_id = msg.get("id")
             if not msg_id or msg_id in seen_ids:
                 continue
@@ -6553,11 +6652,17 @@ def yyds_get_oai_code(
             if address.lower() not in to_addrs:
                 continue
             try:
-                detail = yyds_get_message_detail(msg_id, token=token, jwt=jwt)
+                detail = yyds_get_message_detail(msg_id, token=current_token, jwt=jwt)
             except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] YYDS 获取邮件详情失败: {exc}")
-                continue
+                if _yyds_is_auth_error(exc) and _refresh_mailbox_token():
+                    try:
+                        detail = yyds_get_message_detail(msg_id, token=current_token, jwt=jwt)
+                    except Exception as retry_exc:
+                        _log(f"[Debug] YYDS get mail detail failed: {retry_exc}")
+                        continue
+                else:
+                    _log(f"[Debug] YYDS get mail detail failed: {exc}")
+                    continue
             parts = []
             text_body = detail.get("text") or ""
             if text_body:
@@ -6567,12 +6672,10 @@ def yyds_get_oai_code(
                 parts.append(re.sub(r"<[^>]+>", " ", h))
             combined = "\n".join(parts)
             subject = detail.get("subject", "")
-            if log_callback:
-                log_callback(f"[Debug] YYDS 收到邮件: {subject}")
+            _log(f"[Debug] YYDS mail: {subject}")
             code = extract_verification_code(combined, subject)
             if code:
-                if log_callback:
-                    log_callback(f"[*] YYDS 从邮件中提取到验证码: {code}")
+                _log(f"[*] YYDS code: {code}")
                 return code
         sleep_with_cancel(poll_interval, cancel_callback)
     raise Exception(f"YYDS 在 {timeout}s 内未收到验证码邮件")
@@ -7245,7 +7348,7 @@ def duckmail_get_oai_code(
             messages = get_messages(dev_token)
         except Exception as exc:
             if log_callback:
-                log_callback(f"[Debug] 鎷夊彇閭欢鍒楄〃澶辫触: {exc}")
+                log_callback(f"[Debug] DuckMail list mail failed: {exc}")
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
         for msg in messages:
@@ -7260,7 +7363,7 @@ def duckmail_get_oai_code(
                 detail = get_message_detail(dev_token, msg_id)
             except Exception as exc:
                 if log_callback:
-                    log_callback(f"[Debug] 鑾峰彇閭欢璇︽儏澶辫触: {exc}")
+                    log_callback(f"[Debug] DuckMail get mail detail failed: {exc}")
                 continue
             parts = []
             text_body = detail.get("text") or ""
@@ -7272,11 +7375,11 @@ def duckmail_get_oai_code(
             combined = "\n".join(parts)
             subject = detail.get("subject", "")
             if log_callback:
-                log_callback(f"[Debug] 鏀跺埌閭欢: {subject}")
+                log_callback(f"[Debug] DuckMail mail: {subject}")
             code = extract_verification_code(combined, subject)
             if code:
                 if log_callback:
-                    log_callback(f"[*] 浠庨偖浠朵腑鎻愬彇鍒伴獙璇佺爜: {code}")
+                    log_callback(f"[*] DuckMail code: {code}")
                 return code
         sleep_with_cancel(poll_interval, cancel_callback)
     raise Exception(f"在 {timeout}s 内未收到验证码邮件")

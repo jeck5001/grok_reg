@@ -10358,18 +10358,25 @@ def _solver_http_json(method, path, payload=None, timeout=20.0):
     return data, resp.status_code
 
 
-def probe_local_turnstile_solver(force=False, timeout=2.0):
-    """探测本地/远端 YesCaptcha 协议 solver 是否可用。"""
+def probe_local_turnstile_solver(force=False, timeout=2.0, cache_ttl=30.0):
+    """探测本地/远端 YesCaptcha 协议 solver 是否可用。
+
+    默认缓存 30s，避免看板轮询把 solver /health 打成高频探测。
+    """
     if not bool(config.get("turnstile_solver_enabled", True)):
         return False
     url = normalize_turnstile_solver_url()
     now = time.time()
     cache = _turnstile_solver_probe_cache
+    try:
+        ttl = max(1.0, float(cache_ttl or 30.0))
+    except Exception:
+        ttl = 30.0
     if (
         not force
         and cache.get("url") == url
         and cache.get("ok") is not None
-        and now - float(cache.get("at") or 0) < 30
+        and now - float(cache.get("at") or 0) < ttl
     ):
         return bool(cache["ok"])
     ok = False

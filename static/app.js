@@ -1338,9 +1338,11 @@ async function runAutopilotOnce() {
 
 function startWarRoomPolling() {
   if (warRoomTimer) clearInterval(warRoomTimer);
+  // 看板指标不需要 2–3s 刷新；Solver 健康检查另有服务端缓存。
+  // 任务进度仍由 job polling（~1.2s）负责。
   warRoomTimer = setInterval(() => {
     loadWarRoom({ silent: true }).catch(() => {});
-  }, 2500);
+  }, 10000);
 }
 
 function stopWarRoomPolling() {

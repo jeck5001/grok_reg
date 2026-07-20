@@ -502,7 +502,17 @@ def _current_job_payload():
         }
 
 
-def _solver_status_snapshot(settings):
+# 作战室会周期性拉 /war-room；Solver 健康检查单独缓存，避免每 2–3s 打一次 /health
+_SOLVER_STATUS_CACHE_TTL_SEC = 20.0
+_solver_status_cache = {
+    "at": 0.0,
+    "url": "",
+    "enabled": None,
+    "payload": None,
+}
+
+
+def _solver_status_snapshot(settings, force: bool = False):
     enabled = bool(settings.get("turnstile_solver_enabled", True))
     url = ""
     try:
@@ -511,6 +521,21 @@ def _solver_status_snapshot(settings):
         )
     except Exception:
         url = str(settings.get("turnstile_solver_url") or "http://127.0.0.1:5072")
+
+    now = time.time()
+    cached = _solver_status_cache
+    if (
+        not force
+        and cached.get("payload") is not None
+        and cached.get("url") == url
+        and cached.get("enabled") is enabled
+        and now - float(cached.get("at") or 0) < _SOLVER_STATUS_CACHE_TTL_SEC
+    ):
+        payload = dict(cached["payload"])
+        payload["cached"] = True
+        payload["cache_age_ms"] = int((now - float(cached.get("at") or now)) * 1000)
+        return payload
+
     reachable = False
     latency_ms = None
     error = ""
@@ -520,14 +545,15 @@ def _solver_status_snapshot(settings):
             old = dict(reg.config or {})
             try:
                 reg.config = {**old, **dict(settings or {})}
-                reachable = bool(reg.probe_local_turnstile_solver(force=True, timeout=1.5))
+                # 复用 probe 缓存（默认 30s）；作战室不再 force 打爆 solver
+                reachable = bool(reg.probe_local_turnstile_solver(force=False, timeout=1.5))
             finally:
                 reg.config = old
             latency_ms = int((time.time() - t0) * 1000)
         except Exception as exc:
             error = str(exc)[:160]
             latency_ms = int((time.time() - t0) * 1000)
-    return {
+    payload = {
         "enabled": enabled,
         "url": url,
         "reachable": reachable,
@@ -535,7 +561,14 @@ def _solver_status_snapshot(settings):
         "fallback_click": bool(settings.get("turnstile_solver_fallback_click", True)),
         "use_proxy": bool(settings.get("turnstile_solver_use_proxy", True)),
         "error": error,
+        "cached": False,
+        "cache_age_ms": 0,
     }
+    _solver_status_cache["at"] = now
+    _solver_status_cache["url"] = url
+    _solver_status_cache["enabled"] = enabled
+    _solver_status_cache["payload"] = dict(payload)
+    return payload
 
 
 def _mail_domain_snapshot(settings):

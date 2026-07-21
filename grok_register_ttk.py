@@ -11611,8 +11611,35 @@ return wrote;
         return 0
 
 
-def _solver_http_json(method, path, payload=None, timeout=20.0):
-    """直连 solver（不走业务代理），返回 JSON dict。"""
+def _is_transient_solver_transport_error(exc) -> bool:
+    """curl (52) Empty reply / 连接重置 / 超时等瞬时传输错误。"""
+    text = str(exc or "")
+    low = text.lower()
+    needles = (
+        "empty reply",
+        "curl: (52)",
+        "curl: (56)",
+        "curl: (28)",
+        "curl: (7)",
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "server closed",
+        "recv failure",
+        "failed to perform",
+    )
+    return any(n in low for n in needles)
+
+
+def _solver_http_json(method, path, payload=None, timeout=20.0, retries=3):
+    """直连 solver（不走业务代理），返回 JSON dict。
+
+    对 Empty reply / 连接重置等瞬时错误自动短退避重试，减轻并行 signup+sign-in 时
+    solver 偶发掐连接导致的「sign-in Turnstile 失败」。
+    """
     if requests is None:
         raise RuntimeError("curl_cffi 未安装，无法请求 Turnstile Solver")
     base = normalize_turnstile_solver_url()
@@ -11622,17 +11649,41 @@ def _solver_http_json(method, path, payload=None, timeout=20.0):
         "proxies": {},
         "headers": {"Content-Type": "application/json", "Accept": "application/json"},
     }
-    if method.upper() == "GET":
-        resp = requests.get(url, **kwargs)
-    else:
-        resp = requests.post(url, json=payload or {}, **kwargs)
     try:
-        data = resp.json()
+        attempts = max(1, int(retries or 1))
     except Exception:
-        raise RuntimeError(f"Turnstile Solver 非 JSON 响应 HTTP {resp.status_code}: {resp.text[:200]}")
-    if not isinstance(data, dict):
-        raise RuntimeError(f"Turnstile Solver 返回非对象: {data!r}")
-    return data, resp.status_code
+        attempts = 3
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if method.upper() == "GET":
+                resp = requests.get(url, **kwargs)
+            else:
+                resp = requests.post(url, json=payload or {}, **kwargs)
+            # 部分 solver 过载会直接掐连接，status 可能异常；仍解析 body
+            try:
+                data = resp.json()
+            except Exception:
+                # 空 body / 非 JSON：若像瞬时故障则重试
+                body = (getattr(resp, "text", None) or "")[:200]
+                status = int(getattr(resp, "status_code", 0) or 0)
+                if attempt < attempts and (not body or status in {0, 502, 503, 504}):
+                    time.sleep(min(1.5, 0.25 * attempt))
+                    continue
+                raise RuntimeError(
+                    f"Turnstile Solver 非 JSON 响应 HTTP {status}: {body}"
+                )
+            if not isinstance(data, dict):
+                raise RuntimeError(f"Turnstile Solver 返回非对象: {data!r}")
+            return data, resp.status_code
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts or not _is_transient_solver_transport_error(exc):
+                raise
+            time.sleep(min(1.5, 0.25 * attempt))
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Turnstile Solver 请求失败")
 
 
 def probe_local_turnstile_solver(force=False, timeout=2.0, cache_ttl=30.0):

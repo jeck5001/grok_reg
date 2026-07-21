@@ -98,6 +98,20 @@ def test_proxy_for_turnstile_solver_can_be_disabled(monkeypatch):
     assert reg._proxy_for_turnstile_solver() == "http://192.168.5.35:7890"
 
 
+def test_proxy_for_turnstile_solver_keeps_config_literal_in_docker(monkeypatch):
+    """createTask.task.proxy 必须原样透传配置，不要在 Docker 内改成 host.docker.internal。"""
+    monkeypatch.setenv("GROK_REG_IN_DOCKER", "1")
+    monkeypatch.setitem(reg.config, "turnstile_solver_use_proxy", True)
+    monkeypatch.setitem(reg.config, "proxy", "http://192.168.5.35:7890")
+    assert reg._proxy_for_turnstile_solver() == "http://192.168.5.35:7890"
+
+    # 配置写成 127.0.0.1 时也原样给 solver（由 solver 所在环境解释）
+    monkeypatch.setitem(reg.config, "proxy", "http://127.0.0.1:7890")
+    assert reg._proxy_for_turnstile_solver() == "http://127.0.0.1:7890"
+    # 但 grok_reg 自己访问代理仍可映射
+    assert reg.normalize_proxy_for_runtime("http://127.0.0.1:7890") == "http://host.docker.internal:7890"
+
+
 def test_get_turnstile_token_prefers_solver_then_returns(monkeypatch):
     class DummyPage:
         pass

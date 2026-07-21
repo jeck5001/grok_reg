@@ -11672,14 +11672,18 @@ def probe_local_turnstile_solver(force=False, timeout=2.0, cache_ttl=30.0):
 
 
 def _proxy_for_turnstile_solver():
-    """业务代理透传给 solver（与注册浏览器同出口）。
+    """业务代理透传给 solver 的 createTask.task.proxy。
 
-    使用 normalize_proxy_for_runtime，保证 Docker 内 localhost 映射一致。
+    注意：这里传的是「solver 进程自己去连的上游代理」，不是 grok_reg 容器内
+    访问代理的地址。必须原样透传配置值（如 http://192.168.5.35:7890），
+    不要用 normalize_proxy_for_runtime 把 127.0.0.1 改成 host.docker.internal——
+    那是给「当前容器访问代理」用的；solver 若在另一台机/另一容器，会连错甚至失败。
+
     可用 turnstile_solver_use_proxy=false 关闭透传。
     """
     if not bool(config.get("turnstile_solver_use_proxy", True)):
         return ""
-    return str(normalize_proxy_for_runtime(config.get("proxy", "")) or "").strip()
+    return str(config.get("proxy") or "").strip()
 
 
 def _redact_proxy_for_log(proxy):

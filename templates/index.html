@@ -523,16 +523,26 @@
                   <input name="email_webhook_enabled" type="checkbox" />
                   启用 webhook 收件池（配合 openai-cpa-email Worker）
                 </label>
+                <label>
+                  Worker 名称
+                  <input name="cf_email_worker_name" placeholder="openai-cpa-email" />
+                </label>
                 <label class="wide">
                   Webhook Secret（= Worker 的 EMAIL_WEBHOOK_SECRET）
                   <input name="email_webhook_secret" type="password" autocomplete="off" placeholder="与 CF Worker 变量一致" />
+                </label>
+                <label class="check">
+                  <input name="cf_email_worker_force" type="checkbox" />
+                  强制覆盖已存在 Worker（更新 URL/Secret）
                 </label>
               </div>
 
               <div class="webhook-panel" id="webhookPanel" style="margin-top: 14px;">
                 <div class="accounts-actions" style="flex-wrap: wrap; gap: 8px; margin-bottom: 10px;">
                   <button id="webhookRefreshBtn" type="button">刷新联调状态</button>
-                  <button id="webhookSelfTestBtn" type="button" class="primary">本机模拟推送测试</button>
+                  <button id="cfDeployWorkerBtn" type="button" class="primary">一键部署 Worker</button>
+                  <button id="cfSetupCatchAllBtn" type="button">绑定 Catch-all → Worker</button>
+                  <button id="webhookSelfTestBtn" type="button">本机模拟推送测试</button>
                   <button id="webhookClearBtn" type="button" class="danger">清空收件池</button>
                   <button id="webhookCopyUrlBtn" type="button">复制 Webhook URL</button>
                   <button id="webhookCopyCurlBtn" type="button">复制 curl 示例</button>
@@ -552,11 +562,13 @@
               </div>
 
               <p class="hint" style="margin-top: 10px;">
-                1）邮箱服务商选 <strong>openai_cpa_email</strong> 并填 <code>mail_domains</code> + 多级子域；
-                2）Worker 变量：<code>EMAIL_WEBHOOK_URL</code>=上面推荐基址，
-                <code>EMAIL_WEBHOOK_SECRET</code>=本页 Secret；
-                3）CF Email Routing catch-all 指到该 Worker；
-                4）先点「本机模拟推送测试」，再跑注册。
+                推荐顺序：① 全局鉴权 + 托管域名 + 补齐 MX/SPF →
+                ② 填 Worker 名称与 Secret，点「一键部署 Worker」→
+                ③「绑定 Catch-all → Worker」→
+                ④「本机模拟推送测试」→ ⑤ 邮箱服务商选 <strong>openai_cpa_email</strong> 开跑。
+                部署会从
+                <a href="https://github.com/wenfxl/openai-cpa-email" target="_blank" rel="noopener">wenfxl/openai-cpa-email</a>
+                拉 worker.js；Worker 已存在时默认跳过，勾选「强制覆盖」才会重写变量。
               </p>
             </section>
 

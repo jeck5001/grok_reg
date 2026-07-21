@@ -429,6 +429,74 @@ def cf_global_email_dns(payload: dict):
     return result
 
 
+@app.post("/api/cloudflare/global/deploy-email-worker")
+def cf_global_deploy_email_worker(payload: dict, request: Request):
+    """部署/更新 openai-cpa-email Worker，并写入 EMAIL_WEBHOOK_* 变量。"""
+    settings = merge_sensitive_values(payload or {})
+    body = dict(payload or {})
+    worker_name = body.get("worker_name") or settings.get("cf_email_worker_name")
+    force = body.get("force")
+    if force is None:
+        force = bool(settings.get("cf_email_worker_force"))
+    webhook_url = str(body.get("webhook_url") or "").strip().rstrip("/")
+    if not webhook_url:
+        # 从请求 Host 推导（公网反代时 X-Forwarded-* 优先）
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+        proto = (
+            (request.headers.get("x-forwarded-proto") or request.url.scheme or "http")
+            .split(",")[0]
+            .strip()
+        )
+        if host:
+            webhook_url = f"{proto}://{host}".rstrip("/")
+    webhook_secret = str(
+        body.get("webhook_secret") or settings.get("email_webhook_secret") or ""
+    ).strip()
+    try:
+        result = reg.deploy_cf_email_worker(
+            settings,
+            worker_name=worker_name,
+            webhook_url=webhook_url,
+            webhook_secret=webhook_secret,
+            force=bool(force),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=result.get("message") or "部署失败")
+    # 成功后把 worker 名写回配置，方便下次默认
+    try:
+        cfg = reg.load_config()
+        name = result.get("worker_name") or worker_name
+        if name and str(cfg.get("cf_email_worker_name") or "") != str(name):
+            cfg["cf_email_worker_name"] = name
+            reg.config = reg.validate_registration_config(cfg)
+            reg.save_config()
+    except Exception:
+        pass
+    return result
+
+
+@app.post("/api/cloudflare/global/setup-catch-all")
+def cf_global_setup_catch_all(payload: dict):
+    """把 mail_domains 的 Email Routing catch-all 指到 Worker。"""
+    settings = merge_sensitive_values(payload or {})
+    body = dict(payload or {})
+    domains = body.get("domains") or settings.get("mail_domains") or settings.get("defaultDomains") or ""
+    worker_name = body.get("worker_name") or settings.get("cf_email_worker_name")
+    try:
+        result = reg.setup_cf_email_catch_all(
+            domains=domains, settings=settings, worker_name=worker_name
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return result
+
+
 @app.post("/api/webhook/email")
 async def webhook_email(request: Request):
     """兼容 openai-cpa-email Worker 推送。

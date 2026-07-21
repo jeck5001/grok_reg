@@ -168,6 +168,10 @@ DEFAULT_CONFIG = {
     # openai-cpa-email Worker webhook 收件（本地内存池）
     "email_webhook_enabled": False,
     "email_webhook_secret": "",
+    # openai-cpa-email Worker 名称（CF Workers 脚本名；catch-all 要指向它）
+    "cf_email_worker_name": "openai-cpa-email",
+    # 是否允许覆盖已存在的 Worker 脚本（默认 false：已存在则只更新 bindings 需 force）
+    "cf_email_worker_force": False,
     # Web 访问密码（公网务必修改）。环境变量 GROK_REG_WEB_PASSWORD 优先；空字符串=关闭鉴权。
     "web_password": "admin",
     "notify_enabled": False,
@@ -465,16 +469,31 @@ def cf_global_auth_headers(settings=None, content_type=True):
     return headers
 
 
-def _cf_global_request(method, path, settings=None, params=None, json_body=None, timeout=30):
-    """调用 https://api.cloudflare.com/client/v4/..."""
+def _cf_global_request(
+    method,
+    path,
+    settings=None,
+    params=None,
+    json_body=None,
+    files=None,
+    timeout=30,
+    content_type=True,
+):
+    """调用 https://api.cloudflare.com/client/v4/...
+
+    files 为 multipart 时不要带 Content-Type（由客户端生成 boundary）。
+    """
     if requests is None:
         raise RuntimeError("curl_cffi 未安装，无法请求 Cloudflare API")
     url = f"https://api.cloudflare.com/client/v4{path}"
-    headers = cf_global_auth_headers(settings=settings, content_type=True)
+    use_ct = bool(content_type) and not files
+    headers = cf_global_auth_headers(settings=settings, content_type=use_ct)
     kwargs = _build_request_kwargs(headers=headers, timeout=timeout, proxies=get_proxies() or {})
     if params:
         kwargs["params"] = params
-    if json_body is not None:
+    if files is not None:
+        kwargs["files"] = files
+    elif json_body is not None:
         kwargs["json"] = json_body
     method = str(method or "GET").upper()
     if method == "GET":
@@ -482,7 +501,11 @@ def _cf_global_request(method, path, settings=None, params=None, json_body=None,
     elif method == "POST":
         resp = requests.post(url, **kwargs)
     elif method == "PUT":
-        resp = requests.put(url, **kwargs) if hasattr(requests, "put") else http_post(url, **kwargs)
+        if hasattr(requests, "put"):
+            resp = requests.put(url, **kwargs)
+        else:
+            # curl_cffi 无 put 时退化
+            resp = requests.post(url, **kwargs)
     elif method == "DELETE":
         resp = http_delete(url, **kwargs)
     else:
@@ -746,6 +769,321 @@ def ensure_cf_email_routing_dns(domains, settings=None, log_callback=None):
             log_callback(f"[{'+' if ok else '!'}] CF Email DNS {domain}: {msg}")
     ok_n = len([i for i in items if i.get("ok")])
     return {"ok": ok_n == len(items), "total": ok_n, "failed": len(items) - ok_n, "items": items}
+
+
+OPENAI_CPA_EMAIL_WORKER_RAW_URL = (
+    "https://raw.githubusercontent.com/wenfxl/openai-cpa-email/refs/heads/master/worker.js"
+)
+
+
+def _normalize_cf_worker_name(name: str) -> str:
+    raw = str(name or "").strip()
+    if not raw:
+        return "openai-cpa-email"
+    # CF script name: letters, numbers, underscore, hyphen
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", raw).strip("-_")
+    return cleaned or "openai-cpa-email"
+
+
+def get_cf_email_worker_name(settings=None) -> str:
+    src = settings if isinstance(settings, dict) else config
+    return _normalize_cf_worker_name((src or {}).get("cf_email_worker_name") or "openai-cpa-email")
+
+
+def _cf_primary_account_id(settings=None) -> str:
+    acc = _cf_global_request("GET", "/accounts", settings=settings, timeout=20)
+    if not acc.get("success") or not (acc.get("result") or []):
+        errs = acc.get("errors") or []
+        raise RuntimeError(
+            "无法获取 CF Account ID: "
+            + ("; ".join(str(e.get("message") or e) for e in errs if e) or "empty")
+        )
+    return str(acc["result"][0].get("id") or "")
+
+
+def fetch_openai_cpa_email_worker_source(timeout=30) -> str:
+    """从 GitHub 拉取 openai-cpa-email worker.js 源码。"""
+    if requests is None:
+        raise RuntimeError("curl_cffi 未安装")
+    kwargs = _build_request_kwargs(timeout=timeout, proxies=get_proxies() or {})
+    resp = requests.get(OPENAI_CPA_EMAIL_WORKER_RAW_URL, **kwargs)
+    code = int(getattr(resp, "status_code", 0) or 0)
+    text = getattr(resp, "text", "") or ""
+    if code != 200 or len(text.strip()) < 50:
+        raise RuntimeError(f"拉取 worker.js 失败 HTTP {code}: {text[:200]}")
+    return text.strip()
+
+
+def deploy_cf_email_worker(
+    settings=None,
+    *,
+    worker_name=None,
+    webhook_url=None,
+    webhook_secret=None,
+    force=None,
+    log_callback=None,
+):
+    """部署 / 更新 openai-cpa-email Worker（对齐 openai-cpa deploy_worker）。
+
+    - 默认：Worker 已存在则跳过覆盖（防误覆盖自定义脚本）
+    - force=True：覆盖部署并写入 EMAIL_WEBHOOK_* bindings
+    """
+    settings = {**config, **dict(settings or {})}
+    name = _normalize_cf_worker_name(worker_name or get_cf_email_worker_name(settings))
+    secret = str(
+        webhook_secret
+        if webhook_secret is not None
+        else settings.get("email_webhook_secret") or ""
+    ).strip()
+    url = str(webhook_url or "").strip().rstrip("/")
+    if not url:
+        raise ValueError("webhook_url 不能为空（公网可访问的 grok_reg 地址）")
+    if not secret:
+        raise ValueError("email_webhook_secret 不能为空（需与 Worker EMAIL_WEBHOOK_SECRET 一致）")
+    if force is None:
+        force = bool(settings.get("cf_email_worker_force"))
+
+    account_id = _cf_primary_account_id(settings)
+    if not account_id:
+        raise RuntimeError("CF Account ID 为空")
+
+    script_path = f"/accounts/{account_id}/workers/scripts/{name}"
+    # 探测是否已存在
+    exists = False
+    try:
+        check = _cf_global_request(
+            "GET",
+            script_path,
+            settings=settings,
+            timeout=20,
+            content_type=False,
+        )
+        # 200 + success / 或非 404
+        code = int(check.get("http_status") or 0)
+        if code == 200 or check.get("success"):
+            exists = True
+        elif code not in {0, 404}:
+            # 其它错误仍尝试部署
+            exists = False
+    except Exception:
+        exists = False
+
+    if exists and not force:
+        msg = f"Worker [{name}] 已存在，已跳过覆盖（如需重写变量请 force=true）"
+        if log_callback:
+            log_callback(f"[*] {msg}")
+        return {
+            "ok": True,
+            "skipped": True,
+            "worker_name": name,
+            "account_id": account_id,
+            "message": msg,
+        }
+
+    if log_callback:
+        log_callback(f"[*] 拉取 openai-cpa-email worker.js …")
+    source = fetch_openai_cpa_email_worker_source()
+
+    metadata = {
+        "main_module": "worker.js",
+        "compatibility_date": "2024-03-01",
+        "bindings": [
+            {"name": "EMAIL_WEBHOOK_URL", "type": "plain_text", "text": url},
+            {"name": "EMAIL_WEBHOOK_TIMEOUT_MS", "type": "plain_text", "text": "10000"},
+            {"name": "EMAIL_WEBHOOK_SECRET", "type": "secret_text", "text": secret},
+        ],
+    }
+    # multipart: metadata + worker.js
+    files = {
+        "metadata": (None, json.dumps(metadata), "application/json"),
+        "worker.js": ("worker.js", source, "application/javascript+module"),
+    }
+    if log_callback:
+        log_callback(f"[*] 部署 Worker [{name}] → Account {account_id[:8]}…")
+    deploy = _cf_global_request(
+        "PUT",
+        script_path,
+        settings=settings,
+        files=files,
+        timeout=60,
+        content_type=False,
+    )
+    if int(deploy.get("http_status") or 0) == 200 and deploy.get("success"):
+        msg = f"Worker [{name}] 部署成功，已写入 EMAIL_WEBHOOK_URL/SECRET"
+        if log_callback:
+            log_callback(f"[+] {msg}")
+        return {
+            "ok": True,
+            "skipped": False,
+            "worker_name": name,
+            "account_id": account_id,
+            "message": msg,
+            "webhook_url": url,
+        }
+    errs = deploy.get("errors") or []
+    err_msg = "; ".join(str(e.get("message") or e) for e in errs if e) or (
+        f"HTTP {deploy.get('http_status')}"
+    )
+    if log_callback:
+        log_callback(f"[!] Worker 部署失败: {err_msg}")
+    return {
+        "ok": False,
+        "skipped": False,
+        "worker_name": name,
+        "account_id": account_id,
+        "message": err_msg,
+        "response": deploy,
+    }
+
+
+def setup_cf_email_catch_all(
+    domains=None,
+    settings=None,
+    *,
+    worker_name=None,
+    log_callback=None,
+):
+    """把域名 Email Routing catch-all 指到指定 Worker（对齐 openai-cpa setup_catch_all）。"""
+    settings = {**config, **dict(settings or {})}
+    name = _normalize_cf_worker_name(worker_name or get_cf_email_worker_name(settings))
+    if isinstance(domains, str):
+        domain_list = [d.strip().lower().lstrip("@.") for d in domains.split(",") if d.strip()]
+    else:
+        domain_list = [str(d).strip().lower().lstrip("@.") for d in (domains or []) if str(d).strip()]
+    if not domain_list:
+        raw = str(settings.get("mail_domains") or settings.get("defaultDomains") or "")
+        domain_list = [d.strip().lower().lstrip("@.") for d in raw.split(",") if d.strip()]
+    if not domain_list:
+        raise ValueError("请提供域名（mail_domains）")
+
+    items = []
+    for domain in domain_list:
+        zone_q = _cf_global_request(
+            "GET",
+            "/zones",
+            settings=settings,
+            params={"name": domain, "per_page": 5},
+            timeout=20,
+        )
+        zones = zone_q.get("result") if isinstance(zone_q.get("result"), list) else []
+        if not zone_q.get("success") or not zones:
+            items.append({"domain": domain, "ok": False, "status": "not_found", "msg": "未找到域名 zone"})
+            if log_callback:
+                log_callback(f"[!] catch-all 跳过 {domain}: zone 不存在")
+            continue
+        zone = zones[0]
+        zone_id = zone.get("id")
+        ns_status = str(zone.get("status") or "")
+        if ns_status and ns_status != "active":
+            items.append(
+                {
+                    "domain": domain,
+                    "ok": False,
+                    "status": ns_status,
+                    "zone_id": zone_id,
+                    "msg": f"NS 未生效（status={ns_status}），无法配置路由",
+                }
+            )
+            if log_callback:
+                log_callback(f"[!] catch-all 跳过 {domain}: NS={ns_status}")
+            continue
+
+        # 尽量开启 Email Routing
+        try:
+            _cf_global_request(
+                "POST",
+                f"/zones/{zone_id}/email/routing/enable",
+                settings=settings,
+                json_body={},
+                timeout=20,
+            )
+        except Exception:
+            pass
+
+        # 已正确指向则跳过
+        already = False
+        get_ca = _cf_global_request(
+            "GET",
+            f"/zones/{zone_id}/email/routing/rules/catch_all",
+            settings=settings,
+            timeout=20,
+        )
+        if get_ca.get("success") and isinstance(get_ca.get("result"), dict):
+            rule = get_ca["result"]
+            if rule.get("enabled"):
+                for act in rule.get("actions") or []:
+                    if not isinstance(act, dict):
+                        continue
+                    if act.get("type") == "worker" and name in (act.get("value") or []):
+                        already = True
+                        break
+        if already:
+            items.append(
+                {
+                    "domain": domain,
+                    "ok": True,
+                    "status": "active",
+                    "zone_id": zone_id,
+                    "msg": f"Catch-All 已指向 Worker [{name}]",
+                    "skipped": True,
+                }
+            )
+            if log_callback:
+                log_callback(f"[*] catch-all 已正确: {domain} → {name}")
+            continue
+
+        payload = {
+            "actions": [{"type": "worker", "value": [name]}],
+            "matchers": [{"type": "catch_all"}],
+            "enabled": True,
+            "name": f"Catch-All to {name}",
+        }
+        put = _cf_global_request(
+            "PUT",
+            f"/zones/{zone_id}/email/routing/rules/catch_all",
+            settings=settings,
+            json_body=payload,
+            timeout=30,
+        )
+        if put.get("success"):
+            items.append(
+                {
+                    "domain": domain,
+                    "ok": True,
+                    "status": "active",
+                    "zone_id": zone_id,
+                    "msg": f"Catch-All 已指向 Worker [{name}]",
+                    "skipped": False,
+                }
+            )
+            if log_callback:
+                log_callback(f"[+] catch-all 绑定成功: {domain} → {name}")
+        else:
+            errs = put.get("errors") or []
+            err_msg = "; ".join(str(e.get("message") or e) for e in errs if e) or (
+                f"HTTP {put.get('http_status')}"
+            )
+            items.append(
+                {
+                    "domain": domain,
+                    "ok": False,
+                    "status": "error",
+                    "zone_id": zone_id,
+                    "msg": err_msg,
+                }
+            )
+            if log_callback:
+                log_callback(f"[!] catch-all 失败 {domain}: {err_msg}")
+        time.sleep(0.3)
+
+    ok_n = len([i for i in items if i.get("ok")])
+    return {
+        "ok": ok_n == len(items) and bool(items),
+        "worker_name": name,
+        "total": ok_n,
+        "failed": len(items) - ok_n,
+        "items": items,
+    }
 
 
 def _pick_list_payload(data):

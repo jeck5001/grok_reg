@@ -70,6 +70,8 @@
   "mail_domain_failure_types": ["discarded_email", "cloudflare_temp_email_network", "capacity_exceeded"],
   "email_webhook_enabled": false,
   "email_webhook_secret": "",
+  "cf_email_worker_name": "openai-cpa-email",
+  "cf_email_worker_force": false,
   "web_password": "admin",
   "notify_enabled": false,
   "notify_min_level": "warn",

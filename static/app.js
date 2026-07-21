@@ -24,6 +24,8 @@ const webhookSelfTestBtn = document.querySelector("#webhookSelfTestBtn");
 const webhookClearBtn = document.querySelector("#webhookClearBtn");
 const webhookCopyUrlBtn = document.querySelector("#webhookCopyUrlBtn");
 const webhookCopyCurlBtn = document.querySelector("#webhookCopyCurlBtn");
+const cfDeployWorkerBtn = document.querySelector("#cfDeployWorkerBtn");
+const cfSetupCatchAllBtn = document.querySelector("#cfSetupCatchAllBtn");
 const webhookChecks = document.querySelector("#webhookChecks");
 const webhookSuggestedUrl = document.querySelector("#webhookSuggestedUrl");
 const webhookFullUrl = document.querySelector("#webhookFullUrl");
@@ -268,6 +270,9 @@ function formPayload() {
   }
   if (form.elements.email_webhook_enabled) {
     data.email_webhook_enabled = form.elements.email_webhook_enabled.checked;
+  }
+  if (form.elements.cf_email_worker_force) {
+    data.cf_email_worker_force = form.elements.cf_email_worker_force.checked;
   }
   if (form.elements.notify_enabled) {
     data.notify_enabled = form.elements.notify_enabled.checked;
@@ -2410,6 +2415,120 @@ if (cfGlobalZonesBtn) {
 if (cfGlobalEmailDnsBtn) {
   cfGlobalEmailDnsBtn.addEventListener("click", () => {
     ensureCfGlobalEmailDns().catch((error) => setMessage(error.message));
+  });
+}
+
+async function deployCfEmailWorker() {
+  const data = formPayload();
+  const workerName = String(data.cf_email_worker_name || "openai-cpa-email").trim();
+  const secret = String(data.email_webhook_secret || "").trim();
+  if (!secret || secret === "********") {
+    setMessage("请先填写并保存 Webhook Secret（不要只留掩码）");
+    return;
+  }
+  if (!data.cf_api_email || !data.cf_api_key || data.cf_api_key === "********") {
+    // 允许已保存的掩码 key 走 merge_sensitive；但 email 必须有
+    if (!data.cf_api_email) {
+      setMessage("请先填写 Cloudflare 全局鉴权（CF 登录账号 + Global API Key）");
+      return;
+    }
+  }
+  const force = Boolean(data.cf_email_worker_force);
+  const tip = force
+    ? `强制覆盖部署 Worker「${workerName}」并写入 webhook 变量？`
+    : `部署 Worker「${workerName}」（已存在则跳过覆盖）？`;
+  if (!window.confirm(tip)) return;
+  setMessage(`正在部署 Worker ${workerName}…`);
+  if (cfDeployWorkerBtn) {
+    cfDeployWorkerBtn.disabled = true;
+    cfDeployWorkerBtn.textContent = "部署中…";
+  }
+  try {
+    await saveConfig().catch(() => {});
+    const webhookUrl =
+      (webhookSuggestedUrl && webhookSuggestedUrl.value) ||
+      (webhookPanelCache && webhookPanelCache.webhook && webhookPanelCache.webhook.suggested_base) ||
+      window.location.origin;
+    const result = await requestJson("/api/cloudflare/global/deploy-email-worker", {
+      method: "POST",
+      body: JSON.stringify({
+        ...formPayload(),
+        worker_name: workerName,
+        webhook_url: webhookUrl,
+        force,
+      }),
+    });
+    const msg = result.message || (result.skipped ? "Worker 已存在，已跳过" : "Worker 部署成功");
+    setMessage(msg);
+    setCfGlobalStatus(msg);
+    await loadWebhookPanel({ silent: true }).catch(() => {});
+  } catch (error) {
+    setMessage(`部署 Worker 失败：${error.message}`);
+  } finally {
+    if (cfDeployWorkerBtn) {
+      cfDeployWorkerBtn.disabled = false;
+      cfDeployWorkerBtn.textContent = "一键部署 Worker";
+    }
+  }
+}
+
+async function setupCfCatchAll() {
+  const data = formPayload();
+  const domains = mailDomainsFromForm();
+  const workerName = String(data.cf_email_worker_name || "openai-cpa-email").trim();
+  if (!domains) {
+    setMessage("请先填写 mail_domains");
+    return;
+  }
+  if (!data.cf_api_email) {
+    setMessage("请先填写 Cloudflare 全局鉴权");
+    return;
+  }
+  if (
+    !window.confirm(
+      `把以下域名的 Email Routing catch-all 指到 Worker「${workerName}」？\n\n${domains}\n\n要求：域名 NS 已生效（active），且 Worker 已部署。`
+    )
+  ) {
+    return;
+  }
+  setMessage(`正在绑定 catch-all → ${workerName}…`);
+  if (cfSetupCatchAllBtn) {
+    cfSetupCatchAllBtn.disabled = true;
+    cfSetupCatchAllBtn.textContent = "绑定中…";
+  }
+  try {
+    await saveConfig().catch(() => {});
+    const result = await requestJson("/api/cloudflare/global/setup-catch-all", {
+      method: "POST",
+      body: JSON.stringify({
+        ...formPayload(),
+        domains,
+        worker_name: workerName,
+      }),
+    });
+    const items = Array.isArray(result.items) ? result.items : [];
+    const lines = items.map((it) => `${it.domain}: ${it.msg || (it.ok ? "ok" : "fail")}`);
+    const summary = `Catch-all：成功 ${result.total || 0} / 失败 ${result.failed || 0}（Worker=${result.worker_name || workerName}）`;
+    setMessage(summary);
+    setCfGlobalStatus(summary + (lines.length ? `。${lines.slice(0, 4).join("；")}` : ""));
+  } catch (error) {
+    setMessage(`绑定 catch-all 失败：${error.message}`);
+  } finally {
+    if (cfSetupCatchAllBtn) {
+      cfSetupCatchAllBtn.disabled = false;
+      cfSetupCatchAllBtn.textContent = "绑定 Catch-all → Worker";
+    }
+  }
+}
+
+if (cfDeployWorkerBtn) {
+  cfDeployWorkerBtn.addEventListener("click", () => {
+    deployCfEmailWorker().catch((error) => setMessage(error.message));
+  });
+}
+if (cfSetupCatchAllBtn) {
+  cfSetupCatchAllBtn.addEventListener("click", () => {
+    setupCfCatchAll().catch((error) => setMessage(error.message));
   });
 }
 

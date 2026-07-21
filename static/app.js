@@ -352,8 +352,15 @@ function applyConfig(config) {
 async function requestJson(url, options = {}) {
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
     ...options,
   });
+  // 会话过期 / 未登录 → 跳转登录页
+  if (response.status === 401 && !String(url).includes("/api/auth/")) {
+    const next = `${location.pathname}${location.search || ""}` || "/";
+    location.replace(`/login?next=${encodeURIComponent(next)}`);
+    throw new Error("未登录或会话已过期");
+  }
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     let detail = payload.detail || payload.message || `HTTP ${response.status}`;
@@ -367,6 +374,15 @@ async function requestJson(url, options = {}) {
     throw new Error(detail);
   }
   return payload;
+}
+
+async function logout() {
+  try {
+    await requestJson("/api/auth/logout", { method: "POST", body: "{}" });
+  } catch (e) {
+    /* ignore */
+  }
+  location.replace("/login");
 }
 
 function selectedExportFormats() {
@@ -2715,6 +2731,13 @@ if (notifyTestBtn) {
         notifyTestBtn.disabled = false;
       }
     })();
+  });
+}
+
+const logoutBtn = document.querySelector("#logoutBtn");
+if (logoutBtn) {
+  logoutBtn.addEventListener("click", () => {
+    logout().catch(() => location.replace("/login"));
   });
 }
 

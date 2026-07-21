@@ -11,6 +11,8 @@ services:
       GROK_REG_HEADLESS: "0"
       CHROME_BIN: /usr/bin/browser
       TZ: Asia/Shanghai
+      # Web 访问密码（公网必改）。留空字符串可关闭鉴权：GROK_REG_WEB_PASSWORD=
+      GROK_REG_WEB_PASSWORD: "${GROK_REG_WEB_PASSWORD:-admin}"
       # 独立 turnstile-solver；同 compose 网络可用 http://turnstile-solver:5072
       GROK_REG_TURNSTILE_SOLVER_URL: "${GROK_REG_TURNSTILE_SOLVER_URL:-http://host.docker.internal:5072}"
       # 容器默认纯 HTTP 建号（无浏览器）；可选 http|api|browser

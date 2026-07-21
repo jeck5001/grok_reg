@@ -1,12 +1,18 @@
+import hashlib
+import hmac
+import os
 import re
+import secrets
 import time
 from collections import Counter
 from pathlib import Path
 from threading import Lock
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 import grok_register_ttk as reg
 
@@ -24,7 +30,26 @@ SENSITIVE_KEYS = {
     "yyds_jwt",
     "email_webhook_secret",
     "notify_telegram_bot_token",
+    "web_password",
 }
+
+# ---------- 公网访问密码（会话 Cookie）----------
+# 优先级：环境变量 GROK_REG_WEB_PASSWORD > 配置 web_password > 默认 admin
+# 设为空字符串可关闭登录校验（仅建议内网）。
+_AUTH_COOKIE = "grok_reg_session"
+_AUTH_SESSIONS = {}  # token -> {"exp": unix, "ua": str}
+_AUTH_LOCK = Lock()
+_AUTH_TTL_SEC = 7 * 24 * 3600
+_AUTH_PUBLIC_PREFIXES = (
+    "/healthz",
+    "/api/auth/login",
+    "/api/auth/status",
+    "/api/webhook/email",  # Worker 推信用自己的 secret
+    "/login",
+    "/static/",
+)
+_login_fail_until = {}  # ip -> unix unlock time
+_login_fail_count = {}
 
 _FAIL_REASON_RULES = (
     ("domain_rejected", ("域名被拒", "EmailDomainRejected", "account_email_domain_rejected", "form_invalid_disposable_email", "已被拒绝")),
@@ -46,6 +71,133 @@ _active_job_id = None
 _job_lock = Lock()
 # pending/running 正常执行；stopping 已请求停止但仍在收尾
 _ACTIVE_JOB_STATUSES = frozenset({"pending", "running", "stopping"})
+
+
+def get_web_password() -> str:
+    """返回当前 Web 访问密码；空字符串表示关闭鉴权。"""
+    env = os.environ.get("GROK_REG_WEB_PASSWORD")
+    if env is not None:
+        return str(env)
+    try:
+        cfg = reg.load_config() or {}
+        if "web_password" in cfg:
+            return str(cfg.get("web_password") or "")
+    except Exception:
+        pass
+    return "admin"
+
+
+def auth_enabled() -> bool:
+    return bool(str(get_web_password() or "").strip())
+
+
+def _purge_sessions(now=None):
+    now = now if now is not None else time.time()
+    dead = [t for t, meta in _AUTH_SESSIONS.items() if float(meta.get("exp") or 0) <= now]
+    for t in dead:
+        _AUTH_SESSIONS.pop(t, None)
+
+
+def create_session(request: Request) -> str:
+    token = secrets.token_urlsafe(32)
+    ua = str(request.headers.get("user-agent") or "")[:180]
+    with _AUTH_LOCK:
+        _purge_sessions()
+        _AUTH_SESSIONS[token] = {"exp": time.time() + _AUTH_TTL_SEC, "ua": ua}
+    return token
+
+
+def destroy_session(token: str) -> None:
+    if not token:
+        return
+    with _AUTH_LOCK:
+        _AUTH_SESSIONS.pop(str(token), None)
+
+
+def session_valid(request: Request) -> bool:
+    if not auth_enabled():
+        return True
+    token = str(request.cookies.get(_AUTH_COOKIE) or "").strip()
+    if not token:
+        # 兼容 Authorization: Bearer <token>
+        auth = str(request.headers.get("authorization") or "")
+        if auth.lower().startswith("bearer "):
+            token = auth[7:].strip()
+    if not token:
+        return False
+    now = time.time()
+    with _AUTH_LOCK:
+        _purge_sessions(now)
+        meta = _AUTH_SESSIONS.get(token)
+        if not meta:
+            return False
+        if float(meta.get("exp") or 0) <= now:
+            _AUTH_SESSIONS.pop(token, None)
+            return False
+        # 滑动续期
+        meta["exp"] = now + _AUTH_TTL_SEC
+        return True
+
+
+def _client_ip(request: Request) -> str:
+    xff = str(request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if xff:
+        return xff
+    if request.client:
+        return str(request.client.host or "")
+    return ""
+
+
+def _login_rate_limited(ip: str) -> bool:
+    now = time.time()
+    until = float(_login_fail_until.get(ip) or 0)
+    return until > now
+
+
+def _note_login_failure(ip: str) -> None:
+    n = int(_login_fail_count.get(ip) or 0) + 1
+    _login_fail_count[ip] = n
+    # 5 次起锁 30s，之后每次失败再加 30s，上限 10 分钟
+    if n >= 5:
+        lock = min(600, 30 * (n - 4))
+        _login_fail_until[ip] = time.time() + lock
+
+
+def _clear_login_failures(ip: str) -> None:
+    _login_fail_count.pop(ip, None)
+    _login_fail_until.pop(ip, None)
+
+
+def _is_public_path(path: str) -> bool:
+    p = path or "/"
+    if p in {"/healthz", "/login", "/api/auth/login", "/api/auth/status", "/favicon.ico"}:
+        return True
+    for prefix in _AUTH_PUBLIC_PREFIXES:
+        if p == prefix.rstrip("/") or p.startswith(prefix):
+            return True
+    return False
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path or "/"
+        if not auth_enabled() or _is_public_path(path):
+            return await call_next(request)
+        if session_valid(request):
+            return await call_next(request)
+        # API → 401 JSON；页面 → 跳转登录
+        if path.startswith("/api/"):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "未登录或会话已过期", "code": "auth_required"},
+            )
+        nxt = path
+        if request.url.query:
+            nxt = f"{path}?{request.url.query}"
+        return RedirectResponse(url=f"/login?next={quote(nxt, safe='/?&=')}", status_code=302)
+
+
+app.add_middleware(AuthMiddleware)
 
 
 def mask_config(settings):
@@ -86,13 +238,91 @@ def active_job_running():
 
 
 @app.get("/")
-def index():
+def index(request: Request):
+    if auth_enabled() and not session_valid(request):
+        return RedirectResponse(url="/login?next=/", status_code=302)
     return FileResponse(ROOT / "templates" / "index.html")
+
+
+@app.get("/login")
+def login_page(request: Request):
+    # 已登录则回首页
+    if session_valid(request):
+        return RedirectResponse(url="/", status_code=302)
+    return FileResponse(ROOT / "templates" / "login.html")
 
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    return {"status": "ok", "auth_enabled": auth_enabled()}
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request):
+    enabled = auth_enabled()
+    return {
+        "ok": True,
+        "auth_enabled": enabled,
+        "authenticated": (not enabled) or session_valid(request),
+    }
+
+
+@app.post("/api/auth/login")
+def auth_login(payload: dict, request: Request):
+    ip = _client_ip(request)
+    if _login_rate_limited(ip):
+        left = int(max(1, float(_login_fail_until.get(ip) or 0) - time.time()))
+        raise HTTPException(status_code=429, detail=f"尝试过多，请 {left}s 后再试")
+
+    password = str((payload or {}).get("password") or "")
+    expected = get_web_password()
+    if not str(expected or "").strip():
+        # 鉴权关闭时也允许“登录”，直接回成功
+        token = create_session(request)
+        resp = JSONResponse({"ok": True, "auth_enabled": False, "message": "鉴权已关闭"})
+        resp.set_cookie(
+            _AUTH_COOKIE,
+            token,
+            httponly=True,
+            samesite="lax",
+            max_age=_AUTH_TTL_SEC,
+            path="/",
+        )
+        return resp
+
+    # 常量时间比较
+    ok = hmac.compare_digest(
+        hashlib.sha256(password.encode("utf-8")).digest(),
+        hashlib.sha256(expected.encode("utf-8")).digest(),
+    )
+    if not ok:
+        _note_login_failure(ip)
+        raise HTTPException(status_code=401, detail="密码错误")
+
+    _clear_login_failures(ip)
+    token = create_session(request)
+    resp = JSONResponse({"ok": True, "auth_enabled": True, "message": "登录成功"})
+    # 公网建议反代终止 TLS；Cookie 不强制 Secure，避免纯 HTTP 部署丢会话
+    secure = str(request.headers.get("x-forwarded-proto") or request.url.scheme or "").lower() == "https"
+    resp.set_cookie(
+        _AUTH_COOKIE,
+        token,
+        httponly=True,
+        samesite="lax",
+        secure=secure,
+        max_age=_AUTH_TTL_SEC,
+        path="/",
+    )
+    return resp
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request):
+    token = str(request.cookies.get(_AUTH_COOKIE) or "").strip()
+    destroy_session(token)
+    resp = JSONResponse({"ok": True, "message": "已退出登录"})
+    resp.delete_cookie(_AUTH_COOKIE, path="/")
+    return resp
 
 
 @app.get("/api/config")

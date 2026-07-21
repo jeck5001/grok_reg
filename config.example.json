@@ -70,6 +70,7 @@
   "mail_domain_failure_types": ["discarded_email", "cloudflare_temp_email_network", "capacity_exceeded"],
   "email_webhook_enabled": false,
   "email_webhook_secret": "",
+  "web_password": "admin",
   "notify_enabled": false,
   "notify_min_level": "warn",
   "notify_cooldown_sec": 180,

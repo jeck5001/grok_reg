@@ -58,6 +58,36 @@ docker compose up -d
 http://<NAS-IP>:8787
 ```
 
+### Web 访问密码（公网必开）
+
+默认启用密码登录，未登录会跳到 `/login`。
+
+优先级：
+
+1. 环境变量 `GROK_REG_WEB_PASSWORD`（compose 推荐）
+2. 配置项 `web_password`（控制台「通知」页旁的安全配置）
+3. 默认 `admin`
+
+Compose 示例：
+
+```yaml
+environment:
+  GROK_REG_WEB_PASSWORD: "换成强密码"
+```
+
+关闭鉴权（仅内网）：
+
+```bash
+GROK_REG_WEB_PASSWORD= docker compose up -d
+# 或配置里把 web_password 置空并保存
+```
+
+放行路径（无需登录）：
+
+- `GET /healthz`
+- `POST /api/webhook/email`（仍校验 `email_webhook_secret`）
+- `/login`、`/static/*`
+
 ## 持久化文件
 
 Compose 默认挂载：

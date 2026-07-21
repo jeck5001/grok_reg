@@ -24,7 +24,41 @@ def test_healthz():
     response = client.get("/healthz")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    body = response.json()
+    assert body.get("status") == "ok"
+    assert "auth_enabled" in body
+
+
+def test_web_password_login_guards_api(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("GROK_REG_WEB_PASSWORD", "unit-pass")
+    import web_app
+    from web_app import app
+
+    # 清会话，避免污染
+    web_app._AUTH_SESSIONS.clear()
+    client = TestClient(app)
+
+    blocked = client.get("/api/config")
+    assert blocked.status_code == 401
+
+    bad = client.post("/api/auth/login", json={"password": "nope"})
+    assert bad.status_code == 401
+
+    ok = client.post("/api/auth/login", json={"password": "unit-pass"})
+    assert ok.status_code == 200
+    assert ok.json().get("ok") is True
+
+    cfg = client.get("/api/config")
+    assert cfg.status_code == 200
+
+    # webhook 仍公开（业务层校验 secret）
+    wh = client.post("/api/webhook/email", json={})
+    assert wh.status_code in {400, 503}
+
+    out = client.post("/api/auth/logout")
+    assert out.status_code == 200
+    assert client.get("/api/config").status_code == 401
 
 
 def test_config_round_trip_masks_sensitive_values(monkeypatch, tmp_path):
@@ -401,7 +435,11 @@ def test_start_job_rejects_duplicate_active_job(monkeypatch, tmp_path):
         "/api/jobs/start",
         json={"email_provider": "duckmail", "register_count": 1, "register_threads": 1},
     )
-    assert duplicate.status_code == 409
+    # 已有任务时恢复跟踪（200 + already_running），不再硬 409
+    assert duplicate.status_code == 200
+    body = duplicate.json()
+    assert body.get("already_running") is True
+    assert body.get("job_id") == job_id
 
     stop_response = client.post(f"/api/jobs/{job_id}/stop")
     assert stop_response.status_code == 200

@@ -168,6 +168,8 @@ DEFAULT_CONFIG = {
     # openai-cpa-email Worker webhook 收件（本地内存池）
     "email_webhook_enabled": False,
     "email_webhook_secret": "",
+    # Web 访问密码（公网务必修改）。环境变量 GROK_REG_WEB_PASSWORD 优先；空字符串=关闭鉴权。
+    "web_password": "admin",
     "notify_enabled": False,
     "notify_min_level": "warn",
     "notify_cooldown_sec": 180,

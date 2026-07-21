@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>登录 · Grok Register</title>
+  <link rel="stylesheet" href="/static/app.css" />
+  <style>
+    .login-page {
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+    .login-card {
+      width: min(400px, 100%);
+      background: var(--panel, rgba(18,22,28,.92));
+      border: 1px solid var(--line, rgba(148,163,184,.14));
+      border-radius: var(--radius, 14px);
+      box-shadow: var(--shadow, 0 12px 40px rgba(0,0,0,.35));
+      padding: 28px 24px 22px;
+    }
+    .login-card h1 {
+      margin: 0 0 6px;
+      font-size: 1.25rem;
+      font-weight: 650;
+    }
+    .login-card .sub {
+      margin: 0 0 20px;
+      color: var(--muted, #8b97a8);
+      font-size: 13px;
+    }
+    .login-card label {
+      display: block;
+      margin-bottom: 14px;
+      font-size: 12px;
+      color: var(--muted, #8b97a8);
+    }
+    .login-card input[type="password"],
+    .login-card input[type="text"] {
+      width: 100%;
+      margin-top: 6px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--line, rgba(148,163,184,.14));
+      background: rgba(0,0,0,.25);
+      color: var(--text, #e8edf4);
+      font-size: 14px;
+      outline: none;
+    }
+    .login-card input:focus {
+      border-color: var(--line-strong, rgba(110,231,183,.38));
+    }
+    .login-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 8px;
+    }
+    .login-actions button {
+      flex: 1;
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: 1px solid var(--line, rgba(148,163,184,.14));
+      background: var(--accent-dim, rgba(110,231,183,.12));
+      color: var(--accent, #6ee7b7);
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .login-actions button:hover { filter: brightness(1.08); }
+    .login-msg {
+      min-height: 1.2em;
+      margin: 12px 0 0;
+      font-size: 13px;
+      color: var(--danger, #fb7185);
+    }
+    .login-msg.ok { color: var(--accent, #6ee7b7); }
+  </style>
+</head>
+<body>
+  <div class="login-page">
+    <form class="login-card" id="loginForm" autocomplete="on">
+      <h1>Grok Register</h1>
+      <p class="sub">公网访问需要密码。默认可用环境变量 <code>GROK_REG_WEB_PASSWORD</code> 覆盖。</p>
+      <label>
+        访问密码
+        <input id="password" name="password" type="password" autocomplete="current-password" required autofocus />
+      </label>
+      <div class="login-actions">
+        <button type="submit" id="loginBtn">登录</button>
+      </div>
+      <p class="login-msg" id="loginMsg"></p>
+    </form>
+  </div>
+  <script>
+    const form = document.getElementById("loginForm");
+    const password = document.getElementById("password");
+    const msg = document.getElementById("loginMsg");
+    const btn = document.getElementById("loginBtn");
+    const params = new URLSearchParams(location.search);
+    const next = params.get("next") || "/";
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      msg.textContent = "";
+      msg.className = "login-msg";
+      btn.disabled = true;
+      btn.textContent = "登录中…";
+      try {
+        const resp = await fetch("/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({ password: password.value || "" }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          throw new Error(data.detail || data.message || `HTTP ${resp.status}`);
+        }
+        msg.className = "login-msg ok";
+        msg.textContent = "登录成功，正在进入…";
+        location.replace(next.startsWith("/") ? next : "/");
+      } catch (err) {
+        msg.textContent = err.message || "登录失败";
+        password.focus();
+        password.select();
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "登录";
+      }
+    });
+  </script>
+</body>
+</html>

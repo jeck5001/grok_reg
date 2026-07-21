@@ -17,6 +17,7 @@
         <div class="status-panel">
           <span id="statusText">就绪</span>
           <strong id="statsText">成功 0 / 失败 0</strong>
+          <button id="logoutBtn" type="button" class="ghost-btn" title="退出登录">退出</button>
         </div>
       </section>
 
@@ -557,6 +558,23 @@
                 3）CF Email Routing catch-all 指到该 Worker；
                 4）先点「本机模拟推送测试」，再跑注册。
               </p>
+            </section>
+
+            <section class="config-section" data-config-group="notify" data-config-section="Web访问安全">
+              <div class="section-copy">
+                <p class="section-kicker">Security</p>
+                <h2>Web 访问密码</h2>
+                <p class="hint">
+                  公网部署务必修改。优先级：环境变量 <code>GROK_REG_WEB_PASSWORD</code>
+                  &gt; 本配置 &gt; 默认 <code>admin</code>。填空并保存可关闭鉴权（仅内网）。
+                </p>
+              </div>
+              <div class="config-grid">
+                <label class="wide">
+                  访问密码
+                  <input name="web_password" type="password" autocomplete="new-password" placeholder="公网务必修改默认 admin" />
+                </label>
+              </div>
             </section>
 
             <section class="config-section" data-config-group="notify" data-config-section="Telegram通知">

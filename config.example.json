@@ -7,6 +7,8 @@
   "cloudflare_path_accounts": "/api/new_address",
   "cloudflare_path_token": "/api/token",
   "cloudflare_path_messages": "/api/mails",
+  "cf_api_email": "",
+  "cf_api_key": "",
   "proxy": "",
   "enable_nsfw": false,
   "register_count": 1,

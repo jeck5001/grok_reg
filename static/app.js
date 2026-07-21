@@ -15,6 +15,10 @@ const deleteSub2apiRemoteBtn = document.querySelector("#deleteSub2apiRemoteBtn")
 const importCpaBtn = document.querySelector("#importCpaBtn");
 const exportAccountsBtn = document.querySelector("#exportAccountsBtn");
 const deleteAccountsBtn = document.querySelector("#deleteAccountsBtn");
+const cfGlobalTestBtn = document.querySelector("#cfGlobalTestBtn");
+const cfGlobalZonesBtn = document.querySelector("#cfGlobalZonesBtn");
+const cfGlobalEmailDnsBtn = document.querySelector("#cfGlobalEmailDnsBtn");
+const cfGlobalStatus = document.querySelector("#cfGlobalStatus");
 const exportFmtNative = document.querySelector("#exportFmtNative");
 const exportFmtGrok2api = document.querySelector("#exportFmtGrok2api");
 const exportFmtSub2api = document.querySelector("#exportFmtSub2api");
@@ -2269,9 +2273,116 @@ function startPolling() {
   pollJob().catch((error) => setMessage(error.message));
 }
 
+function setCfGlobalStatus(text) {
+  if (cfGlobalStatus) cfGlobalStatus.textContent = text || "";
+}
+
+function mailDomainsFromForm() {
+  const data = formPayload();
+  return String(data.mail_domains || data.defaultDomains || "").trim();
+}
+
+async function testCfGlobalAuth() {
+  setCfGlobalStatus("正在测试 Cloudflare 全局鉴权…");
+  setMessage("正在测试 Cloudflare 全局鉴权…");
+  try {
+    // 先保存，避免只改了表单没落盘
+    await saveConfig().catch(() => {});
+    const result = await requestJson("/api/cloudflare/global/test", {
+      method: "POST",
+      body: JSON.stringify(formPayload()),
+    });
+    const accounts = Array.isArray(result.accounts) ? result.accounts : [];
+    const names = accounts
+      .slice(0, 3)
+      .map((a) => a.name || a.id)
+      .filter(Boolean)
+      .join("、");
+    const msg =
+      result.message ||
+      `鉴权成功${names ? `（账户: ${names}${accounts.length > 3 ? "…" : ""}）` : ""}`;
+    setCfGlobalStatus(msg);
+    setMessage(msg);
+  } catch (error) {
+    setCfGlobalStatus(`鉴权失败：${error.message}`);
+    setMessage(`Cloudflare 全局鉴权失败：${error.message}`);
+  }
+}
+
+async function ensureCfGlobalZones() {
+  const domains = mailDomainsFromForm();
+  if (!domains) {
+    setMessage("请先填写 mail_domains / defaultDomains");
+    return;
+  }
+  if (!window.confirm(`把以下域名查询/托管到 Cloudflare？\n\n${domains}`)) return;
+  setCfGlobalStatus("正在查询/托管域名…");
+  setMessage("正在查询/托管域名到 Cloudflare…");
+  try {
+    await saveConfig().catch(() => {});
+    const result = await requestJson("/api/cloudflare/global/zones", {
+      method: "POST",
+      body: JSON.stringify({ ...formPayload(), domains }),
+    });
+    const items = Array.isArray(result.items) ? result.items : [];
+    const lines = items.map((it) => {
+      const ns = (it.name_servers || []).slice(0, 2).join(", ");
+      return `${it.domain}: ${it.msg || it.status}${ns ? ` | NS ${ns}` : ""}`;
+    });
+    const summary = `域名托管结果：成功 ${result.total || 0} / 失败 ${result.failed || 0}`;
+    setCfGlobalStatus(summary + (lines.length ? `。${lines.slice(0, 4).join("；")}` : ""));
+    setMessage(summary);
+  } catch (error) {
+    setCfGlobalStatus(`域名托管失败：${error.message}`);
+    setMessage(`域名托管失败：${error.message}`);
+  }
+}
+
+async function ensureCfGlobalEmailDns() {
+  const domains = mailDomainsFromForm();
+  if (!domains) {
+    setMessage("请先填写 mail_domains / defaultDomains");
+    return;
+  }
+  if (!window.confirm(`为以下域名补齐 Email Routing MX/SPF？\n\n${domains}`)) return;
+  setCfGlobalStatus("正在补齐邮件 MX/SPF…");
+  setMessage("正在补齐 Cloudflare Email Routing DNS…");
+  try {
+    await saveConfig().catch(() => {});
+    const result = await requestJson("/api/cloudflare/global/email-dns", {
+      method: "POST",
+      body: JSON.stringify({ ...formPayload(), domains }),
+    });
+    const items = Array.isArray(result.items) ? result.items : [];
+    const lines = items.map((it) => `${it.domain}: ${it.msg || (it.ok ? "ok" : "fail")}`);
+    const summary = `邮件 DNS：成功 ${result.total || 0} / 失败 ${result.failed || 0}`;
+    setCfGlobalStatus(summary + (lines.length ? `。${lines.slice(0, 4).join("；")}` : ""));
+    setMessage(summary);
+  } catch (error) {
+    setCfGlobalStatus(`邮件 DNS 失败：${error.message}`);
+    setMessage(`邮件 DNS 失败：${error.message}`);
+  }
+}
+
 document.querySelector("#saveBtn").addEventListener("click", () => {
   saveConfig().catch((error) => setMessage(error.message));
 });
+
+if (cfGlobalTestBtn) {
+  cfGlobalTestBtn.addEventListener("click", () => {
+    testCfGlobalAuth().catch((error) => setMessage(error.message));
+  });
+}
+if (cfGlobalZonesBtn) {
+  cfGlobalZonesBtn.addEventListener("click", () => {
+    ensureCfGlobalZones().catch((error) => setMessage(error.message));
+  });
+}
+if (cfGlobalEmailDnsBtn) {
+  cfGlobalEmailDnsBtn.addEventListener("click", () => {
+    ensureCfGlobalEmailDns().catch((error) => setMessage(error.message));
+  });
+}
 
 startBtn.addEventListener("click", () => {
   startJob().catch((error) => setMessage(error.message));

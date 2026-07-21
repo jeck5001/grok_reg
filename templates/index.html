@@ -347,10 +347,50 @@
               </div>
             </section>
 
+            <section class="config-section" data-config-group="mail" data-config-section="Cloudflare全局鉴权">
+              <div class="section-copy">
+                <p class="section-kicker">Cloudflare 身份鉴权 (全局)</p>
+                <h2>官方 API 全局凭证</h2>
+                <p class="hint">
+                  用于域名托管 / Email Routing DNS 等官方 API（X-Auth-Email + Global API Key）。
+                  与下方 temp-email Worker 的 Admin Auth 是两套凭据，不要混填。
+                </p>
+              </div>
+              <div class="config-grid">
+                <label>
+                  CF 登录账号
+                  <input name="cf_api_email" type="email" autocomplete="off" placeholder="你的 Cloudflare 登录邮箱" />
+                </label>
+                <label>
+                  Global API Key
+                  <input name="cf_api_key" type="password" autocomplete="off" placeholder="Dashboard → My Profile → API Tokens → Global API Key" />
+                </label>
+                <label class="wide">
+                  邮件主域池 (mail_domains)
+                  <input name="mail_domains" placeholder="a.com,b.com,c.net（优先于 defaultDomains）" />
+                </label>
+                <label class="wide">
+                  默认域名 (兼容)
+                  <input name="defaultDomains" placeholder="a.com,b.com" />
+                </label>
+              </div>
+              <div class="accounts-actions" style="margin-top: 12px; flex-wrap: wrap; gap: 8px;">
+                <button id="cfGlobalTestBtn" type="button">测试全局鉴权</button>
+                <button id="cfGlobalZonesBtn" type="button">查询/托管域名</button>
+                <button id="cfGlobalEmailDnsBtn" type="button">补齐邮件 MX/SPF</button>
+              </div>
+              <p id="cfGlobalStatus" class="hint" style="margin-top: 8px;">尚未测试 Cloudflare 全局鉴权。</p>
+              <p class="hint" style="margin-top: 4px;">
+                获取 Global API Key：
+                <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener">dash.cloudflare.com/profile/api-tokens</a>
+              </p>
+            </section>
+
             <section class="config-section" data-config-group="mail" data-config-section="Cloudflare/CloudMail">
               <div class="section-copy">
-                <p class="section-kicker">Cloudflare / CloudMail</p>
-                <h2>自建邮箱后端</h2>
+                <p class="section-kicker">Cloudflare Temp Email / CloudMail</p>
+                <h2>自建邮箱后端（Worker）</h2>
+                <p class="hint">这里是 temp-email / cloud-mail 服务自己的地址与 Admin 密码，不是 Cloudflare 账号 Global API Key。</p>
               </div>
               <div class="config-grid">
                 <label>
@@ -385,14 +425,6 @@
                 <label>
                   CloudMail 管理员密码
                   <input name="cloudmail_password" type="password" autocomplete="off" />
-                </label>
-                <label class="wide">
-                  邮件主域池 (mail_domains)
-                  <input name="mail_domains" placeholder="a.com,b.com,c.net（优先于 defaultDomains）" />
-                </label>
-                <label class="wide">
-                  默认域名 (兼容)
-                  <input name="defaultDomains" placeholder="a.com,b.com" />
                 </label>
               </div>
             </section>

@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent
 SENSITIVE_KEYS = {
     "duckmail_api_key",
     "cloudflare_api_key",
+    "cf_api_key",
     "cloudmail_password",
     "grok2api_remote_app_key",
     "sub2api_admin_token",
@@ -145,6 +146,57 @@ def mail_domain_pool_clear_domain(payload: dict):
         return {"ok": True, "result": mdp.clear_domain_counters(domain)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/cloudflare/global/test")
+def cf_global_test_auth(payload: dict = None):
+    """测试 Cloudflare 全局身份鉴权（CF 登录账号 + Global API Key）。"""
+    settings = merge_sensitive_values(payload or {})
+    result = reg.test_cf_global_auth(settings)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("message") or "鉴权失败")
+    return result
+
+
+@app.get("/api/cloudflare/global/zones")
+def cf_global_list_zones(domains: str = Query("", max_length=4000)):
+    """查询域名在 CF 账号中的托管状态。domains 逗号分隔；空则用 mail_domains。"""
+    settings = reg.load_config()
+    try:
+        result = reg.list_cf_zones(domains=domains or None, settings=settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return result
+
+
+@app.post("/api/cloudflare/global/zones")
+def cf_global_ensure_zones(payload: dict):
+    """把域名加到 CF 托管并返回 NS（已存在则直接返回）。"""
+    settings = merge_sensitive_values(payload or {})
+    domains = (payload or {}).get("domains") or settings.get("mail_domains") or settings.get("defaultDomains") or ""
+    try:
+        result = reg.ensure_cf_zones(domains, settings=settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return result
+
+
+@app.post("/api/cloudflare/global/email-dns")
+def cf_global_email_dns(payload: dict):
+    """为域名补齐 Email Routing 通配 MX + SPF。"""
+    settings = merge_sensitive_values(payload or {})
+    domains = (payload or {}).get("domains") or settings.get("mail_domains") or settings.get("defaultDomains") or ""
+    try:
+        result = reg.ensure_cf_email_routing_dns(domains, settings=settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return result
 
 
 @app.post("/api/webhook/email")

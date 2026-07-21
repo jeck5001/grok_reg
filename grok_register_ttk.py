@@ -85,6 +85,10 @@ DEFAULT_CONFIG = {
     "cloudflare_path_accounts": "/accounts",
     "cloudflare_path_token": "/token",
     "cloudflare_path_messages": "/messages",
+    # Cloudflare 官方全局身份鉴权（X-Auth-Email + Global API Key）
+    # 用于域名托管 / Email Routing DNS 等官方 API；与上面 temp-email Worker 鉴权分开。
+    "cf_api_email": "",
+    "cf_api_key": "",
     "proxy": "http://127.0.0.1:7890",
     # 注册成功后立刻改 NSFW/生日等特征，容易被当成机器号；默认关闭，需要时再开。
     "enable_nsfw": False,
@@ -432,6 +436,314 @@ def cloudflare_apply_auth_params(params=None):
     if key and mode == "query-key":
         merged["key"] = key
     return merged
+
+
+def get_cf_global_email(settings=None):
+    src = settings if isinstance(settings, dict) else config
+    return str((src or {}).get("cf_api_email") or "").strip()
+
+
+def get_cf_global_api_key(settings=None):
+    src = settings if isinstance(settings, dict) else config
+    return str((src or {}).get("cf_api_key") or "").strip()
+
+
+def cf_global_auth_headers(settings=None, content_type=True):
+    """Cloudflare 官方 v4 全局鉴权头：X-Auth-Email + X-Auth-Key（Global API Key）。"""
+    email = get_cf_global_email(settings)
+    key = get_cf_global_api_key(settings)
+    if not email or not key:
+        raise ValueError("未配置 Cloudflare 全局身份鉴权：请填写 CF 登录账号 + Global API Key")
+    headers = {
+        "X-Auth-Email": email,
+        "X-Auth-Key": key,
+    }
+    if content_type:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def _cf_global_request(method, path, settings=None, params=None, json_body=None, timeout=30):
+    """调用 https://api.cloudflare.com/client/v4/..."""
+    if requests is None:
+        raise RuntimeError("curl_cffi 未安装，无法请求 Cloudflare API")
+    url = f"https://api.cloudflare.com/client/v4{path}"
+    headers = cf_global_auth_headers(settings=settings, content_type=True)
+    kwargs = _build_request_kwargs(headers=headers, timeout=timeout, proxies=get_proxies() or {})
+    if params:
+        kwargs["params"] = params
+    if json_body is not None:
+        kwargs["json"] = json_body
+    method = str(method or "GET").upper()
+    if method == "GET":
+        resp = requests.get(url, **kwargs)
+    elif method == "POST":
+        resp = requests.post(url, **kwargs)
+    elif method == "PUT":
+        resp = requests.put(url, **kwargs) if hasattr(requests, "put") else http_post(url, **kwargs)
+    elif method == "DELETE":
+        resp = http_delete(url, **kwargs)
+    else:
+        raise ValueError(f"unsupported method: {method}")
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"success": False, "errors": [{"message": (getattr(resp, "text", "") or "")[:300]}]}
+    if not isinstance(data, dict):
+        data = {"success": False, "errors": [{"message": "non-json response"}], "raw": data}
+    data.setdefault("http_status", int(getattr(resp, "status_code", 0) or 0))
+    return data
+
+
+def test_cf_global_auth(settings=None, log_callback=None):
+    """验证 Global API Key：GET /accounts + /user。"""
+    settings = {**config, **dict(settings or {})}
+    email = get_cf_global_email(settings)
+    if not email:
+        return {"ok": False, "message": "未填写 CF 登录账号（cf_api_email）"}
+    if not get_cf_global_api_key(settings):
+        return {"ok": False, "message": "未填写 Global API Key（cf_api_key）"}
+    try:
+        user = _cf_global_request("GET", "/user", settings=settings, timeout=20)
+        if not user.get("success"):
+            errs = user.get("errors") or []
+            msg = "; ".join(str(e.get("message") or e) for e in errs if e) or f"HTTP {user.get('http_status')}"
+            return {"ok": False, "message": f"鉴权失败: {msg}", "response": user}
+        accounts = _cf_global_request("GET", "/accounts", settings=settings, timeout=20)
+        acc_list = accounts.get("result") if isinstance(accounts.get("result"), list) else []
+        user_info = user.get("result") if isinstance(user.get("result"), dict) else {}
+        result = {
+            "ok": True,
+            "message": f"鉴权成功：{user_info.get('email') or email}，账户 {len(acc_list)} 个",
+            "user": {
+                "id": user_info.get("id"),
+                "email": user_info.get("email") or email,
+            },
+            "accounts": [
+                {"id": a.get("id"), "name": a.get("name")}
+                for a in acc_list[:20]
+                if isinstance(a, dict)
+            ],
+        }
+        if log_callback:
+            log_callback(f"[+] Cloudflare 全局鉴权 OK: {result['message']}")
+        return result
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
+
+
+def list_cf_zones(domains=None, settings=None):
+    """查询域名是否在 CF 账号中。domains: 逗号串或列表；空则只测连通。"""
+    settings = {**config, **dict(settings or {})}
+    if isinstance(domains, str):
+        domain_list = [d.strip().lower().lstrip("@.") for d in domains.split(",") if d.strip()]
+    else:
+        domain_list = [str(d).strip().lower().lstrip("@.") for d in (domains or []) if str(d).strip()]
+    if not domain_list:
+        # 从 mail_domains 取
+        raw = str(settings.get("mail_domains") or settings.get("defaultDomains") or "")
+        domain_list = [d.strip().lower().lstrip("@.") for d in raw.split(",") if d.strip()]
+    results = []
+    for domain in domain_list[:50]:
+        data = _cf_global_request(
+            "GET",
+            "/zones",
+            settings=settings,
+            params={"name": domain, "per_page": 5},
+            timeout=20,
+        )
+        items = data.get("result") if isinstance(data.get("result"), list) else []
+        if data.get("success") and items:
+            z = items[0]
+            results.append(
+                {
+                    "domain": domain,
+                    "found": True,
+                    "zone_id": z.get("id"),
+                    "status": z.get("status"),
+                    "name_servers": z.get("name_servers") or [],
+                    "paused": bool(z.get("paused")),
+                }
+            )
+        else:
+            errs = data.get("errors") or []
+            results.append(
+                {
+                    "domain": domain,
+                    "found": False,
+                    "zone_id": "",
+                    "status": "not_found",
+                    "name_servers": [],
+                    "error": "; ".join(str(e.get("message") or e) for e in errs if e)
+                    if errs
+                    else "",
+                }
+            )
+    return {"ok": True, "total": len(results), "items": results}
+
+
+def ensure_cf_zones(domains, settings=None, log_callback=None):
+    """把域名加到 CF 托管（已存在则返回 NS）。对齐 openai-cpa add_zones。"""
+    settings = {**config, **dict(settings or {})}
+    if isinstance(domains, str):
+        domain_list = [d.strip().lower().lstrip("@.") for d in domains.split(",") if d.strip()]
+    else:
+        domain_list = [str(d).strip().lower().lstrip("@.") for d in (domains or []) if str(d).strip()]
+    if not domain_list:
+        raise ValueError("请提供要托管的域名")
+
+    acc = _cf_global_request("GET", "/accounts", settings=settings, timeout=20)
+    if not acc.get("success") or not (acc.get("result") or []):
+        errs = acc.get("errors") or []
+        raise RuntimeError(
+            f"无法获取 CF Account ID: "
+            + ("; ".join(str(e.get("message") or e) for e in errs if e) or "empty")
+        )
+    account_id = acc["result"][0].get("id")
+    items = []
+    for domain in domain_list:
+        check = _cf_global_request(
+            "GET",
+            "/zones",
+            settings=settings,
+            params={"name": domain, "per_page": 5},
+            timeout=20,
+        )
+        existing = check.get("result") if isinstance(check.get("result"), list) else []
+        if check.get("success") and existing:
+            z = existing[0]
+            item = {
+                "domain": domain,
+                "status": z.get("status"),
+                "zone_id": z.get("id"),
+                "name_servers": z.get("name_servers") or [],
+                "msg": "已托管",
+                "created": False,
+            }
+            items.append(item)
+            if log_callback:
+                log_callback(f"[*] CF zone 已存在: {domain} ns={','.join(item['name_servers'][:2])}")
+            continue
+        add = _cf_global_request(
+            "POST",
+            "/zones",
+            settings=settings,
+            json_body={
+                "name": domain,
+                "account": {"id": account_id},
+                "type": "full",
+                "jump_start": True,
+            },
+            timeout=40,
+        )
+        if add.get("success") and isinstance(add.get("result"), dict):
+            z = add["result"]
+            item = {
+                "domain": domain,
+                "status": z.get("status"),
+                "zone_id": z.get("id"),
+                "name_servers": z.get("name_servers") or [],
+                "msg": "已添加，请到注册商改 NS",
+                "created": True,
+            }
+            items.append(item)
+            if log_callback:
+                log_callback(
+                    f"[+] CF zone 已添加: {domain} → NS {', '.join(item['name_servers'][:4])}"
+                )
+        else:
+            errs = add.get("errors") or []
+            msg = "; ".join(str(e.get("message") or e) for e in errs if e) or "unknown"
+            items.append(
+                {
+                    "domain": domain,
+                    "status": "error",
+                    "zone_id": "",
+                    "name_servers": [],
+                    "msg": msg,
+                    "created": False,
+                }
+            )
+            if log_callback:
+                log_callback(f"[!] CF zone 添加失败 {domain}: {msg}")
+        time.sleep(0.3)
+    ok_n = len([i for i in items if i.get("status") != "error"])
+    return {"ok": ok_n == len(items), "total": ok_n, "failed": len(items) - ok_n, "items": items}
+
+
+def ensure_cf_email_routing_dns(domains, settings=None, log_callback=None):
+    """为域名补齐 Email Routing 所需的通配 MX + SPF TXT（对齐 openai-cpa add_wildcard_dns）。"""
+    settings = {**config, **dict(settings or {})}
+    if isinstance(domains, str):
+        domain_list = [d.strip().lower().lstrip("@.") for d in domains.split(",") if d.strip()]
+    else:
+        domain_list = [str(d).strip().lower().lstrip("@.") for d in (domains or []) if str(d).strip()]
+    if not domain_list:
+        raise ValueError("请提供域名")
+
+    records_template = (
+        {"type": "MX", "name": "*", "content": "route3.mx.cloudflare.net", "priority": 36},
+        {"type": "MX", "name": "*", "content": "route2.mx.cloudflare.net", "priority": 25},
+        {"type": "MX", "name": "*", "content": "route1.mx.cloudflare.net", "priority": 51},
+        {
+            "type": "TXT",
+            "name": "*",
+            "content": '"v=spf1 include:_spf.mx.cloudflare.net ~all"',
+        },
+    )
+    items = []
+    for domain in domain_list:
+        zone_q = _cf_global_request(
+            "GET",
+            "/zones",
+            settings=settings,
+            params={"name": domain, "per_page": 5},
+            timeout=20,
+        )
+        zones = zone_q.get("result") if isinstance(zone_q.get("result"), list) else []
+        if not zone_q.get("success") or not zones:
+            items.append({"domain": domain, "ok": False, "msg": "zone 不存在，请先托管到 CF"})
+            if log_callback:
+                log_callback(f"[!] CF Email DNS 跳过 {domain}: zone 不存在")
+            continue
+        zone_id = zones[0].get("id")
+        created = 0
+        skipped = 0
+        errors = []
+        for rec in records_template:
+            body = dict(rec)
+            body["name"] = f"{rec['name']}.{domain}" if rec["name"] != "@" else domain
+            # Cloudflare 接受 name=* 相对 zone
+            body["name"] = rec["name"]
+            resp = _cf_global_request(
+                "POST",
+                f"/zones/{zone_id}/dns_records",
+                settings=settings,
+                json_body=body,
+                timeout=20,
+            )
+            if resp.get("success"):
+                created += 1
+            else:
+                errs = resp.get("errors") or []
+                codes = {e.get("code") for e in errs if isinstance(e, dict)}
+                # 81057/81058 已存在
+                if codes & {81057, 81058}:
+                    skipped += 1
+                else:
+                    errors.append(
+                        "; ".join(str(e.get("message") or e) for e in errs if e) or "error"
+                    )
+            time.sleep(0.2)
+        ok = not errors
+        msg = f"created={created} skipped={skipped}"
+        if errors:
+            msg += f" errors={errors[:2]}"
+        items.append({"domain": domain, "ok": ok, "zone_id": zone_id, "msg": msg})
+        if log_callback:
+            log_callback(f"[{'+' if ok else '!'}] CF Email DNS {domain}: {msg}")
+    ok_n = len([i for i in items if i.get("ok")])
+    return {"ok": ok_n == len(items), "total": ok_n, "failed": len(items) - ok_n, "items": items}
 
 
 def _pick_list_payload(data):

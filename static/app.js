@@ -30,7 +30,15 @@ const webhookChecks = document.querySelector("#webhookChecks");
 const webhookSuggestedUrl = document.querySelector("#webhookSuggestedUrl");
 const webhookFullUrl = document.querySelector("#webhookFullUrl");
 const webhookPanelDetail = document.querySelector("#webhookPanelDetail");
+const webhookActionStatus = document.querySelector("#webhookActionStatus");
 let webhookPanelCache = null;
+
+function setWebhookActionStatus(text, tone = "") {
+  if (!webhookActionStatus) return;
+  webhookActionStatus.textContent = text || "";
+  webhookActionStatus.style.color =
+    tone === "error" ? "var(--danger, #fb7185)" : tone === "ok" ? "var(--accent, #6ee7b7)" : "";
+}
 const exportFmtNative = document.querySelector("#exportFmtNative");
 const exportFmtGrok2api = document.querySelector("#exportFmtGrok2api");
 const exportFmtSub2api = document.querySelector("#exportFmtSub2api");
@@ -2420,31 +2428,55 @@ if (cfGlobalEmailDnsBtn) {
 
 async function deployCfEmailWorker() {
   const data = formPayload();
-  const workerName = String(data.cf_email_worker_name || "openai-cpa-email").trim();
+  const workerName = String(data.cf_email_worker_name || "openai-cpa-email").trim() || "openai-cpa-email";
   const secret = String(data.email_webhook_secret || "").trim();
-  if (!secret || secret === "********") {
-    setMessage("请先填写并保存 Webhook Secret（不要只留掩码）");
+  // 已保存的密钥会显示为 ********，后端 merge_sensitive 会还原，不能当“未填写”
+  if (!secret) {
+    const msg = "请先填写 Webhook Secret 并保存配置";
+    setWebhookActionStatus(msg, "error");
+    setMessage(msg);
     return;
   }
-  if (!data.cf_api_email || !data.cf_api_key || data.cf_api_key === "********") {
-    // 允许已保存的掩码 key 走 merge_sensitive；但 email 必须有
-    if (!data.cf_api_email) {
-      setMessage("请先填写 Cloudflare 全局鉴权（CF 登录账号 + Global API Key）");
-      return;
-    }
+  if (!String(data.cf_api_email || "").trim()) {
+    const msg = "请先填写 Cloudflare 全局鉴权：CF 登录账号";
+    setWebhookActionStatus(msg, "error");
+    setMessage(msg);
+    return;
+  }
+  if (!String(data.cf_api_key || "").trim()) {
+    const msg = "请先填写 Cloudflare 全局鉴权：Global API Key";
+    setWebhookActionStatus(msg, "error");
+    setMessage(msg);
+    return;
   }
   const force = Boolean(data.cf_email_worker_force);
   const tip = force
-    ? `强制覆盖部署 Worker「${workerName}」并写入 webhook 变量？`
-    : `部署 Worker「${workerName}」（已存在则跳过覆盖）？`;
-  if (!window.confirm(tip)) return;
+    ? `强制覆盖部署 Worker「${workerName}」并写入 webhook 变量？\n\n点「取消」可中止。`
+    : `部署 Worker「${workerName}」？\n（已存在则跳过覆盖；要更新 URL/Secret 请勾选「强制覆盖」）\n\n点「取消」可中止。`;
+  // 部分环境 confirm 被拦时直接继续，避免“点了没反应”
+  let confirmed = true;
+  try {
+    confirmed = window.confirm(tip);
+  } catch (e) {
+    confirmed = true;
+  }
+  if (!confirmed) {
+    setWebhookActionStatus("已取消部署", "");
+    setMessage("已取消部署 Worker");
+    return;
+  }
+  setWebhookActionStatus(`正在部署 Worker ${workerName}…`, "");
   setMessage(`正在部署 Worker ${workerName}…`);
   if (cfDeployWorkerBtn) {
     cfDeployWorkerBtn.disabled = true;
     cfDeployWorkerBtn.textContent = "部署中…";
   }
   try {
-    await saveConfig().catch(() => {});
+    // 掩码密钥不要用当前表单覆盖服务端真实值：保存前若 secret/key 是 ******，先恢复占位逻辑由 merge_sensitive 处理
+    await saveConfig().catch((e) => {
+      // 保存失败不阻断部署（服务端仍可用已存配置）
+      console.warn("saveConfig before deploy failed", e);
+    });
     const webhookUrl =
       (webhookSuggestedUrl && webhookSuggestedUrl.value) ||
       (webhookPanelCache && webhookPanelCache.webhook && webhookPanelCache.webhook.suggested_base) ||
@@ -2455,15 +2487,20 @@ async function deployCfEmailWorker() {
         ...formPayload(),
         worker_name: workerName,
         webhook_url: webhookUrl,
+        // 掩码时不要传空 secret 覆盖；显式省略让服务端用已存配置
+        webhook_secret: secret === "********" ? undefined : secret,
         force,
       }),
     });
     const msg = result.message || (result.skipped ? "Worker 已存在，已跳过" : "Worker 部署成功");
+    setWebhookActionStatus(msg, result.ok === false ? "error" : "ok");
     setMessage(msg);
     setCfGlobalStatus(msg);
     await loadWebhookPanel({ silent: true }).catch(() => {});
   } catch (error) {
-    setMessage(`部署 Worker 失败：${error.message}`);
+    const msg = `部署 Worker 失败：${error.message}`;
+    setWebhookActionStatus(msg, "error");
+    setMessage(msg);
   } finally {
     if (cfDeployWorkerBtn) {
       cfDeployWorkerBtn.disabled = false;
@@ -2475,29 +2512,46 @@ async function deployCfEmailWorker() {
 async function setupCfCatchAll() {
   const data = formPayload();
   const domains = mailDomainsFromForm();
-  const workerName = String(data.cf_email_worker_name || "openai-cpa-email").trim();
+  const workerName = String(data.cf_email_worker_name || "openai-cpa-email").trim() || "openai-cpa-email";
   if (!domains) {
-    setMessage("请先填写 mail_domains");
+    const msg = "请先填写 mail_domains（邮件主域池）";
+    setWebhookActionStatus(msg, "error");
+    setMessage(msg);
     return;
   }
-  if (!data.cf_api_email) {
-    setMessage("请先填写 Cloudflare 全局鉴权");
+  if (!String(data.cf_api_email || "").trim()) {
+    const msg = "请先填写 Cloudflare 全局鉴权：CF 登录账号";
+    setWebhookActionStatus(msg, "error");
+    setMessage(msg);
     return;
   }
-  if (
-    !window.confirm(
-      `把以下域名的 Email Routing catch-all 指到 Worker「${workerName}」？\n\n${domains}\n\n要求：域名 NS 已生效（active），且 Worker 已部署。`
-    )
-  ) {
+  if (!String(data.cf_api_key || "").trim()) {
+    const msg = "请先填写 Cloudflare 全局鉴权：Global API Key";
+    setWebhookActionStatus(msg, "error");
+    setMessage(msg);
     return;
   }
+  let confirmed = true;
+  try {
+    confirmed = window.confirm(
+      `把以下域名的 Email Routing catch-all 指到 Worker「${workerName}」？\n\n${domains}\n\n要求：域名 NS 已生效（active），且 Worker 已部署。\n点「取消」可中止。`
+    );
+  } catch (e) {
+    confirmed = true;
+  }
+  if (!confirmed) {
+    setWebhookActionStatus("已取消绑定 catch-all", "");
+    setMessage("已取消绑定 catch-all");
+    return;
+  }
+  setWebhookActionStatus(`正在绑定 catch-all → ${workerName}…`, "");
   setMessage(`正在绑定 catch-all → ${workerName}…`);
   if (cfSetupCatchAllBtn) {
     cfSetupCatchAllBtn.disabled = true;
     cfSetupCatchAllBtn.textContent = "绑定中…";
   }
   try {
-    await saveConfig().catch(() => {});
+    await saveConfig().catch((e) => console.warn("saveConfig before catch-all failed", e));
     const result = await requestJson("/api/cloudflare/global/setup-catch-all", {
       method: "POST",
       body: JSON.stringify({
@@ -2509,10 +2563,14 @@ async function setupCfCatchAll() {
     const items = Array.isArray(result.items) ? result.items : [];
     const lines = items.map((it) => `${it.domain}: ${it.msg || (it.ok ? "ok" : "fail")}`);
     const summary = `Catch-all：成功 ${result.total || 0} / 失败 ${result.failed || 0}（Worker=${result.worker_name || workerName}）`;
+    const detail = summary + (lines.length ? `。${lines.slice(0, 6).join("；")}` : "");
+    setWebhookActionStatus(detail, result.ok ? "ok" : "error");
     setMessage(summary);
-    setCfGlobalStatus(summary + (lines.length ? `。${lines.slice(0, 4).join("；")}` : ""));
+    setCfGlobalStatus(detail);
   } catch (error) {
-    setMessage(`绑定 catch-all 失败：${error.message}`);
+    const msg = `绑定 catch-all 失败：${error.message}`;
+    setWebhookActionStatus(msg, "error");
+    setMessage(msg);
   } finally {
     if (cfSetupCatchAllBtn) {
       cfSetupCatchAllBtn.disabled = false;
@@ -2521,16 +2579,36 @@ async function setupCfCatchAll() {
   }
 }
 
-if (cfDeployWorkerBtn) {
-  cfDeployWorkerBtn.addEventListener("click", () => {
-    deployCfEmailWorker().catch((error) => setMessage(error.message));
-  });
+// 事件绑定放到 DOMContent 已解析后；用事件委托兜底，避免 querySelector 失败时“点了没反应”
+function bindCfWorkerActions() {
+  const deployBtn = document.querySelector("#cfDeployWorkerBtn");
+  const catchBtn = document.querySelector("#cfSetupCatchAllBtn");
+  if (deployBtn && !deployBtn.dataset.bound) {
+    deployBtn.dataset.bound = "1";
+    deployBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      deployCfEmailWorker().catch((error) => {
+        setWebhookActionStatus(error.message, "error");
+        setMessage(error.message);
+      });
+    });
+  }
+  if (catchBtn && !catchBtn.dataset.bound) {
+    catchBtn.dataset.bound = "1";
+    catchBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setupCfCatchAll().catch((error) => {
+        setWebhookActionStatus(error.message, "error");
+        setMessage(error.message);
+      });
+    });
+  }
 }
-if (cfSetupCatchAllBtn) {
-  cfSetupCatchAllBtn.addEventListener("click", () => {
-    setupCfCatchAll().catch((error) => setMessage(error.message));
-  });
-}
+bindCfWorkerActions();
+// 若配置区后渲染，再绑一次
+document.addEventListener("DOMContentLoaded", bindCfWorkerActions);
 
 function renderWebhookPanel(data) {
   webhookPanelCache = data || null;

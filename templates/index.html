@@ -531,11 +531,21 @@
                   Webhook Secret（= Worker 的 EMAIL_WEBHOOK_SECRET）
                   <input name="email_webhook_secret" type="password" autocomplete="off" placeholder="与 CF Worker 变量一致" />
                 </label>
+                <label class="wide">
+                  公网 Webhook 基址（EMAIL_WEBHOOK_URL，必填公网）
+                  <input
+                    name="email_webhook_public_url"
+                    id="emailWebhookPublicUrl"
+                    type="url"
+                    placeholder="https://reg.example.com 或 http://公网IP:8787（不要填 192.168/127.0.0.1）"
+                  />
+                </label>
                 <label class="check">
                   <input name="cf_email_worker_force" type="checkbox" />
                   强制覆盖已存在 Worker（更新 URL/Secret）
                 </label>
               </div>
+              <p id="webhookUrlWarning" class="hint" style="margin-top: 8px; color: var(--danger, #fb7185);"></p>
 
               <div class="webhook-panel" id="webhookPanel" style="margin-top: 14px;">
                 <div class="accounts-actions" style="flex-wrap: wrap; gap: 8px; margin-bottom: 10px;">
@@ -551,8 +561,8 @@
                 <div id="webhookChecks" class="hint" style="margin-bottom: 8px;">尚未加载联调状态。</div>
                 <div class="config-grid">
                   <label class="wide">
-                    推荐 Worker EMAIL_WEBHOOK_URL（公网可访问）
-                    <input id="webhookSuggestedUrl" type="text" readonly placeholder="保存配置并刷新后显示" />
+                    当前将写入 Worker 的 EMAIL_WEBHOOK_URL
+                    <input id="webhookSuggestedUrl" type="text" placeholder="与上方「公网 Webhook 基址」同步，可改" />
                   </label>
                   <label class="wide">
                     完整推送路径

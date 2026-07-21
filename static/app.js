@@ -31,6 +31,8 @@ const webhookSuggestedUrl = document.querySelector("#webhookSuggestedUrl");
 const webhookFullUrl = document.querySelector("#webhookFullUrl");
 const webhookPanelDetail = document.querySelector("#webhookPanelDetail");
 const webhookActionStatus = document.querySelector("#webhookActionStatus");
+const webhookUrlWarning = document.querySelector("#webhookUrlWarning");
+const emailWebhookPublicUrl = document.querySelector("#emailWebhookPublicUrl");
 let webhookPanelCache = null;
 
 function setWebhookActionStatus(text, tone = "") {
@@ -38,6 +40,56 @@ function setWebhookActionStatus(text, tone = "") {
   webhookActionStatus.textContent = text || "";
   webhookActionStatus.style.color =
     tone === "error" ? "var(--danger, #fb7185)" : tone === "ok" ? "var(--accent, #6ee7b7)" : "";
+}
+
+function isPrivateWebhookUrl(url) {
+  const raw = String(url || "").trim();
+  if (!raw) return true;
+  try {
+    const u = new URL(raw.includes("://") ? raw : `http://${raw}`);
+    const host = (u.hostname || "").toLowerCase();
+    if (!host) return true;
+    if (["localhost", "127.0.0.1", "0.0.0.0", "::1"].includes(host)) return true;
+    if (host.endsWith(".local") || host.endsWith(".lan")) return true;
+    if (host.startsWith("10.") || host.startsWith("192.168.") || host.startsWith("169.254.")) return true;
+    if (host.startsWith("172.")) {
+      const n = Number(host.split(".")[1]);
+      if (n >= 16 && n <= 31) return true;
+    }
+  } catch (e) {
+    return false;
+  }
+  return false;
+}
+
+function syncWebhookFullUrlFromBase() {
+  const base = String(
+    (webhookSuggestedUrl && webhookSuggestedUrl.value) ||
+      (emailWebhookPublicUrl && emailWebhookPublicUrl.value) ||
+      ""
+  )
+    .trim()
+    .replace(/\/$/, "");
+  if (webhookFullUrl) {
+    webhookFullUrl.value = base ? `${base}/api/webhook/email` : "";
+  }
+  const privateUrl = isPrivateWebhookUrl(base);
+  if (webhookUrlWarning) {
+    webhookUrlWarning.textContent = privateUrl
+      ? `⚠ 当前是内网/本机地址（${base || "空"}）。Cloudflare Worker 在公网，访问不到，验证码永远推不进来。请改成公网域名/IP（或 frp/cloudflared 隧道），保存后勾选「强制覆盖」重新部署 Worker。`
+      : "";
+  }
+  return { base, privateUrl };
+}
+
+function currentWebhookBaseUrl() {
+  const fromSuggested = webhookSuggestedUrl && webhookSuggestedUrl.value.trim();
+  const fromConfig = emailWebhookPublicUrl && emailWebhookPublicUrl.value.trim();
+  const fromCache =
+    webhookPanelCache && webhookPanelCache.webhook && webhookPanelCache.webhook.suggested_base;
+  return String(fromSuggested || fromConfig || fromCache || window.location.origin || "")
+    .trim()
+    .replace(/\/$/, "");
 }
 const exportFmtNative = document.querySelector("#exportFmtNative");
 const exportFmtGrok2api = document.querySelector("#exportFmtGrok2api");
@@ -2477,20 +2529,30 @@ async function deployCfEmailWorker() {
       // 保存失败不阻断部署（服务端仍可用已存配置）
       console.warn("saveConfig before deploy failed", e);
     });
-    const webhookUrl =
-      (webhookSuggestedUrl && webhookSuggestedUrl.value) ||
-      (webhookPanelCache && webhookPanelCache.webhook && webhookPanelCache.webhook.suggested_base) ||
-      window.location.origin;
+    const webhookUrl = currentWebhookBaseUrl();
+    if (isPrivateWebhookUrl(webhookUrl)) {
+      const msg = `EMAIL_WEBHOOK_URL 不能是内网地址：${webhookUrl}。请先填公网地址再部署。`;
+      setWebhookActionStatus(msg, "error");
+      setMessage(msg);
+      return;
+    }
+    // 同步写回可保存字段
+    if (emailWebhookPublicUrl) emailWebhookPublicUrl.value = webhookUrl;
+    const payload = {
+      ...formPayload(),
+      worker_name: workerName,
+      webhook_url: webhookUrl,
+      email_webhook_public_url: webhookUrl,
+      force,
+    };
+    if (secret === "********") {
+      delete payload.webhook_secret;
+      // 让 merge_sensitive 保留服务端真实 secret
+      payload.email_webhook_secret = "********";
+    }
     const result = await requestJson("/api/cloudflare/global/deploy-email-worker", {
       method: "POST",
-      body: JSON.stringify({
-        ...formPayload(),
-        worker_name: workerName,
-        webhook_url: webhookUrl,
-        // 掩码时不要传空 secret 覆盖；显式省略让服务端用已存配置
-        webhook_secret: secret === "********" ? undefined : secret,
-        force,
-      }),
+      body: JSON.stringify(payload),
     });
     const msg = result.message || (result.skipped ? "Worker 已存在，已跳过" : "Worker 部署成功");
     setWebhookActionStatus(msg, result.ok === false ? "error" : "ok");
@@ -2610,14 +2672,40 @@ bindCfWorkerActions();
 // 若配置区后渲染，再绑一次
 document.addEventListener("DOMContentLoaded", bindCfWorkerActions);
 
+if (webhookSuggestedUrl) {
+  webhookSuggestedUrl.addEventListener("input", () => {
+    if (emailWebhookPublicUrl && document.activeElement === webhookSuggestedUrl) {
+      emailWebhookPublicUrl.value = webhookSuggestedUrl.value.trim();
+    }
+    syncWebhookFullUrlFromBase();
+  });
+}
+if (emailWebhookPublicUrl) {
+  emailWebhookPublicUrl.addEventListener("input", () => {
+    if (webhookSuggestedUrl && document.activeElement === emailWebhookPublicUrl) {
+      webhookSuggestedUrl.value = emailWebhookPublicUrl.value.trim();
+    }
+    syncWebhookFullUrlFromBase();
+  });
+}
+
 function renderWebhookPanel(data) {
   webhookPanelCache = data || null;
   if (!data) return;
-  if (webhookSuggestedUrl) {
-    webhookSuggestedUrl.value = (data.webhook && data.webhook.suggested_base) || "";
+  const suggested = (data.webhook && data.webhook.suggested_base) || "";
+  // 用户正在编辑时不要强行覆盖输入框
+  if (webhookSuggestedUrl && document.activeElement !== webhookSuggestedUrl) {
+    webhookSuggestedUrl.value = suggested;
   }
-  if (webhookFullUrl) {
-    webhookFullUrl.value = (data.webhook && data.webhook.suggested_full_url) || "";
+  if (emailWebhookPublicUrl && document.activeElement !== emailWebhookPublicUrl) {
+    // 仅当配置项为空时用 suggested 回填展示
+    if (!String(emailWebhookPublicUrl.value || "").trim() && suggested && !isPrivateWebhookUrl(suggested)) {
+      emailWebhookPublicUrl.value = suggested;
+    }
+  }
+  syncWebhookFullUrlFromBase();
+  if (data.warning) {
+    setWebhookActionStatus(data.warning, "error");
   }
   if (webhookChecks) {
     const checks = Array.isArray(data.checks) ? data.checks : [];
@@ -2633,8 +2721,16 @@ function renderWebhookPanel(data) {
     const stats = data.stats || {};
     const recent = Array.isArray(stats.recent) ? stats.recent : [];
     const lines = [];
-    lines.push(`provider=${data.provider || "—"}  webhook=${data.enabled ? "on" : "off"}  secret=${data.secret_configured ? "已配置" : "未配置"}`);
+    lines.push(
+      `provider=${data.provider || "—"}  webhook=${data.enabled ? "on" : "off"}  secret=${
+        data.secret_configured ? "已配置" : "未配置"
+      }  worker=${data.worker_name || "—"}`
+    );
     lines.push(`mail_domains=${data.mail_domains || "—"}`);
+    if (data.public_url_is_private) {
+      lines.push(`⚠ EMAIL_WEBHOOK_URL 当前是内网地址，Worker 推不进来！`);
+      lines.push(`  detected=${data.detected_base || "—"}`);
+    }
     lines.push(`Worker 建议:`);
     lines.push(`  EMAIL_WEBHOOK_URL=${(data.worker_env && data.worker_env.EMAIL_WEBHOOK_URL) || ""}`);
     lines.push(`  EMAIL_WEBHOOK_SECRET=${(data.worker_env && data.worker_env.EMAIL_WEBHOOK_SECRET) || ""}`);
@@ -2647,7 +2743,7 @@ function renderWebhookPanel(data) {
         if (m.raw_preview) lines.push(`    ${String(m.raw_preview).replace(/\s+/g, " ").slice(0, 100)}`);
       });
     } else {
-      lines.push("最近收件: （空）可用「本机模拟推送测试」写入一封");
+      lines.push("最近收件: （空）若本机模拟成功但注册仍无码，多半是 Worker 用了内网 URL");
     }
     webhookPanelDetail.textContent = lines.join("\n");
   }

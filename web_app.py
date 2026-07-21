@@ -438,7 +438,7 @@ def cf_global_deploy_email_worker(payload: dict, request: Request):
     force = body.get("force")
     if force is None:
         force = bool(settings.get("cf_email_worker_force"))
-    webhook_url = str(body.get("webhook_url") or "").strip().rstrip("/")
+    webhook_url = str(body.get("webhook_url") or settings.get("email_webhook_public_url") or "").strip().rstrip("/")
     if not webhook_url:
         # 从请求 Host 推导（公网反代时 X-Forwarded-* 优先）
         host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
@@ -452,6 +452,9 @@ def cf_global_deploy_email_worker(payload: dict, request: Request):
     webhook_secret = str(
         body.get("webhook_secret") or settings.get("email_webhook_secret") or ""
     ).strip()
+    # 掩码占位不要传给 deploy（merge 后 settings 已有真实 secret）
+    if webhook_secret == "********":
+        webhook_secret = str(settings.get("email_webhook_secret") or "").strip()
     try:
         result = reg.deploy_cf_email_worker(
             settings,
@@ -466,12 +469,19 @@ def cf_global_deploy_email_worker(payload: dict, request: Request):
         raise HTTPException(status_code=502, detail=str(exc))
     if not result.get("ok"):
         raise HTTPException(status_code=502, detail=result.get("message") or "部署失败")
-    # 成功后把 worker 名写回配置，方便下次默认
+    # 成功后把 worker 名 / 公网 URL 写回配置
     try:
         cfg = reg.load_config()
+        changed = False
         name = result.get("worker_name") or worker_name
         if name and str(cfg.get("cf_email_worker_name") or "") != str(name):
             cfg["cf_email_worker_name"] = name
+            changed = True
+        used_url = str(result.get("webhook_url") or webhook_url or "").strip().rstrip("/")
+        if used_url and str(cfg.get("email_webhook_public_url") or "").rstrip("/") != used_url:
+            cfg["email_webhook_public_url"] = used_url
+            changed = True
+        if changed:
             reg.config = reg.validate_registration_config(cfg)
             reg.save_config()
     except Exception:
@@ -566,16 +576,20 @@ def webhook_email_panel(request: Request):
         "cpa_email",
     }
     mail_domains = str(settings.get("mail_domains") or settings.get("defaultDomains") or "").strip()
-    # 推导对外可填的 webhook 基址（优先请求 Host；Docker/反代时用户可改）
+    # 优先用户配置的公网 URL；否则用当前请求 Host 推导（内网时会警告）
+    configured_public = str(settings.get("email_webhook_public_url") or "").strip().rstrip("/")
     host = request.headers.get("x-forwarded-host") or request.headers.get("host") or "127.0.0.1:8787"
     proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "http").split(",")[0].strip()
-    base = f"{proto}://{host}".rstrip("/")
+    detected = f"{proto}://{host}".rstrip("/")
+    base = configured_public or detected
     path = "/api/webhook/email"
-    full_url = f"{base}{path}"
+    full_url = f"{base.rstrip('/')}{path}"
+    private = reg.is_private_or_local_webhook_url(base)
     sample_domain = ""
     if mail_domains:
         sample_domain = mail_domains.split(",")[0].strip()
     sample_to = f"probe@{sample_domain}" if sample_domain else "probe@your-domain.com"
+    worker_name = str(settings.get("cf_email_worker_name") or "openai-cpa-email").strip()
 
     checks = []
     checks.append(
@@ -584,6 +598,18 @@ def webhook_email_panel(request: Request):
             "ok": bool(secret),
             "label": "Webhook Secret",
             "detail": "已配置" if secret else "未配置 email_webhook_secret",
+        }
+    )
+    checks.append(
+        {
+            "key": "public_url",
+            "ok": bool(base) and not private,
+            "label": "公网 Webhook URL",
+            "detail": (
+                f"内网/本机不可用: {base}（Worker 访问不到，请改 email_webhook_public_url 为公网域名/IP）"
+                if private
+                else (base or "未配置")
+            ),
         }
     )
     checks.append(
@@ -611,6 +637,10 @@ def webhook_email_panel(request: Request):
         "provider": provider,
         "secret_configured": bool(secret),
         "mail_domains": mail_domains,
+        "worker_name": worker_name,
+        "public_url_configured": bool(configured_public),
+        "public_url_is_private": private,
+        "detected_base": detected,
         "webhook": {
             "path": path,
             "suggested_base": base,
@@ -626,6 +656,12 @@ def webhook_email_panel(request: Request):
             "EMAIL_WEBHOOK_URL": base,
             "EMAIL_WEBHOOK_SECRET": "(与配置页 Webhook Secret 相同)",
         },
+        "warning": (
+            "当前 Webhook URL 是内网地址，Cloudflare Worker 无法回推邮件。"
+            "请在下方填写公网域名/IP（或 frp/cloudflared 隧道地址），保存后勾选「强制覆盖」重新部署 Worker。"
+            if private
+            else ""
+        ),
         "checks": checks,
         "stats": stats,
         "ready": all(c.get("ok") for c in checks),

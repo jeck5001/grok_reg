@@ -170,6 +170,8 @@ DEFAULT_CONFIG = {
     "email_webhook_secret": "",
     # openai-cpa-email Worker 名称（CF Workers 脚本名；catch-all 要指向它）
     "cf_email_worker_name": "openai-cpa-email",
+    # Worker 回推 grok_reg 的公网基址（EMAIL_WEBHOOK_URL）。必须公网可达，不能是 127.0.0.1 / 192.168.x.x
+    "email_webhook_public_url": "",
     # 是否允许覆盖已存在的 Worker 脚本（默认 false：已存在则只更新 bindings 需 force）
     "cf_email_worker_force": False,
     # Web 访问密码（公网务必修改）。环境变量 GROK_REG_WEB_PASSWORD 优先；空字符串=关闭鉴权。
@@ -814,6 +816,36 @@ def fetch_openai_cpa_email_worker_source(timeout=30) -> str:
     return text.strip()
 
 
+def is_private_or_local_webhook_url(url: str) -> bool:
+    """Worker 无法访问内网/本机地址。"""
+    raw = str(url or "").strip()
+    if not raw:
+        return True
+    try:
+        parsed = urllib.parse.urlparse(raw if "://" in raw else f"http://{raw}")
+    except Exception:
+        return False
+    host = str(parsed.hostname or "").strip().lower()
+    if not host:
+        return True
+    if host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
+        return True
+    if host.endswith(".local") or host.endswith(".lan"):
+        return True
+    # 常见内网段
+    if host.startswith("10.") or host.startswith("192.168.") or host.startswith("169.254."):
+        return True
+    if host.startswith("172."):
+        parts = host.split(".")
+        try:
+            second = int(parts[1])
+            if 16 <= second <= 31:
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def deploy_cf_email_worker(
     settings=None,
     *,
@@ -835,9 +867,22 @@ def deploy_cf_email_worker(
         if webhook_secret is not None
         else settings.get("email_webhook_secret") or ""
     ).strip()
-    url = str(webhook_url or "").strip().rstrip("/")
+    url = str(
+        webhook_url
+        if webhook_url is not None
+        else settings.get("email_webhook_public_url") or ""
+    ).strip().rstrip("/")
     if not url:
-        raise ValueError("webhook_url 不能为空（公网可访问的 grok_reg 地址）")
+        raise ValueError(
+            "webhook_url 不能为空：请填写公网可访问的 grok_reg 地址（email_webhook_public_url），"
+            "不能是 127.0.0.1 / 192.168.x.x"
+        )
+    if is_private_or_local_webhook_url(url):
+        raise ValueError(
+            f"EMAIL_WEBHOOK_URL 不能是内网/本机地址：{url}。"
+            "Cloudflare Worker 在公网，访问不到 192.168/10/172.16-31/127.0.0.1。"
+            "请填域名或公网 IP（可用 frp/cloudflared/反代暴露 8787）。"
+        )
     if not secret:
         raise ValueError("email_webhook_secret 不能为空（需与 Worker EMAIL_WEBHOOK_SECRET 一致）")
     if force is None:

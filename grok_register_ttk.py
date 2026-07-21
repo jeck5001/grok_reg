@@ -803,6 +803,13 @@ def attach_account_status(account, statuses=None):
                     break
     if not isinstance(record, dict):
         record = {}
+    # 优先用账号级 created_at（注册成功时写入）；否则保留文件名/mtime 批次时间
+    per_account_created = str(record.get("created_at") or "").strip()
+    if per_account_created:
+        account["created_at"] = per_account_created
+        account["created_at_source"] = "account"
+    elif account.get("created_at"):
+        account["created_at_source"] = "batch"
     status = str(record.get("sub2api_status") or record.get("status") or "not_pushed").strip() or "not_pushed"
     account["sub2api_status"] = status
     account["sub2api_status_text"] = str(record.get("sub2api_status_text") or account_status_text(status))
@@ -898,6 +905,35 @@ def replace_registered_account_refresh_token(account, refresh_token):
         return True
     except Exception:
         return False
+
+
+def persist_account_created_at(account, created_at=None):
+    """把每个账号的真实注册成功时间写入状态文件（避免整批共用文件名时间）。"""
+    if not isinstance(account, dict):
+        return None
+    account_id = str(account.get("id") or "").strip()
+    if not account_id:
+        return None
+    stamp = str(created_at or account.get("created_at") or "").strip()
+    if not stamp:
+        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+    account["created_at"] = stamp
+    account["created_at_source"] = "account"
+
+    def _mutate(statuses):
+        record = statuses.get(account_id)
+        record = dict(record) if isinstance(record, dict) else {}
+        # 已有精确时间不覆盖（防止后续推送状态回写冲掉）
+        if not str(record.get("created_at") or "").strip():
+            record["created_at"] = stamp
+        record["email"] = str(account.get("email") or record.get("email") or "").strip()
+        if account.get("source_file"):
+            record["source_file"] = account.get("source_file")
+        if account.get("line_no"):
+            record["line_no"] = account.get("line_no")
+        statuses[account_id] = record
+
+    return update_account_status_records(_mutate)
 
 
 def persist_sub2api_push_status(accounts, result):
@@ -5977,6 +6013,7 @@ class RegistrationJob:
             except Exception as cpa_exc:
                 logf(f"[!] CPA 凭证生成或推送失败，继续注册流程: {cpa_exc}")
                 cpa_push_item = {"email": email, "status": "failed", "error": str(cpa_exc)}
+        account_created_at = datetime.datetime.now().isoformat(timespec="seconds")
         with self.stats_lock:
             # 用文件真实行号生成 account id，避免 success_count 与行号不一致导致状态对不上
             out_path = os.path.join(get_data_dir(), self.output_file)
@@ -6008,6 +6045,7 @@ class RegistrationJob:
             source=self.output_file,
             line_no=source_line_no,
             include_sso=True,
+            created_at=account_created_at,
         ) or {
             "id": _account_id(self.output_file, source_line_no, email, sso),
             "email": email,
@@ -6016,7 +6054,12 @@ class RegistrationJob:
             "has_refresh_token": bool(refresh_token),
             "source_file": self.output_file,
             "line_no": source_line_no,
+            "created_at": account_created_at,
         }
+        try:
+            persist_account_created_at(account, account_created_at)
+        except Exception as st_exc:
+            logf(f"[Debug] 写入账号创建时间失败: {st_exc}")
         # 保证 id 始终存在，便于状态落盘
         if not account.get("id"):
             account["id"] = _account_id(

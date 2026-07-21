@@ -1842,7 +1842,9 @@ function renderAccounts() {
       } else {
         cell.textContent = rawText;
         if (column.key === "created" && account.created_at) {
-          cell.title = account.created_at;
+          // batch = 任务启动文件名时间（同批相同）；account = 每个号注册成功时写入
+          const src = account.created_at_source === "account" ? "账号成功时间" : "任务批次时间";
+          cell.title = `${account.created_at}（${src}）`;
         }
       }
       if (column.className) cell.className = `${cell.className} ${column.className}`.trim();

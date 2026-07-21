@@ -902,6 +902,31 @@ def test_parse_account_file_created_at_from_name():
     assert reg.parse_account_file_created_at("notes.txt") == ""
 
 
+def test_list_registered_accounts_prefers_per_account_created_at(monkeypatch, tmp_path):
+    """状态文件里的账号级 created_at 优先于批次文件名时间。"""
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
+        "user1@example.com----Pass-1----sso-token-1\n"
+        "user2@example.com----Pass-2----sso-token-2\n",
+        encoding="utf-8",
+    )
+    accounts = reg.list_registered_accounts()
+    assert accounts[0]["created_at"] == "2026-06-30T14:00:00"
+    assert accounts[0].get("created_at_source") == "batch"
+
+    reg.persist_account_created_at(accounts[0], "2026-06-30T14:05:11")
+    reg.persist_account_created_at(accounts[1], "2026-06-30T14:07:42")
+
+    accounts2 = reg.list_registered_accounts()
+    by_email = {a["email"]: a for a in accounts2}
+    assert by_email["user1@example.com"]["created_at"] == "2026-06-30T14:05:11"
+    assert by_email["user2@example.com"]["created_at"] == "2026-06-30T14:07:42"
+    assert by_email["user1@example.com"]["created_at_source"] == "account"
+    # 再次 persist 不覆盖已有精确时间
+    reg.persist_account_created_at(accounts2[0], "2099-01-01T00:00:00")
+    assert reg.list_registered_accounts()[0]["created_at"] == "2026-06-30T14:05:11"
+
+
 def test_list_registered_accounts_merges_persisted_sub2api_status(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(

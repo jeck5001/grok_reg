@@ -714,6 +714,8 @@ def account_status_text(status):
     value = str(status or "").strip().lower()
     if value == "pushed":
         return "已推送"
+    if value == "probe_failed":
+        return "已入库·探测失败"
     if value == "failed":
         return "推送失败"
     if value == "pushing":
@@ -819,6 +821,13 @@ def attach_account_status(account, statuses=None):
         account["sub2api_response"] = record.get("sub2api_response")
     if record.get("sub2api_error"):
         account["sub2api_error"] = record.get("sub2api_error")
+    remote_id = str(record.get("sub2api_remote_id") or "").strip()
+    if remote_id:
+        account["sub2api_remote_id"] = remote_id
+    if record.get("sub2api_probe_at"):
+        account["sub2api_probe_at"] = record.get("sub2api_probe_at")
+    if record.get("sub2api_probe_error"):
+        account["sub2api_probe_error"] = record.get("sub2api_probe_error")
     grok2api_status = str(record.get("grok2api_status") or "not_pushed").strip() or "not_pushed"
     account["grok2api_status"] = grok2api_status
     account["grok2api_status_text"] = str(record.get("grok2api_status_text") or account_status_text(grok2api_status))
@@ -936,6 +945,26 @@ def persist_account_created_at(account, created_at=None):
     return update_account_status_records(_mutate)
 
 
+def _extract_sub2api_remote_id_from_item(item):
+    """从推送/探测结果里取远端 sub2api account id。"""
+    if not isinstance(item, dict):
+        return ""
+    for key in ("remote_id", "sub2api_remote_id", "account_id"):
+        val = str(item.get(key) or "").strip()
+        if val:
+            return val
+    post = item.get("post_actions") if isinstance(item.get("post_actions"), dict) else {}
+    val = str(post.get("account_id") or "").strip()
+    if val:
+        return val
+    resp = item.get("response")
+    if isinstance(resp, dict):
+        extracted = _extract_sub2api_account_id(resp)
+        if extracted:
+            return extracted
+    return ""
+
+
 def persist_sub2api_push_status(accounts, result):
     items = result.get("items") if isinstance(result, dict) else []
     if not isinstance(items, list):
@@ -959,32 +988,79 @@ def persist_sub2api_push_status(accounts, result):
                         item = it
                         break
             item_status = str(item.get("status") or "pushed").strip().lower()
+            remote_id = _extract_sub2api_remote_id_from_item(item) or str(
+                record.get("sub2api_remote_id") or account.get("sub2api_remote_id") or ""
+            ).strip()
+            base_meta = {
+                "email": email,
+                "source_file": account.get("source_file", ""),
+                "line_no": account.get("line_no", ""),
+            }
+            if remote_id:
+                base_meta["sub2api_remote_id"] = remote_id
+
             if item_status == "failed":
                 record.update(
                     {
+                        **base_meta,
                         "sub2api_status": "failed",
                         "sub2api_status_text": f"失败：{str(item.get('error') or '')[:220]}",
                         "sub2api_failed_at": now,
                         "sub2api_error": str(item.get("error") or ""),
                         "sub2api_step": str(item.get("step") or ""),
-                        "email": email,
-                        "source_file": account.get("source_file", ""),
-                        "line_no": account.get("line_no", ""),
                     }
                 )
-            else:
+            elif item_status in {"probe_failed", "probed_failed"}:
+                probe_err = ""
+                post = item.get("post_actions") if isinstance(item.get("post_actions"), dict) else {}
+                test = post.get("test") if isinstance(post.get("test"), dict) else {}
+                probe_err = str(
+                    item.get("probe_error")
+                    or item.get("error")
+                    or test.get("msg")
+                    or ""
+                ).strip()
                 record.update(
                     {
+                        **base_meta,
+                        "sub2api_status": "probe_failed",
+                        "sub2api_status_text": account_status_text("probe_failed"),
+                        "sub2api_pushed_at": record.get("sub2api_pushed_at") or now,
+                        "sub2api_probe_at": now,
+                        "sub2api_probe_error": probe_err[:400],
+                        "sub2api_response": item.get("response", item),
+                        "sub2api_error": probe_err[:400],
+                    }
+                )
+            elif item_status in {"deleted_remote", "remote_deleted"}:
+                record.update(
+                    {
+                        **base_meta,
+                        "sub2api_status": "not_pushed",
+                        "sub2api_status_text": "远端已删除",
+                        "sub2api_deleted_at": now,
+                    }
+                )
+                record.pop("sub2api_remote_id", None)
+                record.pop("sub2api_error", None)
+                record.pop("sub2api_probe_error", None)
+                record.pop("sub2api_probe_at", None)
+            else:
+                # pushed / probed_ok
+                record.update(
+                    {
+                        **base_meta,
                         "sub2api_status": "pushed",
                         "sub2api_status_text": "已推送",
                         "sub2api_pushed_at": now,
+                        "sub2api_probe_at": now,
                         "sub2api_response": item.get("response", item),
-                        "email": email,
-                        "source_file": account.get("source_file", ""),
-                        "line_no": account.get("line_no", ""),
                     }
                 )
                 record.pop("sub2api_error", None)
+                record.pop("sub2api_probe_error", None)
+                record.pop("sub2api_failed_at", None)
+                record.pop("sub2api_step", None)
             statuses[key] = record
             if account_id:
                 statuses[account_id] = record
@@ -1803,12 +1879,34 @@ def _push_one_account_to_sub2api(account, settings, base, headers, index, log_ca
                 f"[!] sub2api 创建成功但未拿到 account_id，无法自动初始化: {account.get('email','')}"
             )
 
-    return {
+    probe_ok = bool((post_actions or {}).get("ok"))
+    remote_id = str((post_actions or {}).get("account_id") or account_id or "").strip()
+    status = "pushed" if probe_ok or not remote_id else "probe_failed"
+    # auto_probe 关闭时 post_actions.ok=True，仍记 pushed
+    if not bool((settings or {}).get("sub2api_auto_probe", True)):
+        status = "pushed"
+    elif remote_id and (post_actions or {}).get("test") is not None:
+        test = (post_actions or {}).get("test") or {}
+        if test.get("ok") is True:
+            status = "pushed"
+        elif test.get("ok") is False:
+            status = "probe_failed"
+        elif test.get("ok") is None:
+            status = "pushed"
+
+    item = {
         "email": account.get("email", ""),
-        "status": "pushed",
+        "status": status,
         "response": created,
         "post_actions": post_actions,
+        "remote_id": remote_id,
+        "account_id": remote_id,
     }
+    if status == "probe_failed":
+        test = (post_actions or {}).get("test") or {}
+        item["probe_error"] = str(test.get("msg") or "probe failed")[:400]
+        item["error"] = item["probe_error"]
+    return item
 
 
 def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
@@ -1866,17 +1964,185 @@ def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
             )
             if log_callback:
                 log_callback(f"[!] 推送 sub2api 失败: {account.get('email', '')} {items[-1]['error']}")
-    success_count = len([item for item in items if item.get("status") == "pushed"])
-    failed_count = len(items) - success_count
+    success_count = len([item for item in items if item.get("status") in {"pushed", "probe_failed"}])
+    probe_failed_count = len([item for item in items if item.get("status") == "probe_failed"])
+    failed_count = len([item for item in items if item.get("status") == "failed"])
     if log_callback:
-        log_callback(f"[+] sub2api 推送完成: 成功 {success_count} / 失败 {failed_count}")
+        extra = f"，探测失败 {probe_failed_count}" if probe_failed_count else ""
+        log_callback(
+            f"[+] sub2api 推送完成: 入库 {success_count} / 推送失败 {failed_count}{extra}"
+        )
     return {
         "imported": failed_count == 0,
         "total": success_count,
         "failed": failed_count,
+        "probe_failed": probe_failed_count,
         "items": items,
-        "warning": "已按 Refresh Token 直接导入 sub2api；历史仅有 sso 的账号不能推送。",
+        "warning": "已按 Refresh Token 直接导入 sub2api；历史仅有 sso 的账号不能推送。探测失败可筛选「sub2api 探测失败」后重探或删远端。",
     }
+
+
+def probe_accounts_on_sub2api(accounts, settings=None, log_callback=None):
+    """对已入库账号重新探测（不重复创建）。"""
+    settings = {**config, **dict(settings or {})}
+    base = _sub2api_api_base(settings)
+    headers = _sub2api_headers(settings)
+    items = []
+    for account in accounts or []:
+        email = str(account.get("email") or "").strip()
+        remote_id = str(account.get("sub2api_remote_id") or "").strip()
+        if not remote_id:
+            # 尝试从历史 response 解析
+            remote_id = _extract_sub2api_remote_id_from_item(
+                {"response": account.get("sub2api_response"), "account_id": account.get("sub2api_remote_id")}
+            )
+        if not remote_id:
+            items.append(
+                {
+                    "email": email,
+                    "status": "failed",
+                    "step": "probe",
+                    "error": "缺少 sub2api 远端 id，无法探测（请先推送或在状态里补 remote id）",
+                }
+            )
+            continue
+        try:
+            post_actions = _sub2api_initialize_account(
+                base, headers, remote_id, settings={**settings, "sub2api_auto_probe": True}, log_callback=log_callback
+            )
+            ok = bool((post_actions or {}).get("ok"))
+            test = (post_actions or {}).get("test") or {}
+            if ok and test.get("ok") is not False:
+                items.append(
+                    {
+                        "email": email,
+                        "status": "pushed",
+                        "remote_id": remote_id,
+                        "account_id": remote_id,
+                        "post_actions": post_actions,
+                        "response": account.get("sub2api_response"),
+                    }
+                )
+            else:
+                msg = str(test.get("msg") or "probe failed")[:400]
+                items.append(
+                    {
+                        "email": email,
+                        "status": "probe_failed",
+                        "remote_id": remote_id,
+                        "account_id": remote_id,
+                        "probe_error": msg,
+                        "error": msg,
+                        "post_actions": post_actions,
+                        "response": account.get("sub2api_response"),
+                    }
+                )
+        except Exception as exc:
+            items.append(
+                {
+                    "email": email,
+                    "status": "probe_failed",
+                    "remote_id": remote_id,
+                    "account_id": remote_id,
+                    "error": _sub2api_error_text(exc, step="probe")[:400],
+                    "probe_error": _sub2api_error_text(exc, step="probe")[:400],
+                    "response": account.get("sub2api_response"),
+                }
+            )
+    ok_n = len([i for i in items if i.get("status") == "pushed"])
+    fail_n = len(items) - ok_n
+    if log_callback:
+        log_callback(f"[+] sub2api 重新探测完成: 通过 {ok_n} / 失败 {fail_n}")
+    return {"total": ok_n, "failed": fail_n, "items": items}
+
+
+def delete_accounts_from_sub2api(accounts, settings=None, log_callback=None):
+    """删除 sub2api 远端账号，并回写本地状态为未推送。"""
+    settings = {**config, **dict(settings or {})}
+    base = _sub2api_api_base(settings)
+    headers = _sub2api_headers(settings)
+    items = []
+    for account in accounts or []:
+        email = str(account.get("email") or "").strip()
+        remote_id = str(account.get("sub2api_remote_id") or "").strip()
+        if not remote_id:
+            remote_id = _extract_sub2api_remote_id_from_item(
+                {"response": account.get("sub2api_response")}
+            )
+        if not remote_id:
+            items.append(
+                {
+                    "email": email,
+                    "status": "failed",
+                    "step": "delete-remote",
+                    "error": "缺少 sub2api 远端 id，无法删除",
+                }
+            )
+            continue
+        try:
+            last_err = ""
+            for method in ("delete", "post"):
+                try:
+                    if method == "delete":
+                        resp = http_delete(
+                            f"{base}/admin/accounts/{remote_id}",
+                            headers=headers,
+                            timeout=30,
+                            proxies={},
+                        )
+                    else:
+                        # 部分部署用 POST /delete
+                        resp = http_post(
+                            f"{base}/admin/accounts/{remote_id}/delete",
+                            headers=headers,
+                            json={},
+                            timeout=30,
+                            proxies={},
+                        )
+                    code = int(getattr(resp, "status_code", 0) or 0)
+                    if code in {200, 201, 204, 404}:
+                        items.append(
+                            {
+                                "email": email,
+                                "status": "deleted_remote",
+                                "remote_id": remote_id,
+                                "response": {"http_status": code},
+                            }
+                        )
+                        if log_callback:
+                            log_callback(f"[+] 已删除 sub2api 远端账号 id={remote_id} {email}")
+                        last_err = ""
+                        break
+                    last_err = f"HTTP {code}: {(getattr(resp, 'text', '') or '')[:180]}"
+                except Exception as exc:
+                    last_err = str(exc)
+            if last_err:
+                items.append(
+                    {
+                        "email": email,
+                        "status": "failed",
+                        "step": "delete-remote",
+                        "remote_id": remote_id,
+                        "error": last_err[:400],
+                    }
+                )
+                if log_callback:
+                    log_callback(f"[!] 删除 sub2api 远端失败 id={remote_id}: {last_err[:160]}")
+        except Exception as exc:
+            items.append(
+                {
+                    "email": email,
+                    "status": "failed",
+                    "step": "delete-remote",
+                    "remote_id": remote_id,
+                    "error": _sub2api_error_text(exc, step="delete-remote")[:400],
+                }
+            )
+    deleted = len([i for i in items if i.get("status") == "deleted_remote"])
+    failed = len(items) - deleted
+    if log_callback:
+        log_callback(f"[+] sub2api 远端删除完成: 成功 {deleted} / 失败 {failed}")
+    return {"total": deleted, "failed": failed, "items": items}
 
 
 def check_registered_accounts_health(accounts, settings=None, log_callback=None):
@@ -2674,6 +2940,20 @@ def http_post(url, **kwargs):
             retry_kwargs = dict(kwargs)
             retry_kwargs["proxies"] = {}
             return requests.post(url, **_build_request_kwargs(**retry_kwargs))
+        raise
+
+
+def http_delete(url, **kwargs):
+    if requests is None:
+        raise RuntimeError("curl_cffi 未安装，无法发起 HTTP 请求")
+    try:
+        return requests.delete(url, **_build_request_kwargs(**kwargs))
+    except Exception as exc:
+        err = str(exc)
+        if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
+            retry_kwargs = dict(kwargs)
+            retry_kwargs["proxies"] = {}
+            return requests.delete(url, **_build_request_kwargs(**retry_kwargs))
         raise
 
 

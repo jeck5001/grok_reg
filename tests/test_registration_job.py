@@ -927,6 +927,69 @@ def test_list_registered_accounts_prefers_per_account_created_at(monkeypatch, tm
     assert reg.list_registered_accounts()[0]["created_at"] == "2026-06-30T14:05:11"
 
 
+def test_persist_sub2api_probe_failed_status(monkeypatch, tmp_path):
+    """入库成功但探测失败时标记 probe_failed，并保存 remote id。"""
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
+        "user@example.com----Pass----sso-token----refresh-token\n",
+        encoding="utf-8",
+    )
+    account = reg.list_registered_accounts()[0]
+    reg.persist_sub2api_push_status(
+        [account],
+        {
+            "items": [
+                {
+                    "email": account["email"],
+                    "status": "probe_failed",
+                    "remote_id": "14831",
+                    "probe_error": 'Grok Responses API returned 403: {"error":"Access denied."}',
+                    "post_actions": {
+                        "account_id": "14831",
+                        "ok": False,
+                        "test": {"ok": False, "msg": "Access denied."},
+                    },
+                    "response": {"id": 14831},
+                }
+            ]
+        },
+    )
+    refreshed = reg.list_registered_accounts()[0]
+    assert refreshed["sub2api_status"] == "probe_failed"
+    assert "探测失败" in refreshed["sub2api_status_text"]
+    assert refreshed["sub2api_remote_id"] == "14831"
+    assert "Access denied" in (refreshed.get("sub2api_probe_error") or "")
+
+    # 重新探测成功 → 已推送
+    reg.persist_sub2api_push_status(
+        [refreshed],
+        {
+            "items": [
+                {
+                    "email": account["email"],
+                    "status": "pushed",
+                    "remote_id": "14831",
+                    "post_actions": {"account_id": "14831", "ok": True, "test": {"ok": True}},
+                }
+            ]
+        },
+    )
+    ok = reg.list_registered_accounts()[0]
+    assert ok["sub2api_status"] == "pushed"
+    assert ok["sub2api_status_text"] == "已推送"
+    assert ok["sub2api_remote_id"] == "14831"
+    assert not ok.get("sub2api_probe_error")
+
+    # 删除远端 → 未推送并清 remote id
+    reg.persist_sub2api_push_status(
+        [ok],
+        {"items": [{"email": account["email"], "status": "deleted_remote", "remote_id": "14831"}]},
+    )
+    gone = reg.list_registered_accounts()[0]
+    assert gone["sub2api_status"] == "not_pushed"
+    assert not gone.get("sub2api_remote_id")
+
+
 def test_list_registered_accounts_merges_persisted_sub2api_status(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(

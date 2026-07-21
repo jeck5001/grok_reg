@@ -1487,14 +1487,70 @@ def import_accounts_to_sub2api(payload: dict):
     accounts = reg.find_registered_accounts(account_ids)
     total = int(result.get("total") or len(accounts))
     failed = int(result.get("failed") or 0)
-    status = "partial_failed" if failed else "pushed"
+    probe_failed = int(result.get("probe_failed") or 0)
+    status = "partial_failed" if failed or probe_failed else "pushed"
     message = f"已推送到 sub2api：{total} 个账号"
-    if failed:
-        message = f"sub2api 推送完成：成功 {total} 个，失败 {failed} 个"
+    if failed or probe_failed:
+        message = (
+            f"sub2api 推送完成：入库 {total} 个，推送失败 {failed} 个"
+            + (f"，探测失败 {probe_failed} 个" if probe_failed else "")
+        )
     return {
         **result,
         "status": status,
         "message": message,
+        "accounts": [public_account(account) for account in accounts],
+    }
+
+
+@app.post("/api/accounts/sub2api/probe")
+def probe_accounts_on_sub2api(payload: dict):
+    """对已入库账号重新探测（不重复创建）。"""
+    settings = merge_sensitive_values(payload)
+    account_ids = payload.get("account_ids") or []
+    accounts = reg.find_registered_accounts(account_ids)
+    if not accounts:
+        raise HTTPException(status_code=404, detail="未找到选中的账号")
+    try:
+        result = reg.probe_accounts_on_sub2api(accounts, settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"sub2api 探测失败: {exc}")
+    reg.persist_sub2api_push_status(accounts, result)
+    accounts = reg.find_registered_accounts(account_ids)
+    total = int(result.get("total") or 0)
+    failed = int(result.get("failed") or 0)
+    return {
+        **result,
+        "status": "partial_failed" if failed else "probed",
+        "message": f"sub2api 重新探测：通过 {total} 个，失败 {failed} 个",
+        "accounts": [public_account(account) for account in accounts],
+    }
+
+
+@app.post("/api/accounts/sub2api/delete-remote")
+def delete_accounts_from_sub2api(payload: dict):
+    """删除 sub2api 远端账号，本地标记为未推送。"""
+    settings = merge_sensitive_values(payload)
+    account_ids = payload.get("account_ids") or []
+    accounts = reg.find_registered_accounts(account_ids)
+    if not accounts:
+        raise HTTPException(status_code=404, detail="未找到选中的账号")
+    try:
+        result = reg.delete_accounts_from_sub2api(accounts, settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"删除 sub2api 远端失败: {exc}")
+    reg.persist_sub2api_push_status(accounts, result)
+    accounts = reg.find_registered_accounts(account_ids)
+    total = int(result.get("total") or 0)
+    failed = int(result.get("failed") or 0)
+    return {
+        **result,
+        "status": "partial_failed" if failed else "deleted_remote",
+        "message": f"已删除 sub2api 远端：成功 {total} 个，失败 {failed} 个",
         "accounts": [public_account(account) for account in accounts],
     }
 

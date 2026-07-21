@@ -10,6 +10,8 @@ const refreshAccountsBtn = document.querySelector("#refreshAccountsBtn");
 const checkHealthBtn = document.querySelector("#checkHealthBtn");
 const importGrok2apiBtn = document.querySelector("#importGrok2apiBtn");
 const importSub2apiBtn = document.querySelector("#importSub2apiBtn");
+const probeSub2apiBtn = document.querySelector("#probeSub2apiBtn");
+const deleteSub2apiRemoteBtn = document.querySelector("#deleteSub2apiRemoteBtn");
 const importCpaBtn = document.querySelector("#importCpaBtn");
 const exportAccountsBtn = document.querySelector("#exportAccountsBtn");
 const deleteAccountsBtn = document.querySelector("#deleteAccountsBtn");
@@ -728,7 +730,12 @@ function accountIsPushed(account, channel) {
   const text = String(account[`${channel}_status_text`] || "");
   if (channel === "sub2api") {
     const live = accountPushStatus[account.id];
-    if (live) return live === "已推送" || String(live).includes("已推送");
+    if (live) {
+      // 探测失败也算「已入库」，但筛选「已推送」只认真正通过
+      return live === "已推送" || (String(live).includes("已推送") && !String(live).includes("探测失败"));
+    }
+    // probe_failed 已入库但未通过探测，不算「已推送」
+    if (status === "probe_failed" || text.includes("探测失败")) return false;
   }
   if (channel === "grok2api") {
     const live = accountGrok2apiPushStatus[account.id];
@@ -741,6 +748,17 @@ function accountIsPushed(account, channel) {
   return status === "pushed" || text === "已推送";
 }
 
+function accountIsSub2apiProbeFailed(account) {
+  const status = String(account.sub2api_status || "").toLowerCase();
+  const text = String(accountPushStatus[account.id] || account.sub2api_status_text || "");
+  return (
+    status === "probe_failed" ||
+    text.includes("探测失败") ||
+    text.includes("已入库·探测失败") ||
+    Boolean(account.sub2api_probe_error)
+  );
+}
+
 function accountHasPushFailure(account) {
   for (const channel of ["grok2api", "sub2api", "cpa"]) {
     const status = String(account[`${channel}_status`] || "").toLowerCase();
@@ -751,7 +769,8 @@ function accountHasPushFailure(account) {
         account[`${channel}_status_text`] ||
         ""
     );
-    if (status === "failed" || text.startsWith("失败") || text.includes("失败")) return true;
+    if (status === "failed" || status === "probe_failed") return true;
+    if (text.startsWith("失败") || text.includes("失败") || text.includes("探测失败")) return true;
   }
   return false;
 }
@@ -874,6 +893,7 @@ function filteredAccounts() {
     }
     if (filter === "grok2api_pushed") return accountIsPushed(account, "grok2api");
     if (filter === "sub2api_pushed") return accountIsPushed(account, "sub2api");
+    if (filter === "sub2api_probe_failed") return accountIsSub2apiProbeFailed(account);
     if (filter === "cpa_pushed") return accountIsPushed(account, "cpa");
     if (filter === "failed") return accountHasPushFailure(account);
     return true;
@@ -1834,10 +1854,19 @@ function renderAccounts() {
         const formatted = formatAccountStatusDisplay(rawText);
         cell.textContent = formatted.display;
         if (formatted.title) cell.title = formatted.title;
-        if (rawText.startsWith("失败") || rawText.includes("失败")) {
+        if (
+          rawText.startsWith("失败") ||
+          rawText.includes("失败") ||
+          rawText.includes("探测失败")
+        ) {
           cell.classList.add("status-failed");
         } else if (rawText === "已推送" || rawText === "可用") {
           cell.classList.add("status-ok");
+        }
+        if (column.key === "sub2api" && account.sub2api_probe_error) {
+          cell.title = `${formatted.title || rawText}\n${account.sub2api_probe_error}`.trim();
+        } else if (column.key === "sub2api" && account.sub2api_remote_id) {
+          cell.title = `${formatted.title || rawText}\nremote id: ${account.sub2api_remote_id}`.trim();
         }
       } else {
         cell.textContent = rawText;
@@ -1982,6 +2011,100 @@ async function importSelectedToSub2api() {
     pushingToSub2api = false;
     importSub2apiBtn.disabled = false;
     importSub2apiBtn.textContent = "推送到 sub2api";
+    renderAccounts();
+  }
+}
+
+async function probeSelectedOnSub2api() {
+  const accountIds = selectedAccountIds();
+  if (!accountIds.length) {
+    setMessage("请选择要重新探测的账号");
+    return;
+  }
+  if (probeSub2apiBtn) {
+    probeSub2apiBtn.disabled = true;
+    probeSub2apiBtn.textContent = `探测中 ${accountIds.length} 个...`;
+  }
+  accountIds.forEach((id) => {
+    accountPushStatus[id] = "探测中";
+  });
+  renderAccounts();
+  setMessage(`开始 sub2api 重新探测：${accountIds.length} 个账号`);
+  try {
+    const result = await requestJson("/api/accounts/sub2api/probe", {
+      method: "POST",
+      body: JSON.stringify({ ...formPayload(), account_ids: accountIds }),
+    });
+    if (Array.isArray(result.accounts)) {
+      const returned = new Map(result.accounts.map((account) => [account.id, account]));
+      accounts = accounts.map((account) => returned.get(account.id) || account);
+      accountIds.forEach((id) => {
+        const account = returned.get(id);
+        accountPushStatus[id] =
+          account?.sub2api_status_text ||
+          (account?.sub2api_status === "pushed" ? "已推送" : "未推送");
+      });
+    }
+    setMessage(result.message || "sub2api 重新探测完成");
+  } catch (error) {
+    accountIds.forEach((id) => {
+      accountPushStatus[id] = `失败：${error.message}`;
+    });
+    setMessage(`sub2api 重新探测失败：${error.message}`);
+  } finally {
+    if (probeSub2apiBtn) {
+      probeSub2apiBtn.disabled = false;
+      probeSub2apiBtn.textContent = "重新探测 sub2api";
+    }
+    renderAccounts();
+  }
+}
+
+async function deleteSelectedSub2apiRemote() {
+  const accountIds = selectedAccountIds();
+  if (!accountIds.length) {
+    setMessage("请选择要删除远端的账号");
+    return;
+  }
+  if (
+    !window.confirm(
+      `确认删除选中 ${accountIds.length} 个账号在 sub2api 上的远端记录？\n（只删远端，本地账号文件保留；状态会改回未推送）`
+    )
+  ) {
+    return;
+  }
+  if (deleteSub2apiRemoteBtn) {
+    deleteSub2apiRemoteBtn.disabled = true;
+    deleteSub2apiRemoteBtn.textContent = `删除远端中 ${accountIds.length}...`;
+  }
+  accountIds.forEach((id) => {
+    accountPushStatus[id] = "删除远端中";
+  });
+  renderAccounts();
+  try {
+    const result = await requestJson("/api/accounts/sub2api/delete-remote", {
+      method: "POST",
+      body: JSON.stringify({ ...formPayload(), account_ids: accountIds }),
+    });
+    if (Array.isArray(result.accounts)) {
+      const returned = new Map(result.accounts.map((account) => [account.id, account]));
+      accounts = accounts.map((account) => returned.get(account.id) || account);
+      accountIds.forEach((id) => {
+        const account = returned.get(id);
+        accountPushStatus[id] = account?.sub2api_status_text || "未推送";
+      });
+    }
+    setMessage(result.message || "已删除 sub2api 远端账号");
+  } catch (error) {
+    accountIds.forEach((id) => {
+      accountPushStatus[id] = `失败：${error.message}`;
+    });
+    setMessage(`删除 sub2api 远端失败：${error.message}`);
+  } finally {
+    if (deleteSub2apiRemoteBtn) {
+      deleteSub2apiRemoteBtn.disabled = false;
+      deleteSub2apiRemoteBtn.textContent = "删除远端 sub2api";
+    }
     renderAccounts();
   }
 }
@@ -2164,6 +2287,18 @@ accountColumnOptions.addEventListener("change", (event) => {
 importSub2apiBtn.addEventListener("click", () => {
   importSelectedToSub2api().catch((error) => setMessage(error.message));
 });
+
+if (probeSub2apiBtn) {
+  probeSub2apiBtn.addEventListener("click", () => {
+    probeSelectedOnSub2api().catch((error) => setMessage(error.message));
+  });
+}
+
+if (deleteSub2apiRemoteBtn) {
+  deleteSub2apiRemoteBtn.addEventListener("click", () => {
+    deleteSelectedSub2apiRemote().catch((error) => setMessage(error.message));
+  });
+}
 
 importGrok2apiBtn.addEventListener("click", () => {
   importSelectedToGrok2api().catch((error) => setMessage(error.message));

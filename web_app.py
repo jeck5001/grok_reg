@@ -255,6 +255,140 @@ def webhook_email_stats():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/api/webhook/email/panel")
+def webhook_email_panel(request: Request):
+    """openai-cpa-email 联调面板：配置状态 + 收件池 + 推荐 Worker 变量。"""
+    import webhook_mail_store as wms
+
+    settings = reg.load_config()
+    secret = str(settings.get("email_webhook_secret") or "").strip()
+    provider = str(settings.get("email_provider") or "").strip()
+    enabled = bool(settings.get("email_webhook_enabled")) or provider in {
+        "openai_cpa_email",
+        "cpa_email",
+    }
+    mail_domains = str(settings.get("mail_domains") or settings.get("defaultDomains") or "").strip()
+    # 推导对外可填的 webhook 基址（优先请求 Host；Docker/反代时用户可改）
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or "127.0.0.1:8787"
+    proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "http").split(",")[0].strip()
+    base = f"{proto}://{host}".rstrip("/")
+    path = "/api/webhook/email"
+    full_url = f"{base}{path}"
+    sample_domain = ""
+    if mail_domains:
+        sample_domain = mail_domains.split(",")[0].strip()
+    sample_to = f"probe@{sample_domain}" if sample_domain else "probe@your-domain.com"
+
+    checks = []
+    checks.append(
+        {
+            "key": "secret",
+            "ok": bool(secret),
+            "label": "Webhook Secret",
+            "detail": "已配置" if secret else "未配置 email_webhook_secret",
+        }
+    )
+    checks.append(
+        {
+            "key": "provider",
+            "ok": provider in {"openai_cpa_email", "cpa_email"} or enabled,
+            "label": "收件模式",
+            "detail": (
+                f"provider={provider or '—'}; webhook={'on' if enabled else 'off'}"
+            ),
+        }
+    )
+    checks.append(
+        {
+            "key": "domains",
+            "ok": bool(mail_domains),
+            "label": "mail_domains",
+            "detail": mail_domains or "未填写主域池",
+        }
+    )
+    stats = wms.stats()
+    return {
+        "ok": True,
+        "enabled": enabled,
+        "provider": provider,
+        "secret_configured": bool(secret),
+        "mail_domains": mail_domains,
+        "webhook": {
+            "path": path,
+            "suggested_base": base,
+            "suggested_full_url": full_url,
+            "header": "X-Webhook-Secret",
+            "body_example": {
+                "message_id": "test-001",
+                "to_addr": sample_to,
+                "raw_content": "SpaceXAI confirmation code: ABC-DEF",
+            },
+        },
+        "worker_env": {
+            "EMAIL_WEBHOOK_URL": base,
+            "EMAIL_WEBHOOK_SECRET": "(与配置页 Webhook Secret 相同)",
+        },
+        "checks": checks,
+        "stats": stats,
+        "ready": all(c.get("ok") for c in checks),
+    }
+
+
+@app.post("/api/webhook/email/self-test")
+def webhook_email_self_test(payload: dict = None):
+    """本机模拟 Worker 推送一封测试邮件，验证 secret + 内存池 + 验码提取。"""
+    import uuid
+
+    import webhook_mail_store as wms
+
+    settings = reg.load_config()
+    secret_cfg = str(settings.get("email_webhook_secret") or "").strip()
+    if not secret_cfg:
+        raise HTTPException(status_code=400, detail="请先配置并保存 email_webhook_secret")
+
+    body = dict(payload or {})
+    # 允许用配置里的 secret 自测；也允许省略（用已保存 secret）
+    provided = str(body.get("secret") or "").strip()
+    if provided and provided != secret_cfg and provided != "********":
+        raise HTTPException(status_code=401, detail="secret 与配置不一致")
+
+    mail_domains = str(settings.get("mail_domains") or settings.get("defaultDomains") or "").strip()
+    domain = mail_domains.split(",")[0].strip() if mail_domains else "example.com"
+    to_addr = str(body.get("to_addr") or f"selftest@{domain}").strip()
+    code = str(body.get("code") or "AB1-CD2").strip().upper()
+    raw = str(
+        body.get("raw_content")
+        or f"From: noreply@x.ai\nTo: {to_addr}\nSubject: SpaceXAI confirmation code: {code}\n\nYour code is {code}\n"
+    )
+    message_id = str(body.get("message_id") or f"selftest-{uuid.uuid4().hex[:12]}")
+
+    stored = wms.store_webhook_mail(to_addr=to_addr, raw_content=raw, message_id=message_id)
+    peeked = wms.peek_code_for_email(to_addr)
+    return {
+        "ok": True,
+        "stored": stored,
+        "to_addr": to_addr,
+        "message_id": message_id,
+        "expected_code": code,
+        "extracted_code": peeked,
+        "extract_ok": bool(peeked)
+        and str(peeked).replace("-", "").upper() == code.replace("-", "").upper(),
+        "stats": wms.stats(),
+        "hint": "Worker 侧请用相同 secret 向 /api/webhook/email 推送；注册时会按 to_addr 取码。",
+    }
+
+
+@app.post("/api/webhook/email/clear")
+def webhook_email_clear():
+    try:
+        import webhook_mail_store as wms
+
+        wms.clear()
+        return {"ok": True, "stats": wms.stats()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 def public_account(account):
     item = dict(account)
     item.pop("sso", None)

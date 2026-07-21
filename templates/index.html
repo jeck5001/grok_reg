@@ -512,6 +512,10 @@
               <div class="section-copy">
                 <p class="section-kicker">openai-cpa-email</p>
                 <h2>CF Worker → 本地 webhook 收件</h2>
+                <p class="hint">
+                  链路：xAI 发信 → CF Email Routing → openai-cpa-email Worker → 本服务
+                  <code>/api/webhook/email</code> → 注册线程取验证码。
+                </p>
               </div>
               <div class="config-grid">
                 <label class="check">
@@ -523,11 +527,35 @@
                   <input name="email_webhook_secret" type="password" autocomplete="off" placeholder="与 CF Worker 变量一致" />
                 </label>
               </div>
-              <p class="hint">
-                Worker 推送地址填公网可访问的：
-                <code>http://你的域名或IP:8787/api/webhook/email</code>
-                （Worker 会自动补全路径；也可只填 <code>http://host:8787</code>）。
-                邮箱服务商选 <strong>openai_cpa_email</strong>，并配置 <code>mail_domains</code> + 多级子域。
+
+              <div class="webhook-panel" id="webhookPanel" style="margin-top: 14px;">
+                <div class="accounts-actions" style="flex-wrap: wrap; gap: 8px; margin-bottom: 10px;">
+                  <button id="webhookRefreshBtn" type="button">刷新联调状态</button>
+                  <button id="webhookSelfTestBtn" type="button" class="primary">本机模拟推送测试</button>
+                  <button id="webhookClearBtn" type="button" class="danger">清空收件池</button>
+                  <button id="webhookCopyUrlBtn" type="button">复制 Webhook URL</button>
+                  <button id="webhookCopyCurlBtn" type="button">复制 curl 示例</button>
+                </div>
+                <div id="webhookChecks" class="hint" style="margin-bottom: 8px;">尚未加载联调状态。</div>
+                <div class="config-grid">
+                  <label class="wide">
+                    推荐 Worker EMAIL_WEBHOOK_URL（公网可访问）
+                    <input id="webhookSuggestedUrl" type="text" readonly placeholder="保存配置并刷新后显示" />
+                  </label>
+                  <label class="wide">
+                    完整推送路径
+                    <input id="webhookFullUrl" type="text" readonly placeholder="/api/webhook/email" />
+                  </label>
+                </div>
+                <pre id="webhookPanelDetail" class="war-log" style="max-height: 220px; margin-top: 10px; white-space: pre-wrap;"></pre>
+              </div>
+
+              <p class="hint" style="margin-top: 10px;">
+                1）邮箱服务商选 <strong>openai_cpa_email</strong> 并填 <code>mail_domains</code> + 多级子域；
+                2）Worker 变量：<code>EMAIL_WEBHOOK_URL</code>=上面推荐基址，
+                <code>EMAIL_WEBHOOK_SECRET</code>=本页 Secret；
+                3）CF Email Routing catch-all 指到该 Worker；
+                4）先点「本机模拟推送测试」，再跑注册。
               </p>
             </section>
 

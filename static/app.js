@@ -19,6 +19,16 @@ const cfGlobalTestBtn = document.querySelector("#cfGlobalTestBtn");
 const cfGlobalZonesBtn = document.querySelector("#cfGlobalZonesBtn");
 const cfGlobalEmailDnsBtn = document.querySelector("#cfGlobalEmailDnsBtn");
 const cfGlobalStatus = document.querySelector("#cfGlobalStatus");
+const webhookRefreshBtn = document.querySelector("#webhookRefreshBtn");
+const webhookSelfTestBtn = document.querySelector("#webhookSelfTestBtn");
+const webhookClearBtn = document.querySelector("#webhookClearBtn");
+const webhookCopyUrlBtn = document.querySelector("#webhookCopyUrlBtn");
+const webhookCopyCurlBtn = document.querySelector("#webhookCopyCurlBtn");
+const webhookChecks = document.querySelector("#webhookChecks");
+const webhookSuggestedUrl = document.querySelector("#webhookSuggestedUrl");
+const webhookFullUrl = document.querySelector("#webhookFullUrl");
+const webhookPanelDetail = document.querySelector("#webhookPanelDetail");
+let webhookPanelCache = null;
 const exportFmtNative = document.querySelector("#exportFmtNative");
 const exportFmtGrok2api = document.querySelector("#exportFmtGrok2api");
 const exportFmtSub2api = document.querySelector("#exportFmtSub2api");
@@ -192,6 +202,9 @@ function activateConfigGroup(group) {
   try {
     localStorage.setItem(CONFIG_GROUP_PREF_KEY, name);
   } catch (e) {}
+  if (name === "mail") {
+    loadWebhookPanel({ silent: true }).catch(() => {});
+  }
 }
 
 function restoreConfigGroup() {
@@ -2381,6 +2394,168 @@ if (cfGlobalZonesBtn) {
 if (cfGlobalEmailDnsBtn) {
   cfGlobalEmailDnsBtn.addEventListener("click", () => {
     ensureCfGlobalEmailDns().catch((error) => setMessage(error.message));
+  });
+}
+
+function renderWebhookPanel(data) {
+  webhookPanelCache = data || null;
+  if (!data) return;
+  if (webhookSuggestedUrl) {
+    webhookSuggestedUrl.value = (data.webhook && data.webhook.suggested_base) || "";
+  }
+  if (webhookFullUrl) {
+    webhookFullUrl.value = (data.webhook && data.webhook.suggested_full_url) || "";
+  }
+  if (webhookChecks) {
+    const checks = Array.isArray(data.checks) ? data.checks : [];
+    const parts = checks.map((c) => `${c.ok ? "✓" : "✗"} ${c.label}: ${c.detail || ""}`);
+    const stats = data.stats || {};
+    parts.push(
+      `收件池: ${stats.mails || 0} 封 / ${stats.addresses || 0} 地址` +
+        (data.ready ? " · 配置项齐全" : " · 配置未就绪")
+    );
+    webhookChecks.textContent = parts.join(" ｜ ");
+  }
+  if (webhookPanelDetail) {
+    const stats = data.stats || {};
+    const recent = Array.isArray(stats.recent) ? stats.recent : [];
+    const lines = [];
+    lines.push(`provider=${data.provider || "—"}  webhook=${data.enabled ? "on" : "off"}  secret=${data.secret_configured ? "已配置" : "未配置"}`);
+    lines.push(`mail_domains=${data.mail_domains || "—"}`);
+    lines.push(`Worker 建议:`);
+    lines.push(`  EMAIL_WEBHOOK_URL=${(data.worker_env && data.worker_env.EMAIL_WEBHOOK_URL) || ""}`);
+    lines.push(`  EMAIL_WEBHOOK_SECRET=${(data.worker_env && data.worker_env.EMAIL_WEBHOOK_SECRET) || ""}`);
+    lines.push(`Header: ${(data.webhook && data.webhook.header) || "X-Webhook-Secret"}`);
+    if (recent.length) {
+      lines.push("最近收件:");
+      recent.slice(0, 8).forEach((m) => {
+        const ts = m.last_ts ? new Date(Number(m.last_ts) * 1000).toLocaleString() : "—";
+        lines.push(`  · ${m.to}  x${m.count || 1}  ${ts}`);
+        if (m.raw_preview) lines.push(`    ${String(m.raw_preview).replace(/\s+/g, " ").slice(0, 100)}`);
+      });
+    } else {
+      lines.push("最近收件: （空）可用「本机模拟推送测试」写入一封");
+    }
+    webhookPanelDetail.textContent = lines.join("\n");
+  }
+}
+
+async function loadWebhookPanel({ silent = false } = {}) {
+  try {
+    const data = await requestJson("/api/webhook/email/panel");
+    renderWebhookPanel(data);
+    if (!silent) setMessage(data.ready ? "webhook 联调状态已刷新（配置项齐全）" : "webhook 联调状态已刷新（仍有未完成项）");
+    return data;
+  } catch (error) {
+    if (webhookChecks) webhookChecks.textContent = `加载失败：${error.message}`;
+    if (!silent) setMessage(`加载 webhook 面板失败：${error.message}`);
+    throw error;
+  }
+}
+
+async function selfTestWebhook() {
+  setMessage("正在本机模拟 Worker 推送…");
+  try {
+    await saveConfig().catch(() => {});
+    const result = await requestJson("/api/webhook/email/self-test", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    await loadWebhookPanel({ silent: true });
+    if (result.extract_ok) {
+      setMessage(
+        `模拟推送成功：${result.to_addr} 提取到 ${result.extracted_code}（与预期 ${result.expected_code} 一致）`
+      );
+    } else {
+      setMessage(
+        `已写入收件池，但验码提取异常：got=${result.extracted_code || "空"} expected=${result.expected_code}`
+      );
+    }
+  } catch (error) {
+    setMessage(`模拟推送失败：${error.message}`);
+  }
+}
+
+async function clearWebhookPool() {
+  if (!window.confirm("确认清空本机 webhook 收件池？")) return;
+  try {
+    await requestJson("/api/webhook/email/clear", { method: "POST", body: "{}" });
+    await loadWebhookPanel({ silent: true });
+    setMessage("webhook 收件池已清空");
+  } catch (error) {
+    setMessage(`清空失败：${error.message}`);
+  }
+}
+
+async function copyText(text, okMsg) {
+  const value = String(text || "");
+  if (!value) {
+    setMessage("没有可复制的内容");
+    return;
+  }
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(value);
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = value;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    setMessage(okMsg || "已复制");
+  } catch (error) {
+    setMessage(`复制失败：${error.message}`);
+  }
+}
+
+function buildWebhookCurlExample() {
+  const data = webhookPanelCache;
+  const url =
+    (data && data.webhook && data.webhook.suggested_full_url) ||
+    `${window.location.origin}/api/webhook/email`;
+  const body =
+    (data && data.webhook && data.webhook.body_example) || {
+      message_id: "test-001",
+      to_addr: "probe@your-domain.com",
+      raw_content: "SpaceXAI confirmation code: ABC-DEF",
+    };
+  return [
+    `curl -X POST '${url}' \\`,
+    `  -H 'Content-Type: application/json' \\`,
+    `  -H 'X-Webhook-Secret: <你的 EMAIL_WEBHOOK_SECRET>' \\`,
+    `  -d '${JSON.stringify(body)}'`,
+  ].join("\n");
+}
+
+if (webhookRefreshBtn) {
+  webhookRefreshBtn.addEventListener("click", () => {
+    loadWebhookPanel().catch(() => {});
+  });
+}
+if (webhookSelfTestBtn) {
+  webhookSelfTestBtn.addEventListener("click", () => {
+    selfTestWebhook().catch((error) => setMessage(error.message));
+  });
+}
+if (webhookClearBtn) {
+  webhookClearBtn.addEventListener("click", () => {
+    clearWebhookPool().catch((error) => setMessage(error.message));
+  });
+}
+if (webhookCopyUrlBtn) {
+  webhookCopyUrlBtn.addEventListener("click", () => {
+    const url =
+      (webhookFullUrl && webhookFullUrl.value) ||
+      (webhookPanelCache && webhookPanelCache.webhook && webhookPanelCache.webhook.suggested_full_url) ||
+      "";
+    copyText(url, "已复制 Webhook 完整 URL");
+  });
+}
+if (webhookCopyCurlBtn) {
+  webhookCopyCurlBtn.addEventListener("click", () => {
+    copyText(buildWebhookCurlExample(), "已复制 curl 示例（请把 Secret 换成真实值）");
   });
 }
 

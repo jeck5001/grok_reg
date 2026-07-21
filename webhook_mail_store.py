@@ -167,14 +167,51 @@ def extract_xai_code_from_raw(raw: str) -> str:
 def stats() -> Dict[str, Any]:
     with _LOCK:
         _prune()
+        recent = []
+        for addr, items in _MAILS.items():
+            if not items:
+                continue
+            last = items[-1]
+            recent.append(
+                {
+                    "to": addr,
+                    "count": len(items),
+                    "last_ts": float(last.get("ts") or 0),
+                    "message_id": str(last.get("message_id") or ""),
+                    "raw_preview": str(last.get("raw") or "")[:120],
+                }
+            )
+        recent.sort(key=lambda x: x.get("last_ts") or 0, reverse=True)
         return {
             "addresses": len(_MAILS),
             "mails": sum(len(v) for v in _MAILS.values()),
             "seen_ids": len(_SEEN_IDS),
+            "max_age_sec": _MAX_AGE_SEC,
+            "recent": recent[:20],
         }
+
+
+def peek_code_for_email(email: str, *, extract_fn=None) -> Optional[str]:
+    """只看最新邮件能否提出验证码，不消费。"""
+    to_n = _norm_email(email)
+    with _LOCK:
+        _prune()
+        items = _MAILS.get(to_n) or []
+        if not items:
+            return None
+        raw = str(items[-1].get("raw") or "")
+        if extract_fn:
+            try:
+                code = extract_fn(raw) or ""
+            except Exception:
+                code = ""
+        else:
+            code = ""
+        return code or extract_xai_code_from_raw(raw) or None
 
 
 def clear() -> None:
     with _LOCK:
         _MAILS.clear()
+        _SEEN_IDS.clear()
         _SEEN_IDS.clear()

@@ -32,3 +32,14 @@ def test_dedup_message_id():
     b = wms.store_webhook_mail(to_addr="a@b.com", raw_content=raw, message_id="same")
     assert a.get("dedup") is False
     assert b.get("dedup") is True
+
+
+def test_peek_code_does_not_consume():
+    raw = "SpaceXAI confirmation code: ZZ1-YY2"
+    wms.store_webhook_mail(to_addr="p@e.com", raw_content=raw, message_id="peek-1")
+    c1 = wms.peek_code_for_email("p@e.com")
+    c2 = wms.peek_code_for_email("p@e.com")
+    assert c1
+    assert c1 == c2
+    assert wms.stats()["mails"] >= 1
+    assert "recent" in wms.stats()

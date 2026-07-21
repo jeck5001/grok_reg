@@ -1000,16 +1000,33 @@ def persist_sub2api_push_status(accounts, result):
                 base_meta["sub2api_remote_id"] = remote_id
 
             if item_status == "failed":
-                record.update(
-                    {
-                        **base_meta,
-                        "sub2api_status": "failed",
-                        "sub2api_status_text": f"失败：{str(item.get('error') or '')[:220]}",
-                        "sub2api_failed_at": now,
-                        "sub2api_error": str(item.get("error") or ""),
-                        "sub2api_step": str(item.get("step") or ""),
-                    }
-                )
+                step = str(item.get("step") or "").strip()
+                err = str(item.get("error") or "")
+                prev_status = str(record.get("sub2api_status") or "").strip().lower()
+                # 重新探测找不到远端 id：保留历史「已推送」，不要整批改成推送失败
+                if step == "probe" and prev_status in {"pushed", "probe_failed", ""}:
+                    record.update(base_meta)
+                    record["sub2api_error"] = err[:400]
+                    record["sub2api_probe_error"] = err[:400]
+                    record["sub2api_probe_at"] = now
+                    if prev_status in {"", "not_pushed"}:
+                        # 从未成功入库的，仍记失败
+                        record["sub2api_status"] = "failed"
+                        record["sub2api_status_text"] = f"失败：{err[:220]}"
+                        record["sub2api_failed_at"] = now
+                        record["sub2api_step"] = step
+                    # pushed / probe_failed 保持原状态
+                else:
+                    record.update(
+                        {
+                            **base_meta,
+                            "sub2api_status": "failed",
+                            "sub2api_status_text": f"失败：{err[:220]}",
+                            "sub2api_failed_at": now,
+                            "sub2api_error": err,
+                            "sub2api_step": step,
+                        }
+                    )
             elif item_status in {"probe_failed", "probed_failed"}:
                 probe_err = ""
                 post = item.get("post_actions") if isinstance(item.get("post_actions"), dict) else {}
@@ -1982,33 +1999,65 @@ def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
     }
 
 
+def _resolve_sub2api_remote_id(account, base=None, headers=None, settings=None, log_callback=None):
+    """解析远端 id：状态字段 → response → 按账号名回查。"""
+    remote_id = str((account or {}).get("sub2api_remote_id") or "").strip()
+    if remote_id:
+        return remote_id
+    remote_id = _extract_sub2api_remote_id_from_item(
+        {
+            "response": (account or {}).get("sub2api_response"),
+            "account_id": (account or {}).get("sub2api_remote_id"),
+        }
+    )
+    if remote_id:
+        return remote_id
+    if not base or not headers:
+        return ""
+    try:
+        name = _sub2api_account_name(account, settings=settings)
+        found = _sub2api_find_account_id_by_name(base, headers, name, log_callback=log_callback)
+        if found and log_callback:
+            log_callback(f"[*] sub2api 按名称回查到 id={found} ({(account or {}).get('email','')})")
+        return str(found or "").strip()
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] sub2api 按名称回查失败: {exc}")
+        return ""
+
+
 def probe_accounts_on_sub2api(accounts, settings=None, log_callback=None):
-    """对已入库账号重新探测（不重复创建）。"""
+    """对已入库账号重新探测（不重复创建）。
+
+    历史号若只有「已推送」无 remote id，会按命名规则回查 sub2api；
+    查不到则报错，不会把历史 pushed 批量改成 probe_failed。
+    """
     settings = {**config, **dict(settings or {})}
     base = _sub2api_api_base(settings)
     headers = _sub2api_headers(settings)
     items = []
     for account in accounts or []:
         email = str(account.get("email") or "").strip()
-        remote_id = str(account.get("sub2api_remote_id") or "").strip()
-        if not remote_id:
-            # 尝试从历史 response 解析
-            remote_id = _extract_sub2api_remote_id_from_item(
-                {"response": account.get("sub2api_response"), "account_id": account.get("sub2api_remote_id")}
-            )
+        remote_id = _resolve_sub2api_remote_id(
+            account, base=base, headers=headers, settings=settings, log_callback=log_callback
+        )
         if not remote_id:
             items.append(
                 {
                     "email": email,
                     "status": "failed",
                     "step": "probe",
-                    "error": "缺少 sub2api 远端 id，无法探测（请先推送或在状态里补 remote id）",
+                    "error": "缺少 sub2api 远端 id，且按名称未找到（历史号未记 id 时可到 sub2api 后台核对名称）",
                 }
             )
             continue
         try:
             post_actions = _sub2api_initialize_account(
-                base, headers, remote_id, settings={**settings, "sub2api_auto_probe": True}, log_callback=log_callback
+                base,
+                headers,
+                remote_id,
+                settings={**settings, "sub2api_auto_probe": True},
+                log_callback=log_callback,
             )
             ok = bool((post_actions or {}).get("ok"))
             test = (post_actions or {}).get("test") or {}
@@ -2064,11 +2113,9 @@ def delete_accounts_from_sub2api(accounts, settings=None, log_callback=None):
     items = []
     for account in accounts or []:
         email = str(account.get("email") or "").strip()
-        remote_id = str(account.get("sub2api_remote_id") or "").strip()
-        if not remote_id:
-            remote_id = _extract_sub2api_remote_id_from_item(
-                {"response": account.get("sub2api_response")}
-            )
+        remote_id = _resolve_sub2api_remote_id(
+            account, base=base, headers=headers, settings=settings, log_callback=log_callback
+        )
         if not remote_id:
             items.append(
                 {

@@ -330,7 +330,15 @@ async function requestJson(url, options = {}) {
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(payload.detail || `HTTP ${response.status}`);
+    let detail = payload.detail || payload.message || `HTTP ${response.status}`;
+    if (Array.isArray(detail)) {
+      detail = detail
+        .map((item) => (typeof item === "string" ? item : item.msg || JSON.stringify(item)))
+        .join("; ");
+    } else if (detail && typeof detail === "object") {
+      detail = detail.msg || JSON.stringify(detail);
+    }
+    throw new Error(detail);
   }
   return payload;
 }
@@ -749,28 +757,35 @@ function accountIsPushed(account, channel) {
 }
 
 function accountIsSub2apiProbeFailed(account) {
+  // 只认正式状态 probe_failed（新号探测失败后写入）。
+  // 历史号默认 pushed=探测成功；中间态「探测中」也保留在该筛选下，避免一点击整页变空。
   const status = String(account.sub2api_status || "").toLowerCase();
-  const text = String(accountPushStatus[account.id] || account.sub2api_status_text || "");
-  return (
-    status === "probe_failed" ||
-    text.includes("探测失败") ||
-    text.includes("已入库·探测失败") ||
-    Boolean(account.sub2api_probe_error)
-  );
+  const live = String(accountPushStatus[account.id] || "");
+  if (live === "探测中" || live === "删除远端中") {
+    return status === "probe_failed" || Boolean(account.sub2api_probe_error);
+  }
+  if (status === "probe_failed") return true;
+  // 仅当持久化文案明确是探测失败时（不要被 live 临时失败串误伤）
+  const text = String(account.sub2api_status_text || "");
+  return text.includes("已入库·探测失败") || text.includes("探测失败");
 }
 
 function accountHasPushFailure(account) {
   for (const channel of ["grok2api", "sub2api", "cpa"]) {
     const status = String(account[`${channel}_status`] || "").toLowerCase();
-    const text = String(
+    const live = String(
       (channel === "sub2api" && accountPushStatus[account.id]) ||
         (channel === "grok2api" && accountGrok2apiPushStatus[account.id]) ||
         (channel === "cpa" && accountCpaPushStatus[account.id]) ||
-        account[`${channel}_status_text`] ||
         ""
     );
-    if (status === "failed" || status === "probe_failed") return true;
-    if (text.startsWith("失败") || text.includes("失败") || text.includes("探测失败")) return true;
+    const text = String(account[`${channel}_status_text`] || "");
+    // 推送本身失败；sub2api 探测失败单独筛，也算进「推送失败」方便处理
+    if (status === "failed") return true;
+    if (channel === "sub2api" && status === "probe_failed") return true;
+    if (live.startsWith("失败")) return true;
+    if (text.startsWith("失败") || text === "推送失败") return true;
+    if (channel === "sub2api" && (text.includes("探测失败") || live.includes("探测失败"))) return true;
   }
   return false;
 }
@@ -1026,7 +1041,12 @@ function formatAccountStatusDisplay(value) {
   const text = String(value ?? "").trim();
   if (!text) return { display: "", title: "", tone: "" };
   if (text === "已推送" || text === "可用") return { display: text, title: "", tone: "ok" };
-  if (text === "推送中" || text === "检查中") return { display: text, title: "", tone: "running" };
+  if (text === "推送中" || text === "检查中" || text === "探测中" || text === "删除远端中") {
+    return { display: text, title: "", tone: "running" };
+  }
+  if (text === "已入库·探测失败" || text.includes("探测失败")) {
+    return { display: text.includes("已入库") ? "已入库·探测失败" : "探测失败", title: text, tone: "failed" };
+  }
   if (text === "失效" || text === "资料不完整") return { display: text, title: "", tone: "failed" };
   if (text.startsWith("失败") || text === "推送失败") {
     return { display: summarizeFailureStatus(text), title: text, tone: "failed" };
@@ -2018,8 +2038,14 @@ async function importSelectedToSub2api() {
 async function probeSelectedOnSub2api() {
   const accountIds = selectedAccountIds();
   if (!accountIds.length) {
-    setMessage("请选择要重新探测的账号");
+    setMessage("请选择要重新探测的账号（可先用筛选「sub2api 探测失败」）");
     return;
+  }
+  // 操作中暂时取消筛选，避免状态变成「探测中」后整页被滤空，看起来像没反应
+  const prevFilter = accountPushFilterValue;
+  if (accountPushFilterValue === "sub2api_probe_failed") {
+    accountPushFilterValue = "all";
+    if (accountPushFilter) accountPushFilter.value = "all";
   }
   if (probeSub2apiBtn) {
     probeSub2apiBtn.disabled = true;
@@ -2029,7 +2055,7 @@ async function probeSelectedOnSub2api() {
     accountPushStatus[id] = "探测中";
   });
   renderAccounts();
-  setMessage(`开始 sub2api 重新探测：${accountIds.length} 个账号`);
+  setMessage(`开始 sub2api 重新探测：${accountIds.length} 个账号（请稍候，每号约数秒～二十秒）`);
   try {
     const result = await requestJson("/api/accounts/sub2api/probe", {
       method: "POST",
@@ -2040,16 +2066,45 @@ async function probeSelectedOnSub2api() {
       accounts = accounts.map((account) => returned.get(account.id) || account);
       accountIds.forEach((id) => {
         const account = returned.get(id);
-        accountPushStatus[id] =
-          account?.sub2api_status_text ||
-          (account?.sub2api_status === "pushed" ? "已推送" : "未推送");
+        if (account) {
+          accountPushStatus[id] =
+            account.sub2api_status_text ||
+            (account.sub2api_status === "pushed"
+              ? "已推送"
+              : account.sub2api_status === "probe_failed"
+                ? "已入库·探测失败"
+                : "未推送");
+        } else {
+          delete accountPushStatus[id];
+        }
       });
+    } else {
+      accountIds.forEach((id) => {
+        delete accountPushStatus[id];
+      });
+    }
+    // 若还有探测失败，自动回到该筛选，方便继续处理
+    const stillFailed = accountIds.some((id) => {
+      const a = accounts.find((x) => x.id === id);
+      return a && accountIsSub2apiProbeFailed(a);
+    });
+    if (stillFailed) {
+      accountPushFilterValue = "sub2api_probe_failed";
+      if (accountPushFilter) accountPushFilter.value = "sub2api_probe_failed";
+    } else if (prevFilter && prevFilter !== "all") {
+      accountPushFilterValue = prevFilter;
+      if (accountPushFilter) accountPushFilter.value = prevFilter;
     }
     setMessage(result.message || "sub2api 重新探测完成");
   } catch (error) {
     accountIds.forEach((id) => {
       accountPushStatus[id] = `失败：${error.message}`;
     });
+    // 失败时恢复原筛选
+    if (prevFilter) {
+      accountPushFilterValue = prevFilter;
+      if (accountPushFilter) accountPushFilter.value = prevFilter;
+    }
     setMessage(`sub2api 重新探测失败：${error.message}`);
   } finally {
     if (probeSub2apiBtn) {
@@ -2073,6 +2128,11 @@ async function deleteSelectedSub2apiRemote() {
   ) {
     return;
   }
+  const prevFilter = accountPushFilterValue;
+  if (accountPushFilterValue === "sub2api_probe_failed") {
+    accountPushFilterValue = "all";
+    if (accountPushFilter) accountPushFilter.value = "all";
+  }
   if (deleteSub2apiRemoteBtn) {
     deleteSub2apiRemoteBtn.disabled = true;
     deleteSub2apiRemoteBtn.textContent = `删除远端中 ${accountIds.length}...`;
@@ -2081,6 +2141,7 @@ async function deleteSelectedSub2apiRemote() {
     accountPushStatus[id] = "删除远端中";
   });
   renderAccounts();
+  setMessage(`正在删除 sub2api 远端：${accountIds.length} 个账号…`);
   try {
     const result = await requestJson("/api/accounts/sub2api/delete-remote", {
       method: "POST",
@@ -2091,7 +2152,12 @@ async function deleteSelectedSub2apiRemote() {
       accounts = accounts.map((account) => returned.get(account.id) || account);
       accountIds.forEach((id) => {
         const account = returned.get(id);
-        accountPushStatus[id] = account?.sub2api_status_text || "未推送";
+        if (account) accountPushStatus[id] = account.sub2api_status_text || "未推送";
+        else delete accountPushStatus[id];
+      });
+    } else {
+      accountIds.forEach((id) => {
+        delete accountPushStatus[id];
       });
     }
     setMessage(result.message || "已删除 sub2api 远端账号");
@@ -2099,6 +2165,10 @@ async function deleteSelectedSub2apiRemote() {
     accountIds.forEach((id) => {
       accountPushStatus[id] = `失败：${error.message}`;
     });
+    if (prevFilter) {
+      accountPushFilterValue = prevFilter;
+      if (accountPushFilter) accountPushFilter.value = prevFilter;
+    }
     setMessage(`删除 sub2api 远端失败：${error.message}`);
   } finally {
     if (deleteSub2apiRemoteBtn) {

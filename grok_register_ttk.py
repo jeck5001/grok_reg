@@ -6567,16 +6567,14 @@ def validate_registration_config(settings):
         ).strip()
         if not mail_domains:
             raise ValueError("openai_cpa_email 模式需要填写 mail_domains / defaultDomains")
-        # webhook 模式默认开启收件池
+        # webhook 模式默认开启收件池（仅该 provider 依赖）
         normalized["email_webhook_enabled"] = True
         if not str(normalized.get("email_webhook_secret") or "").strip():
             raise ValueError(
                 "openai_cpa_email 模式需要填写 email_webhook_secret（与 CF Worker EMAIL_WEBHOOK_SECRET 一致）"
             )
-    if bool(normalized.get("email_webhook_enabled")) and not str(
-        normalized.get("email_webhook_secret") or ""
-    ).strip():
-        raise ValueError("启用 webhook 收件时需要填写 email_webhook_secret")
+    # 说明：email_webhook_enabled 仅表示「允许接收 Worker 推送」。
+    # yyds/duckmail/cloudflare/cloudmail 的收信路径不再受该开关影响。
     if normalized["cpa_auto_push_remote"]:
         if not str(normalized.get("cpa_management_base") or "").strip():
             raise ValueError("CPA 自动推送需要先填写 CPA 管理地址")
@@ -8347,14 +8345,24 @@ def get_oai_code(
     cancel_callback=None,
     resend_callback=None,
 ):
+    """按当前邮箱服务商收验证码。
+
+    webhook 仅用于：
+    - provider=openai_cpa_email / cpa_email
+    - 或本号建号 token 明确是 webhook_mail
+
+    注意：配置里的 email_webhook_enabled 只是「允许 webhook 收件」，
+    不能在 yyds/duckmail/cloudflare 时抢占收信路径。
+    """
     provider = get_email_provider()
     token_hint = str(dev_token or "").strip()
-    # 优先 webhook 内存池（openai-cpa-email Worker）
-    if (
-        bool(config.get("email_webhook_enabled"))
-        or token_hint == "webhook_mail"
-        or provider in {"openai_cpa_email", "cpa_email"}
-    ):
+
+    use_webhook = provider in {"openai_cpa_email", "cpa_email"} or token_hint == "webhook_mail"
+    if use_webhook:
+        if log_callback and provider not in {"openai_cpa_email", "cpa_email"}:
+            log_callback(
+                f"[!] 邮箱 token=webhook_mail，但 provider={provider}；仍按 webhook 收信"
+            )
         return webhook_get_oai_code(
             email,
             timeout=timeout,
@@ -8363,6 +8371,7 @@ def get_oai_code(
             cancel_callback=cancel_callback,
             resend_callback=resend_callback,
         )
+
     # 建号 token 类型与 provider 不一致时，按 token 纠偏
     if token_hint == "cloudmail_catch_all" and provider != "cloudmail":
         if log_callback:
@@ -8370,7 +8379,10 @@ def get_oai_code(
                 f"[!] 邮箱 token 为 cloudmail_catch_all，但 provider={provider}，按 cloudmail 收信"
             )
         provider = "cloudmail"
+
     if provider == "yyds":
+        if log_callback:
+            log_callback(f"[*] 收信通道: YYDS（provider=yyds）")
         return yyds_get_oai_code(
             dev_token,
             email,
@@ -8382,6 +8394,8 @@ def get_oai_code(
             resend_callback=resend_callback,
         )
     if provider == "cloudmail":
+        if log_callback:
+            log_callback(f"[*] 收信通道: CloudMail（provider=cloudmail）")
         return cloudmail_get_oai_code(
             dev_token,
             email,
@@ -8392,6 +8406,8 @@ def get_oai_code(
             resend_callback=resend_callback,
         )
     if provider == "cloudflare":
+        if log_callback:
+            log_callback(f"[*] 收信通道: Cloudflare temp-email（provider=cloudflare）")
         return cloudflare_get_oai_code(
             dev_token,
             email,
@@ -8403,6 +8419,8 @@ def get_oai_code(
         )
     if provider != "duckmail":
         raise Exception(f"邮箱服务商 {provider!r} 无对应收信实现")
+    if log_callback:
+        log_callback(f"[*] 收信通道: DuckMail（provider=duckmail）")
     return duckmail_get_oai_code(
         dev_token,
         email,

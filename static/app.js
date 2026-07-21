@@ -302,6 +302,15 @@ function applyConfig(config) {
     } else if (key === "notify_events") {
       continue;
     } else {
+      // select 若 value 不在 options 里，浏览器会悄悄落回第一项（原先是 duckmail）
+      if (field.tagName === "SELECT" && value != null && value !== "") {
+        const wanted = String(value);
+        const ok = Array.from(field.options || []).some((opt) => opt.value === wanted);
+        if (!ok) {
+          console.warn(`[config] ${key}=${wanted} 不在选项中，保持当前值`);
+          continue;
+        }
+      }
       field.value = value ?? "";
     }
   }
@@ -452,9 +461,16 @@ function restoreRememberedJobId() {
 }
 
 async function startJob() {
+  const payload = formPayload();
+  const provider = String(payload.email_provider || "").trim();
+  if (!provider) {
+    setMessage("请先选择邮箱服务商（email_provider）再启动");
+    return;
+  }
+  setMessage(`正在启动… 邮箱服务商=${provider}`);
   const job = await requestJson("/api/jobs/start", {
     method: "POST",
-    body: JSON.stringify(formPayload()),
+    body: JSON.stringify(payload),
   });
   // 换 job / 清屏：进行中的 poll 看到 jobId/offset 变化会丢弃结果
   rememberJobId(job.job_id);

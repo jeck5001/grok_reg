@@ -5625,9 +5625,24 @@ def _normalize_path(value):
     return raw if raw.startswith("/") else f"/{raw}"
 
 
+_EMAIL_PROVIDERS = (
+    "duckmail",
+    "yyds",
+    "cloudflare",
+    "cloudmail",
+    "openai_cpa_email",
+    "cpa_email",
+)
+
+
 def validate_registration_config(settings):
     normalized = {**DEFAULT_CONFIG, **dict(settings or {})}
-    provider = str(normalized.get("email_provider") or "duckmail").strip() or "duckmail"
+    provider = str(normalized.get("email_provider") or "duckmail").strip().lower() or "duckmail"
+    # 兼容大小写 / 空格；未知值不要静默回落 duckmail（会误打 DuckMail API 出一串 401）
+    if provider not in _EMAIL_PROVIDERS:
+        raise ValueError(
+            f"未知邮箱服务商: {provider!r}（可选: {', '.join(_EMAIL_PROVIDERS)}）"
+        )
     normalized["email_provider"] = provider
     normalized["register_count"] = _parse_positive_int(
         normalized.get("register_count"), 1, minimum=1, maximum=1000
@@ -6510,7 +6525,9 @@ class RegistrationJob:
         account_interval = float(self.settings.get("account_interval_seconds", 12) or 0)
         account_jitter = float(self.settings.get("account_interval_jitter_seconds", 8) or 0)
         block_threshold = int(self.settings.get("stop_on_consecutive_blocks", 3) or 0)
+        provider = str(self.settings.get("email_provider") or config.get("email_provider") or "").strip()
         self.log(f"[*] 配置已保存，开始执行。目标数量: {count}，并发线程: {worker_count}")
+        self.log(f"[*] 邮箱服务商: {provider or '未知'}（收信走该 provider，不是 DuckMail 标签就一定是 DuckMail）")
         self.log(
             f"[*] 风控节奏: 账号间隔 {account_interval:.1f}s ±{account_jitter:.1f}s，"
             f"连续封禁熔断 {block_threshold or '关闭'}，"
@@ -7428,7 +7445,13 @@ def cloudmail_get_oai_code(
 # ──────────────────────── 公共邮箱工具 ────────────────────────
 
 def get_email_provider():
-    return config.get("email_provider", "duckmail")
+    provider = str(config.get("email_provider") or "duckmail").strip().lower() or "duckmail"
+    if provider not in _EMAIL_PROVIDERS:
+        # 运行期兜底：不要把未知值当 duckmail 用
+        raise Exception(
+            f"未知邮箱服务商: {provider!r}（请在配置里选 duckmail/yyds/cloudflare/cloudmail）"
+        )
+    return provider
 
 
 def _is_transient_http_error(exc):
@@ -7628,10 +7651,11 @@ def get_oai_code(
     resend_callback=None,
 ):
     provider = get_email_provider()
+    token_hint = str(dev_token or "").strip()
     # 优先 webhook 内存池（openai-cpa-email Worker）
     if (
         bool(config.get("email_webhook_enabled"))
-        or str(dev_token or "") == "webhook_mail"
+        or token_hint == "webhook_mail"
         or provider in {"openai_cpa_email", "cpa_email"}
     ):
         return webhook_get_oai_code(
@@ -7642,6 +7666,13 @@ def get_oai_code(
             cancel_callback=cancel_callback,
             resend_callback=resend_callback,
         )
+    # 建号 token 类型与 provider 不一致时，按 token 纠偏
+    if token_hint == "cloudmail_catch_all" and provider != "cloudmail":
+        if log_callback:
+            log_callback(
+                f"[!] 邮箱 token 为 cloudmail_catch_all，但 provider={provider}，按 cloudmail 收信"
+            )
+        provider = "cloudmail"
     if provider == "yyds":
         return yyds_get_oai_code(
             dev_token,
@@ -7673,6 +7704,8 @@ def get_oai_code(
             cancel_callback=cancel_callback,
             resend_callback=resend_callback,
         )
+    if provider != "duckmail":
+        raise Exception(f"邮箱服务商 {provider!r} 无对应收信实现")
     return duckmail_get_oai_code(
         dev_token,
         email,
@@ -7712,13 +7745,44 @@ def duckmail_get_oai_code(
 ):
     deadline = time.time() + timeout
     seen_ids = set()
+    auth_fail_streak = 0
+    soft_fail_streak = 0
+    last_err = ""
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         try:
             messages = get_messages(dev_token)
+            auth_fail_streak = 0
+            soft_fail_streak = 0
+            last_err = ""
         except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] DuckMail list mail failed: {exc}")
+            err_text = str(exc)
+            is_auth = "401" in err_text or "403" in err_text or "unauthorized" in err_text.lower()
+            if is_auth:
+                auth_fail_streak += 1
+                if auth_fail_streak == 1 or auth_fail_streak % 4 == 0:
+                    if log_callback:
+                        log_callback(
+                            f"[Debug] DuckMail list mail 401/403 "
+                            f"(streak={auth_fail_streak}): {err_text}"
+                        )
+                # token 无效时再刷也没用，快速失败换号
+                if auth_fail_streak >= 5:
+                    raise Exception(
+                        f"DuckMail 邮箱鉴权持续失败 (HTTP 401/403): {err_text}"
+                    )
+            else:
+                soft_fail_streak += 1
+                if (
+                    soft_fail_streak == 1
+                    or soft_fail_streak % 8 == 0
+                    or err_text != last_err
+                ):
+                    if log_callback:
+                        log_callback(
+                            f"[Debug] DuckMail list mail failed (#{soft_fail_streak}): {err_text}"
+                        )
+                last_err = err_text
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
         for msg in messages:

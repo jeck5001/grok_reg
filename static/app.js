@@ -758,14 +758,18 @@ function accountIsPushed(account, channel) {
 
 function accountIsSub2apiProbeFailed(account) {
   // 只认正式状态 probe_failed（新号探测失败后写入）。
-  // 历史号默认 pushed=探测成功；中间态「探测中」也保留在该筛选下，避免一点击整页变空。
+  // 历史号默认 pushed=探测成功。操作中 live「探测中/删除远端中」仍留在该筛选下，
+  // 避免一点击列表变空；过滤器本身不要被代码改掉。
   const status = String(account.sub2api_status || "").toLowerCase();
   const live = String(accountPushStatus[account.id] || "");
   if (live === "探测中" || live === "删除远端中") {
-    return status === "probe_failed" || Boolean(account.sub2api_probe_error);
+    return (
+      status === "probe_failed" ||
+      Boolean(account.sub2api_probe_error) ||
+      String(account.sub2api_status_text || "").includes("探测失败")
+    );
   }
   if (status === "probe_failed") return true;
-  // 仅当持久化文案明确是探测失败时（不要被 live 临时失败串误伤）
   const text = String(account.sub2api_status_text || "");
   return text.includes("已入库·探测失败") || text.includes("探测失败");
 }
@@ -2041,12 +2045,7 @@ async function probeSelectedOnSub2api() {
     setMessage("请选择要重新探测的账号（可先用筛选「sub2api 探测失败」）");
     return;
   }
-  // 操作中暂时取消筛选，避免状态变成「探测中」后整页被滤空，看起来像没反应
-  const prevFilter = accountPushFilterValue;
-  if (accountPushFilterValue === "sub2api_probe_failed") {
-    accountPushFilterValue = "all";
-    if (accountPushFilter) accountPushFilter.value = "all";
-  }
+  // 不改过滤条件；「探测中」仍算在「探测失败」筛选内，列表不会被滤空
   if (probeSub2apiBtn) {
     probeSub2apiBtn.disabled = true;
     probeSub2apiBtn.textContent = `探测中 ${accountIds.length} 个...`;
@@ -2083,28 +2082,11 @@ async function probeSelectedOnSub2api() {
         delete accountPushStatus[id];
       });
     }
-    // 若还有探测失败，自动回到该筛选，方便继续处理
-    const stillFailed = accountIds.some((id) => {
-      const a = accounts.find((x) => x.id === id);
-      return a && accountIsSub2apiProbeFailed(a);
-    });
-    if (stillFailed) {
-      accountPushFilterValue = "sub2api_probe_failed";
-      if (accountPushFilter) accountPushFilter.value = "sub2api_probe_failed";
-    } else if (prevFilter && prevFilter !== "all") {
-      accountPushFilterValue = prevFilter;
-      if (accountPushFilter) accountPushFilter.value = prevFilter;
-    }
     setMessage(result.message || "sub2api 重新探测完成");
   } catch (error) {
     accountIds.forEach((id) => {
       accountPushStatus[id] = `失败：${error.message}`;
     });
-    // 失败时恢复原筛选
-    if (prevFilter) {
-      accountPushFilterValue = prevFilter;
-      if (accountPushFilter) accountPushFilter.value = prevFilter;
-    }
     setMessage(`sub2api 重新探测失败：${error.message}`);
   } finally {
     if (probeSub2apiBtn) {
@@ -2128,11 +2110,7 @@ async function deleteSelectedSub2apiRemote() {
   ) {
     return;
   }
-  const prevFilter = accountPushFilterValue;
-  if (accountPushFilterValue === "sub2api_probe_failed") {
-    accountPushFilterValue = "all";
-    if (accountPushFilter) accountPushFilter.value = "all";
-  }
+  // 不改过滤条件；删除过程中状态「删除远端中」仍留在「探测失败」筛选内
   if (deleteSub2apiRemoteBtn) {
     deleteSub2apiRemoteBtn.disabled = true;
     deleteSub2apiRemoteBtn.textContent = `删除远端中 ${accountIds.length}...`;
@@ -2165,10 +2143,6 @@ async function deleteSelectedSub2apiRemote() {
     accountIds.forEach((id) => {
       accountPushStatus[id] = `失败：${error.message}`;
     });
-    if (prevFilter) {
-      accountPushFilterValue = prevFilter;
-      if (accountPushFilter) accountPushFilter.value = prevFilter;
-    }
     setMessage(`删除 sub2api 远端失败：${error.message}`);
   } finally {
     if (deleteSub2apiRemoteBtn) {

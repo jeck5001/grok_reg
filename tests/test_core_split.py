@@ -133,3 +133,14 @@ def test_xai_and_browser_live_in_core_modules():
     assert reg.create_browser_options is browser.create_browser_options
     assert reg.fill_profile_and_submit is browser.fill_profile_and_submit
     assert reg._get_page is browser._get_page
+
+
+def test_push_lives_in_core_module():
+    from core.push import integrations as push
+
+    assert reg.import_accounts_to_sub2api is push.import_accounts_to_sub2api
+    assert reg.import_accounts_to_grok2api is push.import_accounts_to_grok2api
+    assert reg.import_accounts_to_cpa is push.import_accounts_to_cpa
+    assert reg.auto_push_registered_account is push.auto_push_registered_account
+    assert reg.export_and_push_cpa_credential is push.export_and_push_cpa_credential
+    assert reg.XAI_GROK_OAUTH_CLIENT_ID == push.XAI_GROK_OAUTH_CLIENT_ID

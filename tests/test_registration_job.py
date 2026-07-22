@@ -2236,7 +2236,8 @@ def test_turnstile_hook_is_network_safe_and_deferred_from_otp_submit():
     page_hook = Path("turnstilePatch/pageHook.js").read_text(encoding="utf-8")
     source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
     otp_start = source.index("def fill_code_and_submit(")
-    otp_end = source.index("\ndef getTurnstileToken", otp_start)
+    # getTurnstileToken 已迁至 core/turnstile；OTP 块以 fill_profile_and_submit 为下界
+    otp_end = source.index("def fill_profile_and_submit(", otp_start)
     profile_start = source.index("def fill_profile_and_submit(")
     profile_end = source.index("\ndef wait_for_sso_cookie", profile_start)
 
@@ -2245,6 +2246,8 @@ def test_turnstile_hook_is_network_safe_and_deferred_from_otp_submit():
     # OTP 阶段禁止安装 pageHook，避免验证码后 SPA 路由卡死
     assert "install_turnstile_page_hook(page" not in source[otp_start:otp_end]
     assert "install_turnstile_page_hook(page" in source[profile_start:profile_end]
+    # solver 主入口在 core 包
+    assert "def getTurnstileToken(" in Path("core/turnstile/solver.py").read_text(encoding="utf-8")
 
 
 def test_turnstile_page_hook_installs_with_cdp(monkeypatch):

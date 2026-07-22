@@ -108,3 +108,14 @@ def test_email_and_http_live_in_core_modules():
     assert reg.http_get is http_get
     assert reg.get_proxies is get_proxies
     assert reg.sleep_with_cancel is sleep_with_cancel
+
+
+def test_turnstile_lives_in_core_module():
+    from core.turnstile import solver as turnstile
+
+    assert reg.normalize_turnstile_solver_url is turnstile.normalize_turnstile_solver_url
+    assert reg.solve_turnstile_via_local_solver is turnstile.solve_turnstile_via_local_solver
+    assert reg.getTurnstileToken is turnstile.getTurnstileToken
+    assert reg.scrape_turnstile_sitekey_text is turnstile.scrape_turnstile_sitekey_text
+    assert reg.probe_local_turnstile_solver is turnstile.probe_local_turnstile_solver
+    assert reg._proxy_for_turnstile_solver is turnstile._proxy_for_turnstile_solver

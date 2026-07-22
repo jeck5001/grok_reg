@@ -144,3 +144,15 @@ def test_push_lives_in_core_module():
     assert reg.auto_push_registered_account is push.auto_push_registered_account
     assert reg.export_and_push_cpa_credential is push.export_and_push_cpa_credential
     assert reg.XAI_GROK_OAUTH_CLIENT_ID == push.XAI_GROK_OAUTH_CLIENT_ID
+
+
+def test_cf_global_and_jobs_live_in_core_modules():
+    from core.cf_global import api as cf_global
+    from core.jobs import registration as jobs
+
+    assert reg.deploy_cf_email_worker is cf_global.deploy_cf_email_worker
+    assert reg.setup_cf_email_catch_all is cf_global.setup_cf_email_catch_all
+    assert reg.is_private_or_local_webhook_url is cf_global.is_private_or_local_webhook_url
+    assert reg.RegistrationJob is jobs.RegistrationJob
+    assert reg.read_job_log_lines is jobs.read_job_log_lines
+    assert reg.save_job_snapshot is jobs.save_job_snapshot

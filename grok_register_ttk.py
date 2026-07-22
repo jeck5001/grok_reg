@@ -1696,6 +1696,165 @@ def list_registered_accounts(include_sso=True):
         return [dict(a) for a in accounts]
 
 
+def _account_matches_filter(account, filter_name="all"):
+    """与前端 accountPushFilter 语义对齐的服务端筛选。"""
+    name = str(filter_name or "all").strip().lower() or "all"
+    if name in {"", "all"}:
+        return True
+
+    def _status(channel):
+        return str(account.get(f"{channel}_status") or "").strip().lower()
+
+    def _text(channel):
+        return str(account.get(f"{channel}_status_text") or "")
+
+    def _is_pushed(channel):
+        st = _status(channel)
+        tx = _text(channel)
+        if channel == "sub2api" and (st == "probe_failed" or "探测失败" in tx):
+            return False
+        return st == "pushed" or tx == "已推送"
+
+    def _is_failed(channel):
+        st = _status(channel)
+        tx = _text(channel)
+        if st == "failed":
+            return True
+        if channel == "sub2api" and (st == "probe_failed" or "探测失败" in tx):
+            return True
+        return tx.startswith("失败") or tx == "推送失败"
+
+    if name == "any_pushed":
+        return any(_is_pushed(c) for c in ("grok2api", "sub2api", "cpa"))
+    if name == "none_pushed":
+        return all(not _is_pushed(c) for c in ("grok2api", "sub2api", "cpa"))
+    if name == "grok2api_pushed":
+        return _is_pushed("grok2api")
+    if name == "sub2api_pushed":
+        return _is_pushed("sub2api")
+    if name == "sub2api_probe_failed":
+        st = _status("sub2api")
+        tx = _text("sub2api")
+        return (
+            st == "probe_failed"
+            or "已入库·探测失败" in tx
+            or "探测失败" in tx
+            or bool(account.get("sub2api_probe_error"))
+        )
+    if name == "cpa_pushed":
+        return _is_pushed("cpa")
+    if name == "failed":
+        return any(_is_failed(c) for c in ("grok2api", "sub2api", "cpa"))
+    if name == "has_refresh":
+        return bool(account.get("has_refresh_token"))
+    if name == "no_refresh":
+        return not bool(account.get("has_refresh_token"))
+    return True
+
+
+def _account_search_haystack(account):
+    parts = [
+        account.get("email"),
+        account.get("source_file"),
+        account.get("created_at"),
+        account.get("sso_preview"),
+        account.get("grok2api_status_text"),
+        account.get("sub2api_status_text"),
+        account.get("cpa_status_text"),
+        account.get("health_status_text"),
+        account.get("sub2api_remote_id"),
+    ]
+    return " ".join(str(x or "").lower() for x in parts)
+
+
+def _account_sort_key(account, sort_key="created"):
+    key = str(sort_key or "created").strip().lower() or "created"
+    if key == "email":
+        return str(account.get("email") or "").lower()
+    if key == "sso":
+        return str(account.get("sso_preview") or "").lower()
+    if key == "source":
+        return str(account.get("source_file") or "").lower()
+    if key == "index":
+        try:
+            return int(account.get("line_no") or 0)
+        except Exception:
+            return 0
+    if key == "refresh":
+        return "1" if account.get("has_refresh_token") else "0"
+    if key == "password":
+        return "1" if account.get("password") else "0"
+    if key == "health":
+        return str(account.get("health_status_text") or account.get("health_status") or "").lower()
+    if key in {"grok2api", "sub2api", "cpa"}:
+        return str(account.get(f"{key}_status_text") or account.get(f"{key}_status") or "").lower()
+    # created / default
+    return str(account.get("created_at") or "")
+
+
+def query_registered_accounts(
+    *,
+    include_sso=False,
+    q="",
+    filter_name="all",
+    sort_key="created",
+    sort_dir="desc",
+    page=1,
+    page_size=20,
+):
+    """账号列表服务端筛选/排序/分页（7000+ 账号必备）。"""
+    accounts = list_registered_accounts(include_sso=include_sso)
+    query = str(q or "").strip().lower()
+    filtered = []
+    for acc in accounts:
+        if query and query not in _account_search_haystack(acc):
+            continue
+        if not _account_matches_filter(acc, filter_name):
+            continue
+        filtered.append(acc)
+
+    reverse = str(sort_dir or "desc").lower() != "asc"
+    sk = str(sort_key or "created")
+    # 稳定排序：主 key + created_at + line_no
+    try:
+        filtered.sort(
+            key=lambda a: (
+                _account_sort_key(a, sk),
+                str(a.get("created_at") or ""),
+                int(a.get("line_no") or 0),
+            ),
+            reverse=reverse,
+        )
+    except Exception:
+        filtered.sort(key=lambda a: _account_sort_key(a, sk), reverse=reverse)
+
+    try:
+        page = max(1, int(page or 1))
+    except Exception:
+        page = 1
+    try:
+        page_size = max(1, min(200, int(page_size or 20)))
+    except Exception:
+        page_size = 20
+    total = len(filtered)
+    pages = max(1, (total + page_size - 1) // page_size)
+    if page > pages:
+        page = pages
+    start = (page - 1) * page_size
+    items = filtered[start : start + page_size]
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+        "accounts": items,
+        "filter": str(filter_name or "all"),
+        "q": str(q or ""),
+        "sort_key": sk,
+        "sort_dir": "asc" if not reverse else "desc",
+    }
+
+
 def replace_registered_account_refresh_token(account, refresh_token):
     refresh_token = str(refresh_token or "").strip()
     source = str((account or {}).get("source_file") or "").strip()

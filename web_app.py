@@ -2061,11 +2061,54 @@ def evaluate_autopilot(payload: dict = None):
 
 
 @app.get("/api/accounts")
-def list_accounts():
-    accounts = reg.list_registered_accounts(include_sso=False)
-    # 列表页不需要 response/error 大字段，显著减小 JSON
-    compact = [public_account(acc, compact=True) for acc in accounts]
-    return {"total": len(compact), "accounts": compact}
+def list_accounts(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    q: str = Query(""),
+    filter: str = Query("all"),
+    sort_key: str = Query("created"),
+    sort_dir: str = Query("desc"),
+    all: int = Query(0, ge=0, le=1),
+):
+    """账号列表。
+
+    默认服务端分页（7000+ 账号）。
+    all=1 时返回全量（兼容旧前端/导出辅助，仍建议避免）。
+    """
+    if int(all or 0) == 1:
+        accounts = reg.list_registered_accounts(include_sso=False)
+        compact = [public_account(acc, compact=True) for acc in accounts]
+        return {
+            "total": len(compact),
+            "page": 1,
+            "page_size": len(compact) or page_size,
+            "pages": 1,
+            "accounts": compact,
+            "filter": filter or "all",
+            "q": q or "",
+            "sort_key": sort_key or "created",
+            "sort_dir": sort_dir or "desc",
+            "paged": False,
+        }
+
+    result = reg.query_registered_accounts(
+        include_sso=False,
+        q=q,
+        filter_name=filter,
+        sort_key=sort_key,
+        sort_dir=sort_dir,
+        page=page,
+        page_size=page_size,
+    )
+    result["accounts"] = [public_account(acc, compact=True) for acc in (result.get("accounts") or [])]
+    result["paged"] = True
+    return result
+
+
+@app.get("/api/accounts/summary")
+def accounts_summary():
+    """轻量库存摘要（作战室/仪表盘用，不返回账号数组）。"""
+    return {"ok": True, "inventory": _inventory_snapshot_cached()}
 
 
 @app.delete("/api/accounts")

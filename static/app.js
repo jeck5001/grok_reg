@@ -182,6 +182,18 @@ let pollTimer = null;
 /** 防止 setInterval 与 in-flight poll 重叠：同一 offset 被多次 append 导致日志刷屏 */
 let pollInFlight = false;
 let accounts = [];
+/** 服务端分页元信息（7000+ 账号时不再全量拉） */
+let accountsMeta = {
+  total: 0,
+  page: 1,
+  page_size: 20,
+  pages: 1,
+  filter: "all",
+  q: "",
+  sort_key: "created",
+  sort_dir: "desc",
+  paged: true,
+};
 let accountPage = 1;
 let accountSearchQuery = "";
 let accountPushFilterValue = "all";
@@ -197,6 +209,7 @@ let pushingToSub2api = false;
 let pushingToGrok2api = false;
 let pushingToCpa = false;
 let warRoomTimer = null;
+let accountSearchTimer = null;
 let warRoomSnapshot = null;
 
 const FAIL_REASON_LABELS = {
@@ -984,66 +997,20 @@ function setAccountSort(key) {
   }
   saveAccountTablePrefs();
   accountPage = 1;
-  renderAccounts();
+  loadAccounts().catch((error) => setMessage(error.message));
 }
 
+// 服务端已筛选/排序/分页：accounts 即当前页
 function filteredAccounts() {
-  const q = String(accountSearchQuery || "").trim().toLowerCase();
-  const filter = accountPushFilterValue || "all";
-  const list = accounts.filter((account) => {
-    if (q) {
-      const hay = [
-        account.email,
-        account.source_file,
-        account.created_at,
-        account.sso_preview,
-        account.grok2api_status_text,
-        account.sub2api_status_text,
-        account.cpa_status_text,
-        account.health_status_text,
-        accountGrok2apiPushStatus[account.id],
-        accountPushStatus[account.id],
-        accountCpaPushStatus[account.id],
-      ]
-        .map((x) => String(x || "").toLowerCase())
-        .join(" ");
-      if (!hay.includes(q)) return false;
-    }
-    if (filter === "all") return true;
-    if (filter === "any_pushed") {
-      return (
-        accountIsPushed(account, "grok2api") ||
-        accountIsPushed(account, "sub2api") ||
-        accountIsPushed(account, "cpa")
-      );
-    }
-    if (filter === "none_pushed") {
-      return (
-        !accountIsPushed(account, "grok2api") &&
-        !accountIsPushed(account, "sub2api") &&
-        !accountIsPushed(account, "cpa")
-      );
-    }
-    if (filter === "grok2api_pushed") return accountIsPushed(account, "grok2api");
-    if (filter === "sub2api_pushed") return accountIsPushed(account, "sub2api");
-    if (filter === "sub2api_probe_failed") return accountIsSub2apiProbeFailed(account);
-    if (filter === "cpa_pushed") return accountIsPushed(account, "cpa");
-    if (filter === "failed") return accountHasPushFailure(account);
-    return true;
-  });
-  const key = accountSortKey || "created";
-  const dir = accountSortDir === "asc" ? "asc" : "desc";
-  return list.slice().sort((a, b) => compareAccountSort(a, b, key, dir));
+  return accounts.slice();
 }
 
 function accountTotalPages() {
-  return Math.max(1, Math.ceil(filteredAccounts().length / accountTablePrefs.pageSize));
+  return Math.max(1, Number(accountsMeta.pages || 1));
 }
 
 function currentPageAccounts() {
-  const list = filteredAccounts();
-  const start = (accountPage - 1) * accountTablePrefs.pageSize;
-  return list.slice(start, start + accountTablePrefs.pageSize);
+  return accounts.slice();
 }
 
 function clampAccountPage() {
@@ -1051,10 +1018,20 @@ function clampAccountPage() {
 }
 
 function selectedAccountIds() {
-  const visible = new Set(filteredAccounts().map((a) => a.id));
-  return Array.from(selectedAccountIdsSet).filter(
-    (id) => accounts.some((account) => account.id === id) && (visible.has(id) || true)
-  );
+  // 跨页多选：保留已选 id，不要求出现在当前页
+  return Array.from(selectedAccountIdsSet);
+}
+
+function buildAccountsQuery() {
+  const params = new URLSearchParams();
+  params.set("page", String(accountPage || 1));
+  params.set("page_size", String(accountTablePrefs.pageSize || 20));
+  params.set("sort_key", accountSortKey || "created");
+  params.set("sort_dir", accountSortDir === "asc" ? "asc" : "desc");
+  params.set("filter", accountPushFilterValue || "all");
+  const q = String(accountSearchQuery || "").trim();
+  if (q) params.set("q", q);
+  return params.toString();
 }
 
 function renderAccountColumns() {
@@ -1185,35 +1162,31 @@ function isFailedStatus(account, prefix) {
 }
 
 function accountDashboardStats() {
-  const total = accounts.length;
-  const refresh = accounts.filter((account) => account.has_refresh_token).length;
-  const healthy = accounts.filter((account) => account.health_status === "healthy" || account.health_status_text === "可用").length;
-  const unhealthy = accounts.filter((account) => account.health_status === "unhealthy" || account.health_status_text === "失效").length;
-  const incomplete = accounts.filter((account) => account.health_status === "incomplete" || account.health_status_text === "资料不完整").length;
-  const untested = Math.max(0, total - healthy - unhealthy - incomplete);
-  const grok2api = accounts.filter((account) => account.grok2api_status === "pushed" || account.grok2api_status_text === "已推送").length;
-  const sub2api = accounts.filter((account) => account.sub2api_status === "pushed" || account.sub2api_status_text === "已推送").length;
-  const needAction = accounts.filter((account) => {
-    return (
-      !account.has_refresh_token ||
-      account.health_status === "unhealthy" ||
-      account.health_status === "incomplete" ||
-      account.health_status_text === "失效" ||
-      account.health_status_text === "资料不完整" ||
-      isFailedStatus(account, "grok2api") ||
-      isFailedStatus(account, "sub2api")
-    );
-  }).length;
+  // 7000+ 时 accounts 只是当前页；优先用作战室 inventory 全量摘要
+  const inv = (warRoomSnapshot && warRoomSnapshot.inventory) || null;
+  if (inv && typeof inv.total === "number") {
+    return {
+      total: inv.total || 0,
+      refresh: inv.refresh || 0,
+      healthy: inv.healthy || 0,
+      unhealthy: inv.unhealthy || 0,
+      incomplete: inv.incomplete || 0,
+      untested: inv.untested || 0,
+      grok2api: inv.grok2api || 0,
+      sub2api: inv.sub2api || 0,
+      needAction: inv.need_action || 0,
+    };
+  }
   return {
-    total,
-    refresh,
-    healthy,
-    unhealthy,
-    incomplete,
-    untested,
-    grok2api,
-    sub2api,
-    needAction,
+    total: Number(accountsMeta.total || accounts.length || 0),
+    refresh: accounts.filter((a) => a.has_refresh_token).length,
+    healthy: accounts.filter((a) => a.health_status === "healthy" || a.health_status_text === "可用").length,
+    unhealthy: accounts.filter((a) => a.health_status === "unhealthy" || a.health_status_text === "失效").length,
+    incomplete: accounts.filter((a) => a.health_status === "incomplete" || a.health_status_text === "资料不完整").length,
+    untested: 0,
+    grok2api: accounts.filter((a) => a.grok2api_status === "pushed" || a.grok2api_status_text === "已推送").length,
+    sub2api: accounts.filter((a) => a.sub2api_status === "pushed" || a.sub2api_status_text === "已推送").length,
+    needAction: 0,
   };
 }
 
@@ -1910,12 +1883,13 @@ function renderPagination() {
   if (!accountPagination) return;
   accountPagination.innerHTML = "";
   const totalPages = accountTotalPages();
-  const filtered = filteredAccounts();
-  const start = filtered.length ? (accountPage - 1) * accountTablePrefs.pageSize + 1 : 0;
-  const end = Math.min(filtered.length, accountPage * accountTablePrefs.pageSize);
+  const total = Number(accountsMeta.total || 0);
+  const pageSize = Number(accountsMeta.page_size || accountTablePrefs.pageSize || 20);
+  const start = total ? (accountPage - 1) * pageSize + 1 : 0;
+  const end = total ? Math.min(total, (accountPage - 1) * pageSize + accounts.length) : 0;
   const summary = document.createElement("span");
   summary.className = "pagination-summary";
-  summary.textContent = `${start}-${end} / ${filtered.length}`;
+  summary.textContent = `${start}-${end} / ${total}`;
   accountPagination.appendChild(summary);
 
   const prevButton = document.createElement("button");
@@ -1924,8 +1898,9 @@ function renderPagination() {
   prevButton.textContent = "上一页";
   prevButton.disabled = accountPage <= 1;
   prevButton.addEventListener("click", () => {
+    if (accountPage <= 1) return;
     accountPage -= 1;
-    renderAccounts();
+    loadAccounts().catch((error) => setMessage(error.message));
   });
   accountPagination.appendChild(prevButton);
 
@@ -1940,33 +1915,34 @@ function renderPagination() {
   nextButton.textContent = "下一页";
   nextButton.disabled = accountPage >= totalPages;
   nextButton.addEventListener("click", () => {
+    if (accountPage >= totalPages) return;
     accountPage += 1;
-    renderAccounts();
+    loadAccounts().catch((error) => setMessage(error.message));
   });
   accountPagination.appendChild(nextButton);
 }
 
 function renderAccounts() {
   if (!accountsBody) return;
-  selectedAccountIdsSet = new Set(selectedAccountIds());
   clampAccountPage();
   renderAccountsHead();
   renderAccountColumns();
   accountsBody.innerHTML = "";
-  const filtered = filteredAccounts();
+  const total = Number(accountsMeta.total || 0);
+  const pageCount = accounts.length;
   const filterHint =
-    filtered.length !== accounts.length
-      ? `，筛选后 ${filtered.length} 个`
+    (accountSearchQuery || (accountPushFilterValue && accountPushFilterValue !== "all"))
+      ? `，筛选后 ${total} 个`
       : "";
-  accountsSummary.textContent = `共 ${accounts.length} 个账号${filterHint}，已选择 ${selectedAccountIdsSet.size} 个`;
+  accountsSummary.textContent = `共 ${total} 个账号${filterHint}，本页 ${pageCount} 个，已选择 ${selectedAccountIdsSet.size} 个`;
   if (accountPageSize) accountPageSize.value = String(accountTablePrefs.pageSize);
   if (accountSearchInput && accountSearchInput.value !== accountSearchQuery) {
     accountSearchInput.value = accountSearchQuery;
   }
   if (accountPushFilter) accountPushFilter.value = accountPushFilterValue;
-  if (!filtered.length) {
+  if (!pageCount) {
     const row = document.createElement("tr");
-    const emptyText = accounts.length
+    const emptyText = total
       ? "没有匹配的账号，试试清空搜索/筛选"
       : "暂无账号，注册成功后会出现在这里";
     row.innerHTML = `<td colspan="${visibleAccountColumns().length}" class="empty">${emptyText}</td>`;
@@ -1993,7 +1969,7 @@ function renderAccounts() {
         checkbox.addEventListener("change", () => {
           if (checkbox.checked) selectedAccountIdsSet.add(account.id);
           else selectedAccountIdsSet.delete(account.id);
-          accountsSummary.textContent = `共 ${accounts.length} 个账号${filterHint}，已选择 ${selectedAccountIdsSet.size} 个`;
+          accountsSummary.textContent = `共 ${Number(accountsMeta.total || 0)} 个账号${filterHint}，本页 ${accounts.length} 个，已选择 ${selectedAccountIdsSet.size} 个`;
           syncSelectPageAccounts();
         });
         cell.appendChild(checkbox);
@@ -2040,9 +2016,22 @@ function renderAccounts() {
 async function loadAccounts() {
   if (accountsLoadPromise) return accountsLoadPromise;
   accountsLoadPromise = (async () => {
-    const payload = await requestJson("/api/accounts");
+    const qs = buildAccountsQuery();
+    const payload = await requestJson(`/api/accounts?${qs}`);
     accounts = payload.accounts || [];
-    renderDashboard();
+    accountsMeta = {
+      total: Number(payload.total || accounts.length || 0),
+      page: Number(payload.page || accountPage || 1),
+      page_size: Number(payload.page_size || accountTablePrefs.pageSize || 20),
+      pages: Number(payload.pages || 1),
+      filter: payload.filter || accountPushFilterValue || "all",
+      q: payload.q || accountSearchQuery || "",
+      sort_key: payload.sort_key || accountSortKey || "created",
+      sort_dir: payload.sort_dir || accountSortDir || "desc",
+      paged: payload.paged !== false,
+    };
+    accountPage = accountsMeta.page;
+    // 仪表盘数字优先用作战室 inventory；这里只刷新表格
     renderAccounts();
     return accounts;
   })();
@@ -2076,15 +2065,14 @@ async function deleteSelectedAccounts() {
       delete accountGrok2apiPushStatus[id];
       delete accountCpaPushStatus[id];
     });
-    accounts = result.accounts || [];
     setMessage(result.message || `已删除 ${result.deleted || 0} 个账号`);
+    await loadAccounts();
+    loadWarRoom({ silent: true }).catch(() => {});
   } catch (error) {
     setMessage(`删除账号失败：${error.message}`);
   } finally {
     deleteAccountsBtn.disabled = false;
     deleteAccountsBtn.textContent = "删除选中";
-    renderDashboard();
-    renderAccounts();
   }
 }
 
@@ -2925,25 +2913,24 @@ accountPageSize.addEventListener("change", () => {
   accountTablePrefs.pageSize = Number(accountPageSize.value) || DEFAULT_ACCOUNT_TABLE_PREFS.pageSize;
   accountPage = 1;
   saveAccountTablePrefs();
-  renderAccounts();
+  loadAccounts().catch((error) => setMessage(error.message));
 });
 
 if (accountSearchInput) {
-  let searchTimer = null;
   accountSearchInput.addEventListener("input", () => {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => {
+    clearTimeout(accountSearchTimer);
+    accountSearchTimer = setTimeout(() => {
       accountSearchQuery = accountSearchInput.value || "";
       accountPage = 1;
-      renderAccounts();
-    }, 180);
+      loadAccounts().catch((error) => setMessage(error.message));
+    }, 280);
   });
 }
 if (accountPushFilter) {
   accountPushFilter.addEventListener("change", () => {
     accountPushFilterValue = accountPushFilter.value || "all";
     accountPage = 1;
-    renderAccounts();
+    loadAccounts().catch((error) => setMessage(error.message));
   });
 }
 

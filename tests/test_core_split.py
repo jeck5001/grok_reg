@@ -119,3 +119,17 @@ def test_turnstile_lives_in_core_module():
     assert reg.scrape_turnstile_sitekey_text is turnstile.scrape_turnstile_sitekey_text
     assert reg.probe_local_turnstile_solver is turnstile.probe_local_turnstile_solver
     assert reg._proxy_for_turnstile_solver is turnstile._proxy_for_turnstile_solver
+
+
+def test_xai_and_browser_live_in_core_modules():
+    from core.browser import lifecycle as browser
+    from core.xai import protocol as xai
+
+    assert reg.register_via_pure_http is xai.register_via_pure_http
+    assert reg.create_xai_account_via_http is xai.create_xai_account_via_http
+    assert reg.resolve_signup_mode is xai.resolve_signup_mode
+    assert reg.SIGNUP_URL == xai.SIGNUP_URL
+    assert reg.start_browser is browser.start_browser
+    assert reg.create_browser_options is browser.create_browser_options
+    assert reg.fill_profile_and_submit is browser.fill_profile_and_submit
+    assert reg._get_page is browser._get_page

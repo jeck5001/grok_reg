@@ -652,7 +652,7 @@ def test_wait_for_post_code_transition_waits_through_error_page_after_verify(mon
 
 
 def test_fill_code_waits_for_frontend_state_after_otp_input():
-    source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
+    source = Path("core/browser/lifecycle.py").read_text(encoding="utf-8")
 
     assert "验证码已填入，等待前端状态同步" in source
     assert "sleep_with_cancel(0.6, cancel_callback)" in source
@@ -1804,7 +1804,7 @@ def test_fill_profile_waits_for_password_validation_before_submit(monkeypatch):
 
 
 def test_wait_for_sso_cookie_final_page_can_submit_without_visible_turnstile():
-    source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
+    source = Path("core/browser/lifecycle.py").read_text(encoding="utf-8")
     content_script = Path("turnstilePatch/content.js").read_text(encoding="utf-8")
     page_hook = Path("turnstilePatch/pageHook.js").read_text(encoding="utf-8")
     manifest = Path("turnstilePatch/manifest.json").read_text(encoding="utf-8")
@@ -1828,7 +1828,7 @@ def test_wait_for_sso_cookie_final_page_can_submit_without_visible_turnstile():
 
 
 def test_final_page_executes_each_turnstile_widget_only_once():
-    source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
+    source = Path("core/browser/lifecycle.py").read_text(encoding="utf-8")
     page_hook = Path("turnstilePatch/pageHook.js").read_text(encoding="utf-8")
 
     assert "executedWidgetIds" in source
@@ -1837,7 +1837,7 @@ def test_final_page_executes_each_turnstile_widget_only_once():
 
 
 def test_turnstile_hook_records_terminal_challenge_callbacks():
-    source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
+    source = Path("core/browser/lifecycle.py").read_text(encoding="utf-8")
     page_hook = Path("turnstilePatch/pageHook.js").read_text(encoding="utf-8")
 
     assert '"error-callback"' in page_hook
@@ -2216,7 +2216,8 @@ def test_browser_options_apply_configured_proxy(monkeypatch):
 
 
 def test_turnstile_hook_is_deferred_until_profile_form():
-    source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
+    # browser 生命周期已迁至 core/browser/lifecycle.py
+    source = Path("core/browser/lifecycle.py").read_text(encoding="utf-8")
     browser_start = source.index("def start_browser(")
     browser_end = source.index("\ndef stop_browser", browser_start)
     signup_start = source.index("def open_signup_page(")
@@ -2234,9 +2235,8 @@ def test_turnstile_hook_is_deferred_until_profile_form():
 
 def test_turnstile_hook_is_network_safe_and_deferred_from_otp_submit():
     page_hook = Path("turnstilePatch/pageHook.js").read_text(encoding="utf-8")
-    source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
+    source = Path("core/browser/lifecycle.py").read_text(encoding="utf-8")
     otp_start = source.index("def fill_code_and_submit(")
-    # getTurnstileToken 已迁至 core/turnstile；OTP 块以 fill_profile_and_submit 为下界
     otp_end = source.index("def fill_profile_and_submit(", otp_start)
     profile_start = source.index("def fill_profile_and_submit(")
     profile_end = source.index("\ndef wait_for_sso_cookie", profile_start)

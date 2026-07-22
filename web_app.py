@@ -337,7 +337,7 @@ def update_config(payload: dict):
         validated = reg.validate_registration_config(settings)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    reg.config = validated
+    reg.replace_config(validated)
     reg.save_config()
     return mask_config(validated)
 
@@ -482,7 +482,7 @@ def cf_global_deploy_email_worker(payload: dict, request: Request):
             cfg["email_webhook_public_url"] = used_url
             changed = True
         if changed:
-            reg.config = reg.validate_registration_config(cfg)
+            reg.replace_config(reg.validate_registration_config(cfg))
             reg.save_config()
     except Exception:
         pass
@@ -1120,11 +1120,11 @@ def _solver_status_snapshot(settings, force: bool = False):
         try:
             old = dict(reg.config or {})
             try:
-                reg.config = {**old, **dict(settings or {})}
+                reg.replace_config({**old, **dict(settings or {})})
                 # 复用 probe 缓存（默认 30s）；作战室不再 force 打爆 solver
                 reachable = bool(reg.probe_local_turnstile_solver(force=False, timeout=1.5))
             finally:
-                reg.config = old
+                reg.replace_config(old)
             latency_ms = int((time.time() - t0) * 1000)
         except Exception as exc:
             error = str(exc)[:160]
@@ -1708,7 +1708,7 @@ def _apply_autopilot_actions(actions, settings=None):
     if patch:
         merged = {**current, **patch}
         new_settings = reg.validate_registration_config(merged)
-        reg.config = new_settings
+        reg.replace_config(new_settings)
         reg.save_config()
         with _job_lock:
             job_id = _active_job_id
@@ -1880,10 +1880,10 @@ def ops_war_room(
     try:
         old = dict(reg.config or {})
         try:
-            reg.config = {**old, **dict(settings or {})}
+            reg.replace_config({**old, **dict(settings or {})})
             mode = reg.resolve_signup_mode()
         finally:
-            reg.config = old
+            reg.replace_config(old)
     except Exception:
         mode = str(settings.get("signup_mode") or "auto")
 
@@ -1946,7 +1946,7 @@ def apply_ops_preset(preset_id: str):
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    reg.config = validated
+    reg.replace_config(validated)
     reg.save_config()
     return {
         "ok": True,
@@ -2429,7 +2429,7 @@ def start_job(payload: dict):
                     **job.status(),
                 }
             raise HTTPException(status_code=409, detail="已有任务正在运行")
-        reg.config = validated
+        reg.replace_config(validated)
         reg.save_config()
         job = reg.RegistrationJob(validated)
         _jobs[job.id] = job

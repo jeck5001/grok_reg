@@ -1560,7 +1560,9 @@ function stopWarRoomPolling() {
 async function loadWarRoom({ silent = false } = {}) {
   if (warRoomLoadPromise) return warRoomLoadPromise;
   warRoomLoadPromise = (async () => {
-    const data = await requestJson("/api/ops/war-room");
+    // light=1：更短日志 + 库存缓存；silent 轮询用轻量模式
+    const qs = silent ? "?light=1&log_tail=120" : "?light=1&log_tail=160";
+    const data = await requestJson(`/api/ops/war-room${qs}`);
     warRoomSnapshot = data;
     renderWarRoom(data);
     if (!silent && data.job && data.job.job_id && data.job.running) {

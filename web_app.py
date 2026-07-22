@@ -723,11 +723,37 @@ def webhook_email_clear():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-def public_account(account):
+# 账号列表接口不需要这些大字段（探测失败详情、远端原始响应等）
+_ACCOUNT_LIST_DROP_KEYS = (
+    "sso",
+    "refresh_token",
+    "sub2api_response",
+    "grok2api_response",
+    "cpa_response",
+    "health_response",
+    "sub2api_error",
+    "grok2api_error",
+    "cpa_error",
+    "health_error",
+    "sub2api_probe_error",
+)
+
+
+def public_account(account, *, compact=False):
     item = dict(account)
     item.pop("sso", None)
     item.pop("refresh_token", None)
+    if compact:
+        for key in _ACCOUNT_LIST_DROP_KEYS:
+            item.pop(key, None)
     return item
+
+
+# 作战室 inventory 短缓存（账号列表已有 mtime 缓存，这里再缓存摘要结果）
+_inventory_cache = {"signature": None, "status_mtime": None, "payload": None, "at": 0.0}
+_INVENTORY_CACHE_TTL_SEC = 3.0
+_war_room_light_cache = {"payload": None, "at": 0.0, "key": None}
+_WAR_ROOM_LIGHT_TTL_SEC = 2.0
 
 
 def _classify_fail_line(line: str) -> str:
@@ -926,6 +952,36 @@ def _account_inventory_summary(accounts):
         "need_action": need_action,
         "sources": top_sources,
     }
+
+
+def _inventory_snapshot_cached():
+    """作战室用：带短 TTL 的库存摘要，避免每次轮询重算。"""
+    now = time.time()
+    try:
+        data_dir = reg.get_data_dir()
+        signature = reg._accounts_files_signature(data_dir)
+        status_mtime = reg._file_mtime_ns(reg.get_account_status_file())
+    except Exception:
+        signature = None
+        status_mtime = None
+    cached = _inventory_cache
+    if (
+        cached.get("payload") is not None
+        and cached.get("signature") == signature
+        and cached.get("status_mtime") == status_mtime
+        and now - float(cached.get("at") or 0) < _INVENTORY_CACHE_TTL_SEC
+    ):
+        return dict(cached["payload"])
+    try:
+        accounts = reg.list_registered_accounts(include_sso=False)
+    except Exception:
+        accounts = []
+    payload = _account_inventory_summary(accounts)
+    _inventory_cache["signature"] = signature
+    _inventory_cache["status_mtime"] = status_mtime
+    _inventory_cache["payload"] = payload
+    _inventory_cache["at"] = now
+    return dict(payload)
 
 
 def _current_job_payload():
@@ -1672,24 +1728,55 @@ def _apply_autopilot_actions(actions, settings=None):
 
 
 @app.get("/api/ops/war-room")
-def ops_war_room(log_tail: int = Query(200, ge=20, le=800)):
+def ops_war_room(
+    log_tail: int = Query(120, ge=20, le=800),
+    light: int = Query(1, ge=0, le=1),
+):
+    """作战室快照。
+
+    light=1（默认）：更短日志尾、库存摘要缓存、无任务时整体短缓存。
+    light=0：完整 tail，强制刷新库存。
+    """
     settings = reg.load_config()
     job = _current_job_payload()
     job_id = str(job.get("job_id") or "").strip()
+    running = bool(job.get("running") or job.get("status") in _ACTIVE_JOB_STATUSES)
+    light_mode = bool(int(light or 0))
+    effective_tail = int(log_tail)
+    if light_mode and effective_tail > 160:
+        effective_tail = 160
+
+    # 无活跃任务时，作战室数据变化慢，做 2s 整包缓存
+    cache_key = f"{job_id}|{job.get('status')}|{job.get('success_count')}|{job.get('fail_count')}|{effective_tail}|{int(light_mode)}"
+    now = time.time()
+    if (
+        light_mode
+        and not running
+        and _war_room_light_cache.get("payload") is not None
+        and _war_room_light_cache.get("key") == cache_key
+        and now - float(_war_room_light_cache.get("at") or 0) < _WAR_ROOM_LIGHT_TTL_SEC
+    ):
+        cached = dict(_war_room_light_cache["payload"])
+        cached["cached"] = True
+        return cached
+
     log_lines = []
     if job_id:
         try:
             # 只读尾部，避免大日志整文件读入
-            log_lines = reg.read_job_log_lines(job_id, offset=0, tail=int(log_tail)) or []
+            log_lines = reg.read_job_log_lines(job_id, offset=0, tail=effective_tail) or []
         except Exception:
             log_lines = []
     signals = _parse_job_log_signals(log_lines)
-    try:
-        # list_registered_accounts 有短缓存；作战室只需要库存摘要
-        accounts = reg.list_registered_accounts(include_sso=False)
-    except Exception:
-        accounts = []
-    inventory = _account_inventory_summary(accounts)
+    # 作战室只需要库存摘要，不必每次拿完整账号数组
+    if light_mode:
+        inventory = _inventory_snapshot_cached()
+    else:
+        try:
+            accounts = reg.list_registered_accounts(include_sso=False)
+        except Exception:
+            accounts = []
+        inventory = _account_inventory_summary(accounts)
     domains = _mail_domain_snapshot(settings)
     solver = _solver_status_snapshot(settings)
     throughput = _throughput_estimate(job, signals)
@@ -1800,7 +1887,7 @@ def ops_war_room(log_tail: int = Query(200, ge=20, le=800)):
     except Exception:
         mode = str(settings.get("signup_mode") or "auto")
 
-    return {
+    payload = {
         "ok": True,
         "generated_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
         "job": job,
@@ -1809,7 +1896,7 @@ def ops_war_room(log_tail: int = Query(200, ge=20, le=800)):
         "failures": signals,
         "charts": (signals or {}).get("charts")
         or {"timeline": [], "fail_stack": [], "reason_keys": [], "event_count": 0},
-        "recent_logs": log_lines[-40:],
+        "recent_logs": log_lines[-30:] if light_mode else log_lines[-40:],
         "domains": domains,
         "solver": solver,
         "inventory": inventory,
@@ -1836,7 +1923,14 @@ def ops_war_room(log_tail: int = Query(200, ge=20, le=800)):
             ),
             "mail_domain_fail_threshold": settings.get("mail_domain_fail_threshold"),
         },
+        "cached": False,
+        "light": light_mode,
     }
+    if light_mode and not running:
+        _war_room_light_cache["payload"] = payload
+        _war_room_light_cache["at"] = time.time()
+        _war_room_light_cache["key"] = cache_key
+    return payload
 
 
 @app.get("/api/ops/presets")
@@ -1969,7 +2063,9 @@ def evaluate_autopilot(payload: dict = None):
 @app.get("/api/accounts")
 def list_accounts():
     accounts = reg.list_registered_accounts(include_sso=False)
-    return {"total": len(accounts), "accounts": accounts}
+    # 列表页不需要 response/error 大字段，显著减小 JSON
+    compact = [public_account(acc, compact=True) for acc in accounts]
+    return {"total": len(compact), "accounts": compact}
 
 
 @app.delete("/api/accounts")

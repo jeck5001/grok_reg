@@ -1371,17 +1371,85 @@ def parse_registered_account_line(
     return account
 
 
+# account_status.json / accounts_*.txt 列表缓存（减少作战室与账号页重复全盘扫描）
+_account_status_cache = {"path": "", "mtime": None, "data": None, "by_email": None}
+_account_list_cache = {
+    "dir": "",
+    "signature": None,
+    "with_sso": None,
+    "without_sso": None,
+    "status_mtime": None,
+}
+_account_list_cache_lock = threading.Lock()
+
+
+def _file_mtime_ns(path):
+    try:
+        return os.stat(path).st_mtime_ns
+    except Exception:
+        return None
+
+
+def invalidate_account_list_cache():
+    """账号文件或状态变更后清列表缓存。"""
+    with _account_list_cache_lock:
+        _account_list_cache["signature"] = None
+        _account_list_cache["with_sso"] = None
+        _account_list_cache["without_sso"] = None
+        _account_list_cache["status_mtime"] = None
+    _account_status_cache["mtime"] = None
+    _account_status_cache["data"] = None
+    _account_status_cache["by_email"] = None
+
+
 def load_account_statuses():
     path = get_account_status_file()
+    mtime = _file_mtime_ns(path)
+    if (
+        _account_status_cache.get("path") == path
+        and _account_status_cache.get("mtime") == mtime
+        and isinstance(_account_status_cache.get("data"), dict)
+        and mtime is not None
+    ):
+        return _account_status_cache["data"]
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        return {}
+        data = {}
     if not isinstance(data, dict):
-        return {}
+        data = {}
     accounts = data.get("accounts") if isinstance(data.get("accounts"), dict) else data
-    return accounts if isinstance(accounts, dict) else {}
+    if not isinstance(accounts, dict):
+        accounts = {}
+    by_email = {}
+    for rec in accounts.values():
+        if not isinstance(rec, dict):
+            continue
+        email_key = str(rec.get("email") or "").strip().lower()
+        if email_key and email_key not in by_email:
+            by_email[email_key] = rec
+    _account_status_cache["path"] = path
+    _account_status_cache["mtime"] = mtime
+    _account_status_cache["data"] = accounts
+    _account_status_cache["by_email"] = by_email
+    return accounts
+
+
+def _account_status_by_email_index(statuses=None):
+    """email -> status record 索引（与 load_account_statuses 缓存同步）。"""
+    if statuses is None:
+        load_account_statuses()
+        return _account_status_cache.get("by_email") or {}
+    by_email = {}
+    if isinstance(statuses, dict):
+        for rec in statuses.values():
+            if not isinstance(rec, dict):
+                continue
+            email_key = str(rec.get("email") or "").strip().lower()
+            if email_key and email_key not in by_email:
+                by_email[email_key] = rec
+    return by_email
 
 
 def save_account_statuses(statuses):
@@ -1394,6 +1462,7 @@ def save_account_statuses(statuses):
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
     os.replace(tmp_path, path)
+    invalidate_account_list_cache()
 
 
 def update_account_status_records(mutator):
@@ -1402,6 +1471,7 @@ def update_account_status_records(mutator):
         statuses = load_account_statuses()
         if not isinstance(statuses, dict):
             statuses = {}
+        statuses = dict(statuses)
         mutator(statuses)
         save_account_statuses(statuses)
         return statuses
@@ -1484,22 +1554,19 @@ def is_xai_refresh_token_client_error(exc):
     return str(status_code) == "400" or "http 400" in text or "http error 400" in text or is_refresh_token_revoked_error(text)
 
 
-def attach_account_status(account, statuses=None):
+def attach_account_status(account, statuses=None, by_email=None):
     if not isinstance(account, dict):
         return account
     statuses = load_account_statuses() if statuses is None else statuses
     account_id = str(account.get("id") or "").strip()
     record = statuses.get(account_id, {}) if account_id else {}
     # 兼容：id 对不上时按 email 回退匹配（自动注册时 line_no 偶发漂移）
+    # 使用 email 索引，避免对每个账号 O(n) 扫 statuses
     if not isinstance(record, dict) or not record:
         email_key = str(account.get("email") or "").strip().lower()
         if email_key:
-            for rec in statuses.values():
-                if not isinstance(rec, dict):
-                    continue
-                if str(rec.get("email") or "").strip().lower() == email_key:
-                    record = rec
-                    break
+            index = by_email if isinstance(by_email, dict) else _account_status_by_email_index(statuses)
+            record = index.get(email_key) or {}
     if not isinstance(record, dict):
         record = {}
     # 优先用账号级 created_at（注册成功时写入）；否则保留文件名/mtime 批次时间
@@ -1555,9 +1622,45 @@ def attach_account_status(account, statuses=None):
     return account
 
 
+def _accounts_files_signature(data_dir):
+    """accounts_*.txt 的 (name, mtime_ns, size) 签名，用于列表缓存失效。"""
+    items = []
+    try:
+        names = os.listdir(data_dir)
+    except Exception:
+        return tuple()
+    for name in names:
+        if not (name.startswith("accounts_") and name.endswith(".txt")):
+            continue
+        path = os.path.join(data_dir, name)
+        try:
+            st = os.stat(path)
+            items.append((name, st.st_mtime_ns, st.st_size))
+        except Exception:
+            continue
+    items.sort()
+    return tuple(items)
+
+
 def list_registered_accounts(include_sso=True):
     data_dir = get_data_dir()
+    status_path = get_account_status_file()
+    status_mtime = _file_mtime_ns(status_path)
+    signature = _accounts_files_signature(data_dir)
+    cache_key = "with_sso" if include_sso else "without_sso"
+
+    with _account_list_cache_lock:
+        if (
+            _account_list_cache.get("dir") == data_dir
+            and _account_list_cache.get("signature") == signature
+            and _account_list_cache.get("status_mtime") == status_mtime
+            and _account_list_cache.get(cache_key) is not None
+        ):
+            # 返回浅拷贝，避免调用方原地改缓存
+            return [dict(a) for a in _account_list_cache[cache_key]]
+
     statuses = load_account_statuses()
+    by_email = _account_status_by_email_index(statuses)
     accounts = []
     for name in sorted(os.listdir(data_dir), reverse=True):
         if not (name.startswith("accounts_") and name.endswith(".txt")):
@@ -1577,11 +1680,20 @@ def list_registered_accounts(include_sso=True):
                         created_at=created_at,
                     )
                     if account:
-                        attach_account_status(account, statuses)
+                        attach_account_status(account, statuses, by_email=by_email)
                         accounts.append(account)
         except Exception:
             continue
-    return accounts
+
+    with _account_list_cache_lock:
+        _account_list_cache["dir"] = data_dir
+        _account_list_cache["signature"] = signature
+        _account_list_cache["status_mtime"] = status_mtime
+        _account_list_cache[cache_key] = accounts
+        # 另一种 include_sso 视图过期
+        other = "without_sso" if include_sso else "with_sso"
+        _account_list_cache[other] = None
+        return [dict(a) for a in accounts]
 
 
 def replace_registered_account_refresh_token(account, refresh_token):
@@ -1605,6 +1717,7 @@ def replace_registered_account_refresh_token(account, refresh_token):
             newline = "\n" if lines[line_no - 1].endswith("\n") else ""
             lines[line_no - 1] = f"{parts[0]}----{parts[1]}----{parts[2]}----{refresh_token}{newline}"
             _write_registered_account_lines(path, lines)
+        invalidate_account_list_cache()
         account["refresh_token"] = refresh_token
         account["refresh_token_preview"] = _mask_token(refresh_token)
         account["has_refresh_token"] = True
@@ -2006,6 +2119,9 @@ def delete_registered_accounts(account_ids):
 
         if deleted_ids:
             save_account_statuses(statuses)
+        else:
+            # 可能只改了行号映射但未删净时也清缓存
+            invalidate_account_list_cache()
 
     return {"deleted": len(deleted_ids), "missing": len(wanted - deleted_ids)}
 
@@ -6648,16 +6764,53 @@ def save_job_snapshot(job_id, snapshot):
         pass
 
 
-def read_job_log_lines(job_id, offset=0):
+def read_job_log_lines(job_id, offset=0, tail=None):
+    """读任务日志。
+
+    - offset: 从第几行开始（0-based）
+    - tail: 若给定且 offset==0，只返回最后 tail 行（作战室用，避免整文件读入）
+    """
     path = _job_log_path(job_id)
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            lines = [line.rstrip("\n") for line in handle]
-    except Exception:
-        return []
     if offset < 0:
         offset = 0
-    return lines[offset:]
+    try:
+        # 只取尾部：从文件末尾倒读，省内存/IO
+        if tail is not None and offset == 0:
+            try:
+                n = max(1, int(tail))
+            except Exception:
+                n = 200
+            # 粗估每行 200 字节，多读一点再截
+            read_bytes = min(8 * 1024 * 1024, max(64 * 1024, n * 240))
+            with open(path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                start = max(0, size - read_bytes)
+                handle.seek(start)
+                chunk = handle.read()
+            text = chunk.decode("utf-8", errors="replace")
+            if start > 0:
+                # 丢掉可能被截断的首行
+                nl = text.find("\n")
+                if nl >= 0:
+                    text = text[nl + 1 :]
+            lines = [ln.rstrip("\n") for ln in text.splitlines()]
+            if len(lines) > n:
+                lines = lines[-n:]
+            return lines
+
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            if offset == 0:
+                lines = [line.rstrip("\n") for line in handle]
+            else:
+                lines = []
+                for idx, line in enumerate(handle):
+                    if idx < offset:
+                        continue
+                    lines.append(line.rstrip("\n"))
+            return lines
+    except Exception:
+        return []
 
 
 def append_job_log_line(job_id, line):
@@ -6667,6 +6820,7 @@ def append_job_log_line(job_id, line):
             handle.write(str(line).rstrip("\n") + "\n")
     except Exception:
         pass
+    # 新日志不直接影响账号列表；无需 invalidate_account_list_cache
 
 
 class RegistrationJob:
@@ -7071,6 +7225,7 @@ class RegistrationJob:
                 with _registered_accounts_lock:
                     with open(out_path, "a", encoding="utf-8") as f:
                         f.write(line)
+                invalidate_account_list_cache()
             except Exception as file_exc:
                 logf(f"[Debug] 保存账号文件失败: {file_exc}")
         try:

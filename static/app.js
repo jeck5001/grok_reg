@@ -1539,12 +1539,16 @@ async function runAutopilotOnce() {
 
 function startWarRoomPolling() {
   if (warRoomTimer) clearInterval(warRoomTimer);
-  // 看板指标不需要 2–3s 刷新；Solver 健康检查另有服务端缓存。
+  // 看板指标不需要高频刷新；Solver 健康检查另有服务端缓存。
   // 任务进度仍由 job polling（~1.2s）负责。
   warRoomTimer = setInterval(() => {
     loadWarRoom({ silent: true }).catch(() => {});
-  }, 10000);
+  }, 15000);
 }
+
+// 避免切 tab / 初始化时 accounts + war-room 同时打满磁盘
+let accountsLoadPromise = null;
+let warRoomLoadPromise = null;
 
 function stopWarRoomPolling() {
   if (warRoomTimer) {
@@ -1554,13 +1558,21 @@ function stopWarRoomPolling() {
 }
 
 async function loadWarRoom({ silent = false } = {}) {
-  const data = await requestJson("/api/ops/war-room");
-  warRoomSnapshot = data;
-  renderWarRoom(data);
-  if (!silent && data.job && data.job.job_id && data.job.running) {
-    rememberJobId(data.job.job_id);
+  if (warRoomLoadPromise) return warRoomLoadPromise;
+  warRoomLoadPromise = (async () => {
+    const data = await requestJson("/api/ops/war-room");
+    warRoomSnapshot = data;
+    renderWarRoom(data);
+    if (!silent && data.job && data.job.job_id && data.job.running) {
+      rememberJobId(data.job.job_id);
+    }
+    return data;
+  })();
+  try {
+    return await warRoomLoadPromise;
+  } finally {
+    warRoomLoadPromise = null;
   }
-  return data;
 }
 
 function renderWarRoom(data) {
@@ -2024,10 +2036,19 @@ function renderAccounts() {
 }
 
 async function loadAccounts() {
-  const payload = await requestJson("/api/accounts");
-  accounts = payload.accounts || [];
-  renderDashboard();
-  renderAccounts();
+  if (accountsLoadPromise) return accountsLoadPromise;
+  accountsLoadPromise = (async () => {
+    const payload = await requestJson("/api/accounts");
+    accounts = payload.accounts || [];
+    renderDashboard();
+    renderAccounts();
+    return accounts;
+  })();
+  try {
+    return await accountsLoadPromise;
+  } finally {
+    accountsLoadPromise = null;
+  }
 }
 
 async function deleteSelectedAccounts() {
@@ -3036,7 +3057,11 @@ if (logoutBtn) {
 
 loadConfig().catch((error) => setMessage(error.message));
 loadPresets().catch(() => {});
-loadAccounts().catch((error) => setMessage(error.message));
-startWarRoomPolling();
-loadWarRoom({ silent: true }).catch(() => {});
+// 先账号后作战室，避免双接口同时全盘扫 accounts
+loadAccounts()
+  .catch((error) => setMessage(error.message))
+  .finally(() => {
+    startWarRoomPolling();
+    loadWarRoom({ silent: true }).catch(() => {});
+  });
 restoreCurrentJob().catch((error) => setMessage(error.message));

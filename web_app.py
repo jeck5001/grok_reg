@@ -1679,12 +1679,13 @@ def ops_war_room(log_tail: int = Query(200, ge=20, le=800)):
     log_lines = []
     if job_id:
         try:
-            all_lines = reg.read_job_log_lines(job_id, offset=0) or []
-            log_lines = all_lines[-int(log_tail) :]
+            # 只读尾部，避免大日志整文件读入
+            log_lines = reg.read_job_log_lines(job_id, offset=0, tail=int(log_tail)) or []
         except Exception:
             log_lines = []
     signals = _parse_job_log_signals(log_lines)
     try:
+        # list_registered_accounts 有短缓存；作战室只需要库存摘要
         accounts = reg.list_registered_accounts(include_sso=False)
     except Exception:
         accounts = []
@@ -1932,7 +1933,7 @@ def evaluate_autopilot(payload: dict = None):
     log_lines = []
     if job_id:
         try:
-            log_lines = (reg.read_job_log_lines(job_id, offset=0) or [])[-400:]
+            log_lines = reg.read_job_log_lines(job_id, offset=0, tail=400) or []
         except Exception:
             log_lines = []
     signals = _parse_job_log_signals(log_lines)

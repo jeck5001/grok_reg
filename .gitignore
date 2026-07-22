@@ -3,11 +3,29 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
 
+# Runtime / secrets (never commit)
 accounts_*.txt
 mail_credentials.txt
-
 config.json
 config.local.json
-
 *.log
+jobs/
+local_data/
+rejected_email_domains.json
+oauth_debug_*.html
+oauth_debug_*.png
+cpa_auths/
+data/
+
+# Local tooling / IDE agent state
+.omo/
+.workbuddy/
+.claude/
+.codegraph
+
+# OS / editor
+.DS_Store
+*.swp
+*~

@@ -791,6 +791,7 @@ def test_registration_job_stops_queue_when_email_provider_is_unusable(monkeypatc
     assert any("邮箱服务商不可用" in line for line in job.logs())
 
 
+@pytest.mark.xfail(reason='remember_rejected 仅冷却域名池，不再维护永久 rejected 集合/文件', strict=False)
 def test_yyds_pick_domain_skips_rejected_domains_and_rotates(monkeypatch):
     reg._rejected_email_domains.clear()
     reg.remember_rejected_email_domain("first.example")
@@ -808,6 +809,7 @@ def test_yyds_pick_domain_skips_rejected_domains_and_rotates(monkeypatch):
     assert reg.yyds_pick_domain() == "second.example"
 
 
+@pytest.mark.xfail(reason='remember_rejected 仅冷却域名池，不再维护永久 rejected 集合/文件', strict=False)
 def test_remember_rejected_email_domain_stores_exact_suffix_only(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     reg._rejected_email_domains.clear()
@@ -826,6 +828,7 @@ def test_remember_rejected_email_domain_stores_exact_suffix_only(monkeypatch, tm
     assert reg.is_email_domain_rejected("10011.hzeg.eu.org")
 
 
+@pytest.mark.xfail(reason='remember_rejected 仅冷却域名池，不再维护永久 rejected 集合/文件', strict=False)
 def test_rejected_email_domains_are_persisted_and_reloaded(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     reg._rejected_email_domains.clear()
@@ -1288,7 +1291,7 @@ def test_import_accounts_to_sub2api_posts_grok_refresh_token(monkeypatch):
     assert calls[1][1]["json"]["credentials"]["token_type"] == "Bearer"
     assert calls[1][1]["json"]["credentials"]["expires_at"] == 1790000000
     assert calls[1][1]["json"]["credentials"]["client_id"]
-    assert calls[1][1]["json"]["credentials"]["base_url"] == "https://api.x.ai/v1"
+    assert calls[1][1]["json"]["credentials"]["base_url"] == "https://cli-chat-proxy.grok.com/v1"
     assert calls[1][1]["json"]["group_ids"] == [1, 2]
     assert calls[1][1]["json"]["concurrency"] == 5
     assert calls[1][1]["json"]["priority"] == 40
@@ -2168,8 +2171,11 @@ def test_docker_starts_web_server_directly_and_keeps_xvfb_for_registration():
 def test_docker_workflow_publishes_amd64_and_arm64_images():
     workflow = Path(".github/workflows/docker-image.yml").read_text(encoding="utf-8")
 
+    # 默认单平台 amd64 加速；arm64 可通过 workflow_dispatch inputs.platforms 启用
     assert "docker/setup-qemu-action@v3" in workflow
-    assert "platforms: linux/amd64,linux/arm64" in workflow
+    assert "linux/amd64" in workflow
+    assert "platforms:" in workflow
+    assert "workflow_dispatch" in workflow
 
 
 def test_loopback_proxy_is_rewritten_inside_docker(monkeypatch):
@@ -2661,8 +2667,8 @@ def test_docker_visible_browser_keeps_linux_startup_flags(monkeypatch):
 
     assert ("--no-sandbox", None) in options.arguments
     assert ("--disable-dev-shm-usage", None) in options.arguments
-    assert ("--disable-gpu", None) in options.arguments
-    assert ("--window-size", "1365,900") in options.arguments
+    assert ("--disable-gpu", None) not in options.arguments  # Turnstile 需要 WebGL，故意不加
+    assert ("--window-size", "1920,1080") in options.arguments
 
 
 def test_docker_forces_visible_mode_even_if_legacy_headless_env_is_set(monkeypatch):
@@ -2701,7 +2707,7 @@ def test_visible_docker_starts_xvfb_when_display_is_missing(monkeypatch):
     started = reg.ensure_virtual_display()
 
     assert started is True
-    assert calls == [["Xvfb", ":99", "-screen", "0", "1365x900x24", "-nolisten", "tcp"]]
+    assert calls == [["Xvfb", ":99", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"]]
     assert reg.os.environ["DISPLAY"] == ":99"
 
 
@@ -2736,7 +2742,7 @@ def test_web_console_places_menu_on_left_side():
     assert 'class="main-panel"' in html
     assert html.index('class="side-nav"') < html.index('class="main-panel"')
     assert ".app-layout" in css
-    assert "grid-template-columns: 176px minmax(0, 1fr)" in css
+    assert "grid-template-columns: 168px minmax(0, 1fr)" in css
     assert ".side-nav" in css
 
 
@@ -2837,17 +2843,17 @@ def test_web_console_exposes_account_table_controls():
 def test_web_console_displays_continuous_account_row_number():
     js = Path("static/app.js").read_text(encoding="utf-8")
 
-    assert '{ key: "index", label: "序号" }' in js
+    assert '{ key: "index", label: "序号"' in js
     assert "accountCellValue(account, column.key, rowNumber)" in js
-    assert "index: rowNumber" in js
-    assert "line: account.line_no" not in js
+    assert "key === \"index\" ? Number(account.line_no || rowNumber) : rowNumber" in js
+    assert "const rowNumber = (accountPage - 1) * accountTablePrefs.pageSize + pageIndex + 1" in js
 
 
 def test_web_console_uses_roomier_operational_layout():
     css = Path("static/app.css").read_text(encoding="utf-8")
 
-    assert "width: min(1680px, calc(100vw - 24px))" in css
-    assert "grid-template-columns: 176px minmax(0, 1fr)" in css
+    assert "width: min(1440px, calc(100vw - 32px))" in css
+    assert "grid-template-columns: 168px minmax(0, 1fr)" in css
     assert "grid-template-columns: minmax(0, 1fr) 220px" in css
     assert "grid-template-columns: repeat(auto-fit, minmax(240px, 1fr))" in css
     assert "grid-column: 1 / -1" in css

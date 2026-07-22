@@ -271,10 +271,14 @@ def test_import_selected_accounts_persists_sub2api_status(monkeypatch, tmp_path)
     )
 
     assert response.status_code == 200
-    refreshed = client.get("/api/accounts").json()["accounts"][0]
-    assert refreshed["sub2api_status"] == "pushed"
-    assert refreshed["sub2api_status_text"] == "已推送"
-    assert refreshed["sub2api_response"]["id"] == 101
+    # 列表接口 compact 会丢掉 response/error 大字段；状态与详情以导入接口返回为准
+    body_acc = response.json()["accounts"][0]
+    assert body_acc["sub2api_status"] == "pushed"
+    assert body_acc["sub2api_status_text"] == "已推送"
+    assert body_acc["sub2api_response"]["id"] == 101
+    listed = client.get("/api/accounts").json()["accounts"][0]
+    assert listed["sub2api_status"] == "pushed"
+    assert listed["sub2api_status_text"] == "已推送"
 
 
 def test_import_selected_accounts_persists_sub2api_failure_status(monkeypatch, tmp_path):
@@ -316,10 +320,12 @@ def test_import_selected_accounts_persists_sub2api_failure_status(monkeypatch, t
 
     assert response.status_code == 200
     assert response.json()["status"] == "partial_failed"
-    refreshed = client.get("/api/accounts").json()["accounts"][0]
-    assert refreshed["sub2api_status"] == "failed"
-    assert refreshed["sub2api_status_text"].startswith("失败")
-    assert "refresh-token HTTP 502" in refreshed["sub2api_error"]
+    body_acc = response.json()["accounts"][0]
+    assert body_acc["sub2api_status"] == "failed"
+    assert body_acc["sub2api_status_text"].startswith("失败")
+    assert "refresh-token HTTP 502" in body_acc["sub2api_error"]
+    listed = client.get("/api/accounts").json()["accounts"][0]
+    assert listed["sub2api_status"] == "failed"
 
 
 def test_import_selected_accounts_to_cpa_uses_only_selected_accounts_and_persists_status(monkeypatch, tmp_path):
@@ -367,11 +373,15 @@ def test_import_selected_accounts_to_cpa_uses_only_selected_accounts_and_persist
     assert [account["email"] for account in calls[0][0]] == ["second@example.com"]
     assert calls[0][1]["cpa_management_key"] == "management-secret"
     assert "sso" not in response.json()["accounts"][0]
+    # 详情以导入接口返回为准（列表 compact 会丢掉 cpa_response）
+    body_accounts = response.json()["accounts"]
+    second_body = next(account for account in body_accounts if account["id"] == selected["id"])
+    assert second_body["cpa_status"] == "pushed"
+    assert second_body["cpa_response"]["upload_status"] == 201
     refreshed = client.get("/api/accounts").json()["accounts"]
     second = next(account for account in refreshed if account["id"] == selected["id"])
     first = next(account for account in refreshed if account["id"] != selected["id"])
     assert second["cpa_status"] == "pushed"
-    assert second["cpa_response"]["upload_status"] == 201
     assert first["cpa_status"] == "not_pushed"
 
 

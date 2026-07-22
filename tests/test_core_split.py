@@ -93,3 +93,18 @@ def test_accounts_store_lives_in_core_module():
     assert reg.persist_sub2api_push_status is accounts.persist_sub2api_push_status
     assert reg._registered_accounts_lock is accounts._registered_accounts_lock
     assert reg._account_id is accounts._account_id
+
+
+def test_email_and_http_live_in_core_modules():
+    from core.cancel import sleep_with_cancel
+    from core.email import providers as email
+    from core.http_client import get_proxies, http_get
+
+    assert reg.get_email_and_token is email.get_email_and_token
+    assert reg.get_oai_code is email.get_oai_code
+    assert reg.compose_mail_address is email.compose_mail_address
+    assert reg.remember_rejected_email_domain is email.remember_rejected_email_domain
+    assert reg._rejected_email_domains is email._rejected_email_domains
+    assert reg.http_get is http_get
+    assert reg.get_proxies is get_proxies
+    assert reg.sleep_with_cancel is sleep_with_cancel

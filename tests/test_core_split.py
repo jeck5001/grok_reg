@@ -81,3 +81,15 @@ def test_config_lives_in_core_module():
     assert reg.save_config is cfg.save_config
     assert reg.replace_config is cfg.replace_config
     assert reg.validate_registration_config is cfg.validate_registration_config
+
+
+def test_accounts_store_lives_in_core_module():
+    from core.accounts import store as accounts
+
+    assert reg.list_registered_accounts is accounts.list_registered_accounts
+    assert reg.query_registered_accounts is accounts.query_registered_accounts
+    assert reg.delete_registered_accounts is accounts.delete_registered_accounts
+    assert reg.parse_registered_account_line is accounts.parse_registered_account_line
+    assert reg.persist_sub2api_push_status is accounts.persist_sub2api_push_status
+    assert reg._registered_accounts_lock is accounts._registered_accounts_lock
+    assert reg._account_id is accounts._account_id

@@ -1105,13 +1105,23 @@ def obtain_sso_via_create_session(
                 # CreateSession 的 JWT 只是 accounts 会话；要走 OAuth Device Flow / consent，
                 # 还需要 CreateCookieSetterLink 把 sso 种到 auth.x.ai / grokusercontent 等域。
                 try:
-                    promote_sso_session_cookies(
+                    promo = promote_sso_session_cookies(
                         sso,
                         session=session,
                         proxies=proxies,
                         log_callback=log_callback,
                         cancel_callback=cancel_callback,
                     )
+                    # 在同一 session 上尽量立刻换 RT，避免 Device Flow 另开空 jar
+                    if isinstance(promo, dict) and promo.get("ok"):
+                        try:
+                            from core.push.integrations import (
+                                exchange_sso_to_refresh_token_via_device_flow,
+                            )
+                            # stash promo cookies on a module attribute for fetch path
+                            promote_sso_session_cookies._last_promo = promo
+                        except Exception:
+                            pass
                 except Exception as exc:
                     if log_callback:
                         log_callback(f"[Debug] CookieSetter 推广会话失败（仍返回 sso）: {exc}")
@@ -1231,6 +1241,33 @@ def create_cookie_setter_link(
                 pass
 
 
+def _export_session_cookie_list(session):
+    """导出 curl_cffi/requests cookie jar 为 [{name,value,domain,path}, ...]。"""
+    out = []
+    if not session:
+        return out
+    try:
+        jar = session.cookies
+        if hasattr(jar, "jar"):
+            for c in jar.jar:
+                out.append(
+                    {
+                        "name": getattr(c, "name", "") or "",
+                        "value": getattr(c, "value", "") or "",
+                        "domain": getattr(c, "domain", "") or ".x.ai",
+                        "path": getattr(c, "path", "/") or "/",
+                    }
+                )
+        elif hasattr(jar, "items"):
+            for name, value in jar.items():
+                out.append(
+                    {"name": name, "value": value, "domain": ".x.ai", "path": "/"}
+                )
+    except Exception:
+        pass
+    return [c for c in out if c.get("name") and c.get("value") is not None]
+
+
 def promote_sso_session_cookies(
     sso,
     *,
@@ -1242,12 +1279,13 @@ def promote_sso_session_cookies(
 ):
     """CreateSession 后把 session JWT 推广到 OAuth 相关域（CreateCookieSetterLink + 跳转）。
 
-    Device Flow / 浏览器 OAuth 的 Access denied 常见原因：只种了 accounts 会话，
-    auth.x.ai 上没有完整 sso 链路。
+    返回 dict: {ok, cookie_setter_url, cookies, final_url}
+    Device Flow 应复用 cookies，不要另开空 session 只塞 JWT。
     """
     sso = str(sso or "").strip()
+    empty = {"ok": False, "cookie_setter_url": "", "cookies": [], "final_url": ""}
     if not sso or requests is None:
-        return False
+        return empty
     proxies = proxies if proxies is not None else get_proxies()
     own = session is None
     if own:
@@ -1270,61 +1308,50 @@ def promote_sso_session_cookies(
         )
         setter = str(csl.get("cookie_setter_url") or "").strip()
         if not setter:
-            return False
-        # 跟随 set-cookie 跳转链，把 cookie 落到 auth.x.ai / grokusercontent
-        current = setter
-        for hop in range(8):
-            raise_if_cancelled(cancel_callback)
-            try:
-                resp = session.get(
-                    current,
-                    headers={
-                        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "user-agent": get_user_agent(),
-                        "upgrade-insecure-requests": "1",
-                    },
-                    allow_redirects=False,
-                    timeout=30,
-                )
-            except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] CookieSetter hop 失败: {exc}")
-                break
-            # 吸收 set-cookie
-            try:
-                if hasattr(resp.headers, "get_list"):
-                    for sc in resp.headers.get_list("set-cookie") or []:
-                        # best-effort: cookie jar already updated by curl_cffi on redirects;
-                        # for non-redirect still ok
-                        pass
-            except Exception:
-                pass
+            return {
+                "ok": False,
+                "cookie_setter_url": "",
+                "cookies": _export_session_cookie_list(session),
+                "final_url": "",
+            }
+        # 关键：必须 allow_redirects=True，让 jar 真正吸收各 hop 的 Set-Cookie
+        # （手动 302 链容易只拿到终页 HTML，auth 域 cookie 仍为空 → Device Flow Access denied）
+        raise_if_cancelled(cancel_callback)
+        try:
+            resp = session.get(
+                setter,
+                headers={
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "user-agent": get_user_agent(),
+                    "upgrade-insecure-requests": "1",
+                },
+                allow_redirects=True,
+                timeout=45,
+            )
+            final_url = str(getattr(resp, "url", "") or setter)
             status = int(getattr(resp, "status_code", 0) or 0)
-            loc = resp.headers.get("location") or resp.headers.get("Location")
-            if status in (301, 302, 303, 307, 308) and loc:
-                if loc.startswith("/"):
-                    # relative
-                    from urllib.parse import urljoin
-
-                    current = urljoin(current, loc)
-                else:
-                    current = loc
-                continue
-            # 终态页
             if log_callback:
                 log_callback(
-                    f"[*] CookieSetter 完成 hop={hop + 1} HTTP {status} "
-                    f"url={str(getattr(resp, 'url', current) or current)[:100]}"
+                    f"[*] CookieSetter 完成 HTTP {status} "
+                    f"url={final_url[:120]} cookies={len(_export_session_cookie_list(session))}"
                 )
-            return True
-        return True
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] CookieSetter 跟随跳转失败: {exc}")
+            final_url = setter
+        cookies = _export_session_cookie_list(session)
+        return {
+            "ok": True,
+            "cookie_setter_url": setter,
+            "cookies": cookies,
+            "final_url": final_url,
+        }
     finally:
         if own:
             try:
                 session.close()
             except Exception:
                 pass
-
 
 def extract_signup_hard_error(rsc_body):
     text = str(rsc_body or "")

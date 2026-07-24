@@ -2143,6 +2143,7 @@ def exchange_sso_to_refresh_token_via_device_flow(
     log_callback=None,
     cancel_callback=None,
     retries=3,
+    browser_cookies=None,
 ):
     """对齐 grokcli-2api/sso_to_auth_json：纯 HTTP Device Flow，sso → refresh_token。
 
@@ -2215,6 +2216,21 @@ def exchange_sso_to_refresh_token_via_device_flow(
                 except Exception:
                     continue
 
+            # 优先使用建号阶段 CookieSetter 后的完整 jar（含 auth.x.ai 等）
+            for c in browser_cookies or []:
+                try:
+                    session.cookies.set(
+                        c.get("name"),
+                        c.get("value"),
+                        domain=c.get("domain") or ".x.ai",
+                        path=c.get("path") or "/",
+                    )
+                except Exception:
+                    try:
+                        session.cookies.set(c.get("name"), c.get("value"))
+                    except Exception:
+                        pass
+
             # 1) 校验 sso
             raise_if_cancelled(cancel_callback)
             try:
@@ -2231,26 +2247,38 @@ def exchange_sso_to_refresh_token_via_device_flow(
                 raise RuntimeError(f"sso 无效（校验落到登录页）: {final_url}")
             log(f"[*] Device Flow: sso 有效（校验 URL={final_url[:80]}）")
 
-            # CreateSession 返回的是 accounts 会话 JWT；走 OIDC 前先 CreateCookieSetterLink
-            # 把 sso 推广到 auth.x.ai / grokusercontent（缺失时 token 端常 Access denied）
-            try:
-                from core.xai.protocol import promote_sso_session_cookies
+            # 若调用方已传入 CookieSetter 后的 cookies，则不再二次 CreateCookieSetterLink
+            # （二次调用易 403，且会丢掉第一次推广结果）
+            if browser_cookies:
+                log(f"[*] Device Flow 复用建号 CookieSetter jar（{len(browser_cookies)} cookies）")
+            else:
+                try:
+                    from core.xai.protocol import promote_sso_session_cookies
 
-                raise_if_cancelled(cancel_callback)
-                promoted = promote_sso_session_cookies(
-                    token,
-                    session=session,
-                    proxies=proxies,
-                    success_url="https://accounts.x.ai/account",
-                    log_callback=log_callback,
-                    cancel_callback=cancel_callback,
-                )
-                log(
-                    f"[*] Device Flow CookieSetter 推广: "
-                    f"{'ok' if promoted else 'skip/fail'}"
-                )
-            except Exception as exc:
-                log(f"[Debug] Device Flow CookieSetter 推广异常: {exc}")
+                    raise_if_cancelled(cancel_callback)
+                    promo = promote_sso_session_cookies(
+                        token,
+                        session=session,
+                        proxies=proxies,
+                        success_url="https://accounts.x.ai/account",
+                        log_callback=log_callback,
+                        cancel_callback=cancel_callback,
+                    )
+                    ok = bool(isinstance(promo, dict) and promo.get("ok"))
+                    log(f"[*] Device Flow CookieSetter 推广: {'ok' if ok else 'skip/fail'}")
+                    if ok and promo.get("cookies"):
+                        for c in promo.get("cookies") or []:
+                            try:
+                                session.cookies.set(
+                                    c.get("name"),
+                                    c.get("value"),
+                                    domain=c.get("domain") or ".x.ai",
+                                    path=c.get("path") or "/",
+                                )
+                            except Exception:
+                                pass
+                except Exception as exc:
+                    log(f"[Debug] Device Flow CookieSetter 推广异常: {exc}")
 
             # 纯 HTTP 刚 CreateSession 的新号：给 IdP 一点时间把会话同步到 auth.x.ai
             try:
@@ -2475,10 +2503,20 @@ def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_cal
                 "exchange_sso_to_refresh_token_via_device_flow",
                 exchange_sso_to_refresh_token_via_device_flow,
             )
+            promo_cookies = None
+            try:
+                from core.xai.protocol import promote_sso_session_cookies as _promo
+
+                last = getattr(_promo, "_last_promo", None)
+                if isinstance(last, dict) and last.get("cookies"):
+                    promo_cookies = last.get("cookies")
+            except Exception:
+                promo_cookies = None
             return device_fn(
                 token,
                 log_callback=log_callback,
                 cancel_callback=cancel_callback,
+                browser_cookies=promo_cookies,
             )
         except Exception as device_exc:
             if log_callback:

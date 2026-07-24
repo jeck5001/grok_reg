@@ -178,7 +178,12 @@ requests = _requests_impl
 XAI_GROK_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 XAI_GROK_OAUTH_AUTHORIZE_URL = "https://auth.x.ai/oauth2/authorize"
 XAI_GROK_OAUTH_TOKEN_URL = "https://auth.x.ai/oauth2/token"
-XAI_GROK_OAUTH_SCOPE = "openid profile email offline_access grok-cli:access api:access"
+# 对齐 grokcli-2api/sso_to_auth_json 默认 OIDC scopes（缺 conversations 时 device approve
+# 可能“看起来成功”但 /oauth2/token 返回 invalid_grant）
+XAI_GROK_OAUTH_SCOPE = (
+    "openid profile email offline_access grok-cli:access api:access "
+    "conversations:read conversations:write"
+)
 XAI_GROK_OAUTH_REDIRECT_URI = "http://127.0.0.1:56121/callback"
 # 计费 API 通道（API Key）；OAuth/Device Flow 账号应走 cli-chat-proxy
 XAI_GROK_API_BASE_URL = "https://api.x.ai/v1"
@@ -2151,7 +2156,8 @@ def exchange_sso_to_refresh_token_via_device_flow(
     并发时全局串行 + 最小间隔，降低 rate_limited。
     """
     global _DEVICE_FLOW_LAST_TS
-    if requests is None:
+    req = _requests_mod()
+    if req is None:
         raise RuntimeError("curl_cffi 未安装，无法 Device Flow")
     token = _normalize_sso_token(sso)
     if not token:
@@ -2163,10 +2169,26 @@ def exchange_sso_to_refresh_token_via_device_flow(
     issuer = "https://auth.x.ai"
     client_id = XAI_GROK_OAUTH_CLIENT_ID
     scopes = XAI_GROK_OAUTH_SCOPE
+    # 与 grokcli-2api 一致：每次请求带 impersonate=chrome（不要锁死 chrome131）
+    impersonate = "chrome"
 
     def log(msg):
         if log_callback:
             log_callback(msg)
+
+    # 从 sso JWT 尽量抠 principal（空串也能过，有值更稳）
+    principal_id = ""
+    try:
+        claims = _parse_jwt_payload(token) or {}
+        principal_id = str(
+            claims.get("sub")
+            or claims.get("user_id")
+            or claims.get("uid")
+            or claims.get("session_id")
+            or ""
+        ).strip()
+    except Exception:
+        principal_id = ""
 
     # 整段 Device Flow 串行，避免两线程同时 verify/approve 触发限流
     with _DEVICE_FLOW_LOCK:
@@ -2177,7 +2199,7 @@ def exchange_sso_to_refresh_token_via_device_flow(
             sleep_with_cancel(wait, cancel_callback)
         _DEVICE_FLOW_LAST_TS = time.time()
 
-        session = requests.Session(impersonate="chrome131")
+        session = req.Session()
         try:
             try:
                 session.cookies.set("sso", token, domain=".x.ai")
@@ -2191,6 +2213,7 @@ def exchange_sso_to_refresh_token_via_device_flow(
             try:
                 r = session.get(
                     "https://accounts.x.ai/",
+                    impersonate=impersonate,
                     timeout=timeout,
                     **proxy_kw,
                 )
@@ -2212,11 +2235,12 @@ def exchange_sso_to_refresh_token_via_device_flow(
                         f"{issuer}/oauth2/device/code",
                         data={"client_id": client_id, "scope": scopes},
                         headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        impersonate=impersonate,
                         timeout=timeout,
                         **proxy_kw,
                     )
                     if int(getattr(r, "status_code", 0) or 0) >= 400:
-                        last_err = f"device/code HTTP {r.status_code}: {(r.text or '')[:160]}"
+                        last_err = f"device/code HTTP {r.status_code}: {(r.text or '')[:200]}"
                         log(f"[Debug] {last_err}")
                         sleep_with_cancel(2.0 * attempt, cancel_callback)
                         continue
@@ -2234,16 +2258,28 @@ def exchange_sso_to_refresh_token_via_device_flow(
                 user_code = str(dc.get("user_code") or "")
                 device_code = str(dc.get("device_code") or "")
                 verify_url = str(dc.get("verification_uri_complete") or "")
+                try:
+                    poll_interval = float(dc.get("interval") or 1)
+                except Exception:
+                    poll_interval = 1.0
+                # approve 后可以更积极轮询（对齐 2api）
+                poll_interval = max(0.4, min(poll_interval, 1.5))
                 log(f"[*] Device Flow user_code={user_code}")
 
                 # 3) verify
                 try:
                     if verify_url:
-                        session.get(verify_url, timeout=timeout, **proxy_kw)
+                        session.get(
+                            verify_url,
+                            impersonate=impersonate,
+                            timeout=timeout,
+                            **proxy_kw,
+                        )
                     r = session.post(
                         f"{issuer}/oauth2/device/verify",
                         data={"user_code": user_code},
                         headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        impersonate=impersonate,
                         timeout=timeout,
                         allow_redirects=True,
                         **proxy_kw,
@@ -2252,7 +2288,6 @@ def exchange_sso_to_refresh_token_via_device_flow(
                     if "consent" not in vurl:
                         last_err = f"verify 未到 consent: {vurl[:160]}"
                         log(f"[Debug] {last_err}")
-                        # rate_limited 时多等一会
                         backoff = 4.0 * attempt if "rate_limited" in vurl else 2.0 * attempt
                         sleep_with_cancel(backoff, cancel_callback)
                         continue
@@ -2270,9 +2305,10 @@ def exchange_sso_to_refresh_token_via_device_flow(
                             "user_code": user_code,
                             "action": "allow",
                             "principal_type": "User",
-                            "principal_id": "",
+                            "principal_id": principal_id,
                         },
                         headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        impersonate=impersonate,
                         timeout=timeout,
                         allow_redirects=True,
                         **proxy_kw,
@@ -2291,9 +2327,9 @@ def exchange_sso_to_refresh_token_via_device_flow(
                     sleep_with_cancel(2.0 * attempt, cancel_callback)
                     continue
 
-                # 5) poll token
+                # 5) poll token（approve 后立即第一枪，不要先 sleep）
                 poll_deadline = time.time() + 45
-                interval = 1.0
+                interval = poll_interval
                 form = {
                     "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                     "client_id": client_id,
@@ -2310,6 +2346,7 @@ def exchange_sso_to_refresh_token_via_device_flow(
                             f"{issuer}/oauth2/token",
                             data=form,
                             headers={"Content-Type": "application/x-www-form-urlencoded"},
+                            impersonate=impersonate,
                             timeout=timeout,
                             **proxy_kw,
                         )
@@ -2320,19 +2357,25 @@ def exchange_sso_to_refresh_token_via_device_flow(
                             if refresh:
                                 log(f"[*] Device Flow 成功，refresh_token 长度={len(refresh)}")
                                 return refresh
-                            last_err = f"token 响应无 refresh_token: {str(data)[:160]}"
+                            last_err = f"token 响应无 refresh_token: {str(data)[:200]}"
                             break
                         try:
                             err = r.json() if getattr(r, "content", None) else {}
                         except Exception:
                             err = {}
                         error = str((err or {}).get("error") or "")
+                        err_desc = str((err or {}).get("error_description") or "").strip()
                         if error == "authorization_pending":
                             continue
                         if error == "slow_down":
                             interval = min(8.0, interval + 1.0)
                             continue
-                        last_err = f"token 错误: {error or f'HTTP {code}'}"
+                        body_preview = (getattr(r, "text", None) or "")[:200]
+                        last_err = (
+                            f"token 错误: {error or f'HTTP {code}'}"
+                            + (f" ({err_desc})" if err_desc else "")
+                            + (f" body={body_preview}" if body_preview and not err_desc else "")
+                        )
                         break
                     except Exception as exc:
                         last_err = f"token 轮询异常: {exc}"

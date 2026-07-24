@@ -2144,6 +2144,7 @@ def exchange_sso_to_refresh_token_via_device_flow(
     cancel_callback=None,
     retries=3,
     browser_cookies=None,
+    session=None,
 ):
     """对齐 grokcli-2api/sso_to_auth_json：纯 HTTP Device Flow，sso → refresh_token。
 
@@ -2191,7 +2192,9 @@ def exchange_sso_to_refresh_token_via_device_flow(
             sleep_with_cancel(wait, cancel_callback)
         _DEVICE_FLOW_LAST_TS = time.time()
 
-        session = req.Session()
+        own_session = session is None
+        if own_session:
+            session = req.Session()
         try:
             # 多域种 sso（与 CreateSession 后 CookieSetter 推广一致）
             for domain in (
@@ -2481,10 +2484,11 @@ def exchange_sso_to_refresh_token_via_device_flow(
 
             raise RuntimeError(f"Device Flow 失败: {last_err or 'unknown'}")
         finally:
-            try:
-                session.close()
-            except Exception:
-                pass
+            if own_session:
+                try:
+                    session.close()
+                except Exception:
+                    pass
 
 
 def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_callback=None):
@@ -2492,6 +2496,24 @@ def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_cal
     token = _normalize_sso_token(sso)
     if not token:
         raise ValueError("账号缺少 sso cookie，无法获取 Refresh Token")
+
+    # CreateSession 同会话若已换到 RT，直接复用
+    try:
+        from core.xai.protocol import promote_sso_session_cookies as _promo
+
+        cached_rt = str(getattr(_promo, "_last_refresh_token", "") or "").strip()
+        if cached_rt:
+            if log_callback:
+                log_callback(
+                    f"[*] 复用 CreateSession 同会话已取得的 refresh_token，长度={len(cached_rt)}"
+                )
+            try:
+                delattr(_promo, "_last_refresh_token")
+            except Exception:
+                _promo._last_refresh_token = ""
+            return cached_rt
+    except Exception:
+        pass
 
     # API 建号路径：纯 HTTP Device Flow；若测试已注入浏览器（_get_browser 有值）则跳过直连网络。
     browser_ready = _get_browser() is not None

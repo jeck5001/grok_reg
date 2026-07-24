@@ -1112,16 +1112,43 @@ def obtain_sso_via_create_session(
                         log_callback=log_callback,
                         cancel_callback=cancel_callback,
                     )
-                    # 在同一 session 上尽量立刻换 RT，避免 Device Flow 另开空 jar
                     if isinstance(promo, dict) and promo.get("ok"):
+                        # 导出推广后 jar，供后续 Device Flow 复用（勿另开空 session）
+                        promo["cookies"] = promo.get("cookies") or _export_session_cookie_list(
+                            session
+                        )
+                        promote_sso_session_cookies._last_promo = promo
+                        # 关键：在同一 CreateSession session 上立刻换 RT
+                        # （另开 Session 再塞 cookie 常出现 approve 成功但 token Access denied）
                         try:
                             from core.push.integrations import (
                                 exchange_sso_to_refresh_token_via_device_flow,
                             )
-                            # stash promo cookies on a module attribute for fetch path
-                            promote_sso_session_cookies._last_promo = promo
-                        except Exception:
-                            pass
+
+                            if log_callback:
+                                log_callback(
+                                    "[*] CreateSession 同会话立即 Device Flow 换 Refresh Token..."
+                                )
+                            rt = exchange_sso_to_refresh_token_via_device_flow(
+                                sso,
+                                log_callback=log_callback,
+                                cancel_callback=cancel_callback,
+                                browser_cookies=promo.get("cookies"),
+                                session=session,
+                            )
+                            if rt:
+                                promote_sso_session_cookies._last_refresh_token = rt
+                                if log_callback:
+                                    log_callback(
+                                        f"[*] CreateSession 同会话 Device Flow 成功，"
+                                        f"refresh_token 长度={len(rt)}"
+                                    )
+                        except Exception as rt_exc:
+                            if log_callback:
+                                log_callback(
+                                    f"[Debug] CreateSession 同会话 Device Flow 失败"
+                                    f"（将在后续步骤重试）: {rt_exc}"
+                                )
                 except Exception as exc:
                     if log_callback:
                         log_callback(f"[Debug] CookieSetter 推广会话失败（仍返回 sso）: {exc}")
@@ -1506,6 +1533,24 @@ def create_xai_account_via_http(
             raise RuntimeError(
                 f"create_account HTTP {resp.status_code}: {rsc_body[:300]}"
             )
+        # 优先走 RSC set-cookie JWT 链路（真实浏览器种 cookie 路径）；
+        # 只有链路上没有 sso 时才 CreateSession 密码登录兜底。
+        if not sso:
+            try:
+                sso = extract_sso_via_set_cookie_chain(
+                    rsc_body,
+                    session=session,
+                    proxies=proxies,
+                    log_callback=log_callback,
+                )
+                if sso and log_callback:
+                    log_callback(f"[*] RSC set-cookie 链路拿到 sso len={len(sso)}")
+            except Exception as hop_exc:
+                if log_callback:
+                    log_callback(f"[Debug] RSC set-cookie 链路失败: {hop_exc}")
+        # 账号刚创建时 CreateSession 偶发不可见，给一点传播时间
+        if (not sso) and allow_create_session_fallback:
+            sleep_with_cancel(2.0, cancel_callback)
         # create_account → CreateSession（优先用预解的 sign-in token，避免再等一轮 Solver）
         if (not sso) and allow_create_session_fallback:
             sitekey = str(config.get("turnstile_sitekey") or "0x4AAAAAAAhr9JGVDZbrZOo0")

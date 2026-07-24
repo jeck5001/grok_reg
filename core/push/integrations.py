@@ -2170,7 +2170,12 @@ def exchange_sso_to_refresh_token_via_device_flow(
     timeout = 20
     issuer = "https://auth.x.ai"
     client_id = XAI_GROK_OAUTH_CLIENT_ID
-    scopes = XAI_GROK_OAUTH_SCOPE
+    # Access denied 时会自动降级到更短 scope 再试一轮
+    scope_candidates = [
+        XAI_GROK_OAUTH_SCOPE,
+        "openid profile email offline_access grok-cli:access api:access",
+        "openid profile email offline_access",
+    ]
     # 与 grokcli-2api 一致：每次请求带 impersonate=chrome（不要锁死 chrome131）
     impersonate = "chrome"
 
@@ -2305,9 +2310,15 @@ def exchange_sso_to_refresh_token_via_device_flow(
                     pass
 
             last_err = ""
+            access_denied_hits = 0
             for attempt in range(1, max(1, int(retries)) + 1):
                 raise_if_cancelled(cancel_callback)
-                log(f"[*] Device Flow 第 {attempt}/{retries} 次...")
+                scopes = scope_candidates[min(access_denied_hits, len(scope_candidates) - 1)]
+                log(
+                    f"[*] Device Flow 第 {attempt}/{retries} 次..."
+                    f" scope={scopes.split()[-1] if access_denied_hits else 'full'}"
+                    f"{' (降级)' if access_denied_hits else ''}"
+                )
 
                 # 2) device/code
                 try:
@@ -2468,11 +2479,13 @@ def exchange_sso_to_refresh_token_via_device_flow(
                             + (f" ({err_desc})" if err_desc else "")
                             + (f" body={body_preview}" if body_preview and not err_desc else "")
                         )
-                        # Access denied：新会话偶发未同步；本轮 device_code 作废，外层重试
+                        # Access denied：换 device_code，并在后续 attempt 降级 scope
                         if error == "invalid_grant" and "access denied" in (err_desc or "").lower():
+                            access_denied_hits += 1
                             log(
-                                "[Debug] token Access denied：会话/权限可能未就绪，"
-                                "将换新 device_code 重试"
+                                "[Debug] token Access denied：将换新 device_code"
+                                + (" 并降级 scope" if access_denied_hits else "")
+                                + " 重试"
                             )
                             sleep_with_cancel(min(6.0, 2.0 * attempt + 1.0), cancel_callback)
                         break

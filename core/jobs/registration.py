@@ -671,11 +671,24 @@ class RegistrationJob:
                 logf(f"[!] NSFW 开启失败，继续注册流程: {nsfw_message}")
         raise_if_cancelled(self.should_stop)
         logf("[*] 7. 获取 Refresh Token")
-        refresh_token = fetch_xai_oauth_refresh_token(
-            sso, log_callback=logf, cancel_callback=self.should_stop
-        )
+        refresh_token = ""
+        try:
+            refresh_token = (
+                fetch_xai_oauth_refresh_token(
+                    sso, log_callback=logf, cancel_callback=self.should_stop
+                )
+                or ""
+            )
+            refresh_token = str(refresh_token).strip()
+        except Exception as rt_exc:
+            # 号已建好（有 sso）时：RT 失败不应整单作废。xAI 对新号/部分出口
+            # Device Flow + 浏览器 OAuth 都会 Access denied，需后置换 RT。
+            logf(f"[!] 获取 Refresh Token 失败，仍保存 SSO 账号: {rt_exc}")
+            refresh_token = ""
+        if not refresh_token:
+            logf("[!] 本账号无 refresh_token（仅 SSO）；CPA/部分推送将跳过")
         cpa_push_item = None
-        if self.settings.get("cpa_auto_push_remote"):
+        if self.settings.get("cpa_auto_push_remote") and refresh_token:
             raise_if_cancelled(self.should_stop)
             logf("[*] 8. 推送 CPA 凭证")
             try:
@@ -705,6 +718,8 @@ class RegistrationJob:
             except Exception as cpa_exc:
                 logf(f"[!] CPA 凭证生成或推送失败，继续注册流程: {cpa_exc}")
                 cpa_push_item = {"email": email, "status": "failed", "error": str(cpa_exc)}
+        elif self.settings.get("cpa_auto_push_remote") and not refresh_token:
+            logf("[!] 跳过 CPA 推送：缺少 refresh_token")
         account_created_at = datetime.datetime.now().isoformat(timespec="seconds")
         with self.stats_lock:
             # 用文件真实行号生成 account id，避免 success_count 与行号不一致导致状态对不上
@@ -721,6 +736,7 @@ class RegistrationJob:
                 {"email": email, "sso": sso, "refresh_token": refresh_token, "profile": profile}
             )
             self.success_count += 1
+            # 第四段可为空：仅 SSO 账号；后置批量换 RT 时再补全
             line = f"{email}----{profile.get('password','')}----{sso}----{refresh_token}\n"
             try:
                 with _registered_accounts_lock:
@@ -795,7 +811,10 @@ class RegistrationJob:
             note_mail_domain_outcome(email, success=True, log_callback=logf)
         except Exception:
             pass
-        logf(f"[+] 注册成功: {email}")
+        if refresh_token:
+            logf(f"[+] 注册成功: {email}")
+        else:
+            logf(f"[+] 注册成功(仅 SSO，待补 Refresh Token): {email}")
         try:
             import notify_hub
 

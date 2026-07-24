@@ -11,8 +11,9 @@ mail_credentials.txt
 config.json
 config.local.json
 *.log
-jobs/
-local_data/
+# Runtime job state at repo root only (do not ignore core/jobs package)
+/jobs/
+/local_data/
 rejected_email_domains.json
 oauth_debug_*.html
 oauth_debug_*.png

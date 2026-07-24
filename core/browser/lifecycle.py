@@ -28,6 +28,7 @@ from core.runtime import (
     should_apply_container_chrome_flags,
     should_run_headless,
 )
+from core.turnstile.solver import normalize_turnstile_solver_url
 
 try:
     from DrissionPage import Chromium, ChromiumOptions

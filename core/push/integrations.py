@@ -2176,19 +2176,10 @@ def exchange_sso_to_refresh_token_via_device_flow(
         if log_callback:
             log_callback(msg)
 
-    # 从 sso JWT 尽量抠 principal（空串也能过，有值更稳）
+    # 对齐 grokcli-2api：approve 始终传空 principal_id。
+    # CreateSession 的 sso JWT 通常只有 session_id，没有 user sub；
+    # 误把 session_id 当 principal_id 会导致 token 端 invalid_grant (Access denied)。
     principal_id = ""
-    try:
-        claims = _parse_jwt_payload(token) or {}
-        principal_id = str(
-            claims.get("sub")
-            or claims.get("user_id")
-            or claims.get("uid")
-            or claims.get("session_id")
-            or ""
-        ).strip()
-    except Exception:
-        principal_id = ""
 
     # 整段 Device Flow 串行，避免两线程同时 verify/approve 触发限流
     with _DEVICE_FLOW_LOCK:
@@ -2223,6 +2214,28 @@ def exchange_sso_to_refresh_token_via_device_flow(
             if "sign-in" in final_url or "sign-up" in final_url:
                 raise RuntimeError(f"sso 无效（校验落到登录页）: {final_url}")
             log(f"[*] Device Flow: sso 有效（校验 URL={final_url[:80]}）")
+
+            # 纯 HTTP 刚 CreateSession 的新号：给 IdP 一点时间把会话同步到 auth.x.ai
+            # 否则会出现 approve→done 但 /token invalid_grant (Access denied)
+            try:
+                settle = float(
+                    (_active_config() or {}).get("device_flow_settle_seconds", 2.5) or 2.5
+                )
+            except Exception:
+                settle = 2.5
+            settle = max(0.0, min(settle, 15.0))
+            if settle > 0:
+                log(f"[*] Device Flow 会话预热 {settle:.1f}s（auth.x.ai）")
+                sleep_with_cancel(settle, cancel_callback)
+                try:
+                    session.get(
+                        f"{issuer}/",
+                        impersonate=impersonate,
+                        timeout=timeout,
+                        **proxy_kw,
+                    )
+                except Exception:
+                    pass
 
             last_err = ""
             for attempt in range(1, max(1, int(retries)) + 1):
@@ -2297,7 +2310,7 @@ def exchange_sso_to_refresh_token_via_device_flow(
                     sleep_with_cancel(2.0 * attempt, cancel_callback)
                     continue
 
-                # 4) approve
+                # 4) approve（字段与 grokcli-2api 完全一致）
                 try:
                     r = session.post(
                         f"{issuer}/oauth2/device/approve",
@@ -2314,13 +2327,25 @@ def exchange_sso_to_refresh_token_via_device_flow(
                         **proxy_kw,
                     )
                     aurl = str(getattr(r, "url", "") or "")
-                    if "done" not in aurl:
-                        last_err = f"approve 未到 done: {aurl[:160]}"
+                    astatus = int(getattr(r, "status_code", 0) or 0)
+                    # 仅认路径段 /done 或 query，避免误匹配其它含 done 的 URL
+                    aurl_l = aurl.lower()
+                    approved = (
+                        "/done" in aurl_l
+                        or aurl_l.rstrip("/").endswith("done")
+                        or "device/done" in aurl_l
+                        or "status=done" in aurl_l
+                    )
+                    if not approved:
+                        last_err = (
+                            f"approve 未到 done: HTTP {astatus} url={aurl[:180]} "
+                            f"body={(getattr(r, 'text', None) or '')[:120]}"
+                        )
                         log(f"[Debug] {last_err}")
-                        backoff = 4.0 * attempt if "rate_limited" in aurl else 2.0 * attempt
+                        backoff = 4.0 * attempt if "rate_limited" in aurl_l else 2.0 * attempt
                         sleep_with_cancel(backoff, cancel_callback)
                         continue
-                    log("[*] Device Flow 已 approve")
+                    log(f"[*] Device Flow 已 approve (HTTP {astatus})")
                 except Exception as exc:
                     last_err = f"approve 异常: {exc}"
                     log(f"[Debug] {last_err}")
@@ -2376,6 +2401,13 @@ def exchange_sso_to_refresh_token_via_device_flow(
                             + (f" ({err_desc})" if err_desc else "")
                             + (f" body={body_preview}" if body_preview and not err_desc else "")
                         )
+                        # Access denied：新会话偶发未同步；本轮 device_code 作废，外层重试
+                        if error == "invalid_grant" and "access denied" in (err_desc or "").lower():
+                            log(
+                                "[Debug] token Access denied：会话/权限可能未就绪，"
+                                "将换新 device_code 重试"
+                            )
+                            sleep_with_cancel(min(6.0, 2.0 * attempt + 1.0), cancel_callback)
                         break
                     except Exception as exc:
                         last_err = f"token 轮询异常: {exc}"

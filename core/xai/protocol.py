@@ -1096,12 +1096,234 @@ def obtain_sso_via_create_session(
                     f"[*] CreateSession HTTP {resp.status_code} grpc={grpc_status} "
                     f"jwt={'yes' if (token or session_jwt) else 'no'}"
                 )
-            if token:
-                return token
-            if session_jwt and session_jwt.startswith("eyJ") and session_jwt.count(".") >= 2:
-                return session_jwt
+            sso = token or (
+                session_jwt
+                if session_jwt and session_jwt.startswith("eyJ") and session_jwt.count(".") >= 2
+                else ""
+            )
+            if sso:
+                # CreateSession 的 JWT 只是 accounts 会话；要走 OAuth Device Flow / consent，
+                # 还需要 CreateCookieSetterLink 把 sso 种到 auth.x.ai / grokusercontent 等域。
+                try:
+                    promote_sso_session_cookies(
+                        sso,
+                        session=session,
+                        proxies=proxies,
+                        log_callback=log_callback,
+                        cancel_callback=cancel_callback,
+                    )
+                except Exception as exc:
+                    if log_callback:
+                        log_callback(f"[Debug] CookieSetter 推广会话失败（仍返回 sso）: {exc}")
+                return sso
             sleep_with_cancel(0.5 * attempt, cancel_callback)
     return ""
+
+
+def _set_sso_cookie_on_session(session, jwt_token):
+    """把 session JWT 挂到多个相关域，供 AuthManagement / OIDC 读取。"""
+    if not session or not jwt_token:
+        return
+    domains = (
+        "accounts.x.ai",
+        ".x.ai",
+        "auth.x.ai",
+        ".grok.com",
+        "grok.com",
+        "auth.grokusercontent.com",
+    )
+    for domain in domains:
+        try:
+            session.cookies.set("sso", jwt_token, domain=domain)
+        except Exception:
+            continue
+    try:
+        session.cookies.set("sso", jwt_token)
+    except Exception:
+        pass
+    for domain in ("accounts.x.ai", ".x.ai", ".grok.com"):
+        try:
+            session.cookies.set("sso-rw", jwt_token, domain=domain)
+        except Exception:
+            continue
+
+
+def create_cookie_setter_link(
+    success_url,
+    *,
+    error_url="https://accounts.x.ai/sign-in",
+    referer="https://accounts.x.ai/sign-in",
+    session=None,
+    proxies=None,
+    log_callback=None,
+):
+    """AuthManagement/CreateCookieSetterLink → 多域 set-cookie 跳转 URL。"""
+    if requests is None:
+        return {"ok": False, "error": "curl_cffi 未安装", "cookie_setter_url": ""}
+    success_url = str(success_url or "").strip()
+    if not success_url:
+        return {"ok": False, "error": "success_url 为空", "cookie_setter_url": ""}
+    proxies = proxies if proxies is not None else get_proxies()
+    own = session is None
+    if own:
+        sk = {"impersonate": "chrome131", "timeout": 30}
+        if proxies:
+            sk["proxies"] = proxies
+        session = requests.Session(**sk)
+    try:
+        msg = _grpc_encode_string(1, success_url) + _grpc_encode_string(2, error_url)
+        headers = {
+            "content-type": "application/grpc-web+proto",
+            "x-grpc-web": "1",
+            "x-user-agent": "connect-es/2.1.1",
+            "accept": "*/*",
+            "origin": "https://accounts.x.ai",
+            "referer": referer,
+            "user-agent": get_user_agent(),
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+        }
+        resp = session.post(
+            "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateCookieSetterLink",
+            data=_grpc_frame_request(msg),
+            headers=headers,
+            timeout=30,
+        )
+        try:
+            parsed = _grpc_parse_response(resp.content or b"")
+        except Exception:
+            parsed = {"messages": [], "trailers": {}, "grpc_status": None}
+        grpc_status = parsed.get("grpc_status")
+        try:
+            grpc_status = int(grpc_status) if grpc_status is not None else None
+        except Exception:
+            pass
+        urls = []
+        for msg_fields in parsed.get("messages") or []:
+            for f in msg_fields or []:
+                if f.get("type") != "string":
+                    continue
+                val = str(f.get("value") or "")
+                if "http://" in val or "https://" in val or "set-cookie" in val:
+                    urls.append(val)
+        cookie_setter = next((u for u in urls if "set-cookie" in u), None) or (
+            urls[0] if urls else ""
+        )
+        ok = grpc_status in (None, 0) and bool(cookie_setter)
+        if log_callback:
+            log_callback(
+                f"[*] CreateCookieSetterLink HTTP {resp.status_code} "
+                f"grpc={grpc_status} setter={'yes' if cookie_setter else 'no'}"
+            )
+        return {
+            "ok": ok,
+            "error": None if ok else "CreateCookieSetterLink failed",
+            "grpc_status": grpc_status,
+            "cookie_setter_url": cookie_setter,
+            "raw_urls": urls,
+        }
+    finally:
+        if own:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+
+def promote_sso_session_cookies(
+    sso,
+    *,
+    session=None,
+    proxies=None,
+    success_url=None,
+    log_callback=None,
+    cancel_callback=None,
+):
+    """CreateSession 后把 session JWT 推广到 OAuth 相关域（CreateCookieSetterLink + 跳转）。
+
+    Device Flow / 浏览器 OAuth 的 Access denied 常见原因：只种了 accounts 会话，
+    auth.x.ai 上没有完整 sso 链路。
+    """
+    sso = str(sso or "").strip()
+    if not sso or requests is None:
+        return False
+    proxies = proxies if proxies is not None else get_proxies()
+    own = session is None
+    if own:
+        sk = {"impersonate": "chrome131", "timeout": 30}
+        if proxies:
+            sk["proxies"] = proxies
+        session = requests.Session(**sk)
+    try:
+        _set_sso_cookie_on_session(session, sso)
+        success_url = (
+            str(success_url or "").strip()
+            or "https://accounts.x.ai/account"
+        )
+        raise_if_cancelled(cancel_callback)
+        csl = create_cookie_setter_link(
+            success_url,
+            session=session,
+            proxies=proxies,
+            log_callback=log_callback,
+        )
+        setter = str(csl.get("cookie_setter_url") or "").strip()
+        if not setter:
+            return False
+        # 跟随 set-cookie 跳转链，把 cookie 落到 auth.x.ai / grokusercontent
+        current = setter
+        for hop in range(8):
+            raise_if_cancelled(cancel_callback)
+            try:
+                resp = session.get(
+                    current,
+                    headers={
+                        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "user-agent": get_user_agent(),
+                        "upgrade-insecure-requests": "1",
+                    },
+                    allow_redirects=False,
+                    timeout=30,
+                )
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] CookieSetter hop 失败: {exc}")
+                break
+            # 吸收 set-cookie
+            try:
+                if hasattr(resp.headers, "get_list"):
+                    for sc in resp.headers.get_list("set-cookie") or []:
+                        # best-effort: cookie jar already updated by curl_cffi on redirects;
+                        # for non-redirect still ok
+                        pass
+            except Exception:
+                pass
+            status = int(getattr(resp, "status_code", 0) or 0)
+            loc = resp.headers.get("location") or resp.headers.get("Location")
+            if status in (301, 302, 303, 307, 308) and loc:
+                if loc.startswith("/"):
+                    # relative
+                    from urllib.parse import urljoin
+
+                    current = urljoin(current, loc)
+                else:
+                    current = loc
+                continue
+            # 终态页
+            if log_callback:
+                log_callback(
+                    f"[*] CookieSetter 完成 hop={hop + 1} HTTP {status} "
+                    f"url={str(getattr(resp, 'url', current) or current)[:100]}"
+                )
+            return True
+        return True
+    finally:
+        if own:
+            try:
+                session.close()
+            except Exception:
+                pass
 
 
 def extract_signup_hard_error(rsc_body):

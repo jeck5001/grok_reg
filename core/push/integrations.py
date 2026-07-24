@@ -2192,12 +2192,28 @@ def exchange_sso_to_refresh_token_via_device_flow(
 
         session = req.Session()
         try:
+            # 多域种 sso（与 CreateSession 后 CookieSetter 推广一致）
+            for domain in (
+                "accounts.x.ai",
+                ".x.ai",
+                "auth.x.ai",
+                ".grok.com",
+                "grok.com",
+                "auth.grokusercontent.com",
+            ):
+                try:
+                    session.cookies.set("sso", token, domain=domain)
+                except Exception:
+                    continue
             try:
-                session.cookies.set("sso", token, domain=".x.ai")
-                session.cookies.set("sso-rw", token, domain=".x.ai")
-            except Exception:
                 session.cookies.set("sso", token)
-                session.cookies.set("sso-rw", token)
+            except Exception:
+                pass
+            for domain in ("accounts.x.ai", ".x.ai", ".grok.com"):
+                try:
+                    session.cookies.set("sso-rw", token, domain=domain)
+                except Exception:
+                    continue
 
             # 1) 校验 sso
             raise_if_cancelled(cancel_callback)
@@ -2215,14 +2231,34 @@ def exchange_sso_to_refresh_token_via_device_flow(
                 raise RuntimeError(f"sso 无效（校验落到登录页）: {final_url}")
             log(f"[*] Device Flow: sso 有效（校验 URL={final_url[:80]}）")
 
+            # CreateSession 返回的是 accounts 会话 JWT；走 OIDC 前先 CreateCookieSetterLink
+            # 把 sso 推广到 auth.x.ai / grokusercontent（缺失时 token 端常 Access denied）
+            try:
+                from core.xai.protocol import promote_sso_session_cookies
+
+                raise_if_cancelled(cancel_callback)
+                promoted = promote_sso_session_cookies(
+                    token,
+                    session=session,
+                    proxies=proxies,
+                    success_url="https://accounts.x.ai/account",
+                    log_callback=log_callback,
+                    cancel_callback=cancel_callback,
+                )
+                log(
+                    f"[*] Device Flow CookieSetter 推广: "
+                    f"{'ok' if promoted else 'skip/fail'}"
+                )
+            except Exception as exc:
+                log(f"[Debug] Device Flow CookieSetter 推广异常: {exc}")
+
             # 纯 HTTP 刚 CreateSession 的新号：给 IdP 一点时间把会话同步到 auth.x.ai
-            # 否则会出现 approve→done 但 /token invalid_grant (Access denied)
             try:
                 settle = float(
-                    (_active_config() or {}).get("device_flow_settle_seconds", 2.5) or 2.5
+                    (_active_config() or {}).get("device_flow_settle_seconds", 1.5) or 1.5
                 )
             except Exception:
-                settle = 2.5
+                settle = 1.5
             settle = max(0.0, min(settle, 15.0))
             if settle > 0:
                 log(f"[*] Device Flow 会话预热 {settle:.1f}s（auth.x.ai）")

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 
 from core.config import config
 from core.http_client import get_proxies

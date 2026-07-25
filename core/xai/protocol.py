@@ -11,6 +11,7 @@ import struct
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 
 from core.cancel import raise_if_cancelled as _raise_if_cancelled_impl

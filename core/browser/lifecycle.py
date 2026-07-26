@@ -2878,12 +2878,23 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
     last_cf_retry_at = 0.0
     last_final_retry_state = ""
     wait_cf_zero_since = None
+    # 外部 Solver 注入 token 后 SPA 常只点按钮不真正 POST create_account。
+    # 统计“有 token 仍停留在最终页提交目标”的次数，尽早失败以便上层 API 降级。
+    stuck_submit_hits = 0
+    first_stuck_submit_at = None
+    last_network_diag = {}
+    max_stuck_submit_hits = 8
+    stuck_submit_grace_seconds = 28.0
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         try:
-            refresh_active_page()
+            # 优先复用当前页（含 facade/_get_page 注入的测试页）；
+            # 只有拿不到页时才 refresh，避免无头环境里无意义 restart。
             page = _get_page()
+            if page is None:
+                refresh_active_page()
+                page = _get_page()
             if page is None:
                 sleep_with_cancel(1, cancel_callback)
                 continue
@@ -2973,14 +2984,35 @@ const submitBtn = buttons.find((node) => {
 });
 if (!submitBtn) return 'final-page-no-submit';
 submitBtn.focus();
+const form = submitBtn.form || submitBtn.closest('form');
+let formSubmitted = false;
+if (form && typeof form.requestSubmit === 'function') {
+    try { form.requestSubmit(submitBtn); formSubmitted = true; } catch (e) {}
+}
 const rect = submitBtn.getBoundingClientRect();
 try { submitBtn.click(); } catch (e) {}
+// 诊断：是否真的发出了 create_account / server action
+let network = { signUpPosts: 0, validatePassword: 0, nextAction: 0 };
+try {
+    const resources = performance.getEntriesByType('resource') || [];
+    for (const entry of resources) {
+        const name = String((entry && entry.name) || '');
+        const type = String((entry && entry.initiatorType) || '');
+        if (name.includes('ValidatePassword')) network.validatePassword += 1;
+        if (name.includes('/sign-up') && (type === 'fetch' || type === 'xmlhttprequest' || type === 'other')) {
+            network.signUpPosts += 1;
+        }
+        if (name.includes('next') || name.includes('action')) network.nextAction += 1;
+    }
+} catch (e) {}
 return {
     state: 'final-page-submit-target',
     centerX: Math.round(rect.left + rect.width / 2),
     centerY: Math.round(rect.top + rect.height / 2),
     text: compactText(submitBtn).slice(0, 80),
     tokenLen: String((cfInput && cfInput.value) || '').trim().length,
+    formSubmitted,
+    network,
     captured: (() => {
         try {
             const raw = window.__grokTurnstile || {};
@@ -2990,6 +3022,7 @@ return {
                 executeCount: raw.executeCount || 0,
                 callbackCount: raw.callbackCount || 0,
                 lastTokenLen: String(raw.lastToken || '').trim().length,
+                externalInjected: !!raw.externalInjected,
                 executedWidgets,
                 widgets: Array.isArray(raw.widgets) ? raw.widgets.slice(-5) : [],
                 errors: Array.isArray(raw.errors) ? raw.errors.slice(-5) : [],
@@ -3029,11 +3062,30 @@ return {
                             _dispatch_cdp_click(page, x, y, include_keyboard=False)
                             retried["nativeClicked"] = True
                             last_final_retry_state = f"{last_final_retry_state}:native-click:{x},{y}"
+                            stuck_submit_hits += 1
+                            if first_stuck_submit_at is None:
+                                first_stuck_submit_at = now
+                            if isinstance(retried.get("network"), dict):
+                                last_network_diag = retried.get("network") or {}
                         except Exception as native_exc:
                             retried["nativeClickError"] = str(native_exc)[:160]
                             last_final_retry_state = f"{last_final_retry_state}:native-failed"
                     if log_callback:
                         log_callback(f"[Debug] 最终页状态: {json.dumps(retried, ensure_ascii=False)}")
+                    # token 已有且多次原生点击仍停留最终页 → SPA 未真正建号，尽早失败触发 API 降级
+                    if (
+                        stuck_submit_hits >= max_stuck_submit_hits
+                        and first_stuck_submit_at is not None
+                        and (now - first_stuck_submit_at) >= stuck_submit_grace_seconds
+                    ):
+                        raise Exception(
+                            "等待超时：未获取到 sso cookie。"
+                            f"最终页有 token 仍连点 {stuck_submit_hits} 次未建号"
+                            f"（常见于外部 Solver token 未进入 React 状态）。"
+                            f"最后最终页状态: {last_final_retry_state or 'unknown'}。"
+                            f"network={last_network_diag}。"
+                            f"已看到 cookies: {sorted(last_seen_names)}"
+                        )
                 if token_len_now is not None:
                     if str(token_len_now) in {"0", ""}:
                         if wait_cf_zero_since is None:
@@ -3104,13 +3156,19 @@ return 'final-trigger:' + (executed ? '1' : '0') + ':token=' + tokenLen;
                     return value
         except PageDisconnectedError:
             refresh_active_page()
-        except Exception:
+        except Exception as loop_exc:
+            # 尽早失败 / 明确超时类异常向上抛，供 registration 做 API 降级
+            msg = str(loop_exc or "")
+            if "未获取到 sso" in msg or "Turnstile" in msg or "token长度=0" in msg:
+                raise
             pass
 
         sleep_with_cancel(1, cancel_callback)
 
     raise Exception(
-        f"等待超时：未获取到 sso cookie。最后最终页状态: {last_final_retry_state or 'unknown'}。已看到 cookies: {sorted(last_seen_names)}"
+        f"等待超时：未获取到 sso cookie。最后最终页状态: {last_final_retry_state or 'unknown'}。"
+        f"stuck_submit_hits={stuck_submit_hits} network={last_network_diag}。"
+        f"已看到 cookies: {sorted(last_seen_names)}"
     )
 
 

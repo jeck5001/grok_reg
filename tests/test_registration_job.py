@@ -203,6 +203,87 @@ def test_registration_job_runs_successfully(monkeypatch, tmp_path):
     assert any("注册成功" in line for line in job.logs())
 
 
+def test_registration_job_falls_back_to_api_when_sso_cookie_timeout(monkeypatch, tmp_path):
+    """SPA 最终页有 token 仍不种 sso 时，应降级 HTTP create_account。"""
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "restart_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "stop_browser", lambda: None)
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+    monkeypatch.setattr(reg, "resolve_signup_mode", lambda: "browser")
+    monkeypatch.setattr(reg, "open_signup_page", lambda log_callback=None, cancel_callback=None: None)
+    monkeypatch.setattr(
+        reg,
+        "fill_email_and_submit",
+        lambda log_callback=None, cancel_callback=None: ("user@example.com", "mail-token"),
+    )
+    monkeypatch.setattr(
+        reg,
+        "fill_code_and_submit",
+        lambda email, token, log_callback=None, cancel_callback=None: "ABC123",
+    )
+    monkeypatch.setattr(
+        reg,
+        "fill_profile_and_submit",
+        lambda log_callback=None, cancel_callback=None: {
+            "given_name": "Ada",
+            "family_name": "Lovelace",
+            "password": "secret",
+        },
+    )
+
+    def boom_wait(**kwargs):
+        raise Exception(
+            "等待超时：未获取到 sso cookie。最后最终页状态: final-page-submit-target:native-click:480,628。"
+            "已看到 cookies: ['cf_clearance', 'xai_anon_id']"
+        )
+
+    api_calls = []
+
+    def fake_api(email, code, log_callback=None, cancel_callback=None, profile=None):
+        api_calls.append(
+            {
+                "email": email,
+                "code": code,
+                "profile": dict(profile or {}),
+            }
+        )
+        if log_callback:
+            log_callback("[*] API create_account fallback")
+        return "sso-from-api", {
+            "given_name": "Ada",
+            "family_name": "Lovelace",
+            "password": "secret",
+        }
+
+    monkeypatch.setattr(reg, "wait_for_sso_cookie", boom_wait)
+    monkeypatch.setattr(reg, "register_via_api_after_otp", fake_api)
+    monkeypatch.setattr(
+        reg,
+        "fetch_xai_oauth_refresh_token",
+        lambda sso, log_callback=None, cancel_callback=None: "refresh-token",
+    )
+    monkeypatch.setattr(
+        reg,
+        "add_token_to_grok2api_pools",
+        lambda raw_token, email="", log_callback=None: None,
+    )
+
+    job = reg.RegistrationJob({"email_provider": "duckmail", "register_count": 1, "register_threads": 1})
+    job.start()
+    status = wait_for_job(job)
+
+    assert status["status"] == "completed"
+    assert status["success_count"] == 1
+    assert api_calls and api_calls[0]["email"] == "user@example.com"
+    assert api_calls[0]["code"] == "ABC123"
+    assert api_calls[0]["profile"].get("password") == "secret"
+    assert "user@example.com----secret----sso-from-api----refresh-token" in tmp_path.joinpath(
+        status["output_file"]
+    ).read_text(encoding="utf-8")
+    assert any("降级 API create_account" in line for line in job.logs())
+
+
 def test_registration_job_pushes_cpa_after_refresh_token_when_enabled(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(reg, "open_signup_page", lambda **kwargs: None)
@@ -1962,6 +2043,7 @@ def test_turnstile_challenge_clicks_about_blank_frame_owner(monkeypatch):
 
 def test_wait_for_sso_cookie_uses_native_click_for_final_page(monkeypatch):
     events = []
+    import core.browser.lifecycle as life
 
     class FakePage:
         def run_js(self, script):
@@ -1988,6 +2070,8 @@ def test_wait_for_sso_cookie_uses_native_click_for_final_page(monkeypatch):
             return []
 
     page = FakePage()
+    monkeypatch.setattr(life, "refresh_active_page", lambda: page)
+    monkeypatch.setattr(life, "_get_page", lambda: page)
     monkeypatch.setattr(reg, "refresh_active_page", lambda: page)
     monkeypatch.setattr(reg, "_get_page", lambda: page)
 
@@ -1999,6 +2083,51 @@ def test_wait_for_sso_cookie_uses_native_click_for_final_page(monkeypatch):
     ]
     assert events[0][1]["x"] == 321
     assert events[0][1]["y"] == 654
+
+
+def test_wait_for_sso_cookie_raises_early_when_submit_stuck(monkeypatch):
+    """有 token 多次点提交仍无 sso 时，应尽早抛错以便上层 API 降级。"""
+    import core.browser.lifecycle as life
+
+    clicks = {"n": 0}
+    clock = {"t": 1000.0}
+
+    class FakePage:
+        def run_js(self, script):
+            return {
+                "state": "final-page-submit-target",
+                "centerX": 100,
+                "centerY": 200,
+                "text": "completesignup",
+                "tokenLen": 200,
+                "network": {"signUpPosts": 0, "validatePassword": 1},
+                "captured": {"externalInjected": True, "callbackCount": 1},
+            }
+
+        def run_cdp(self, method, **kwargs):
+            if method == "Input.dispatchMouseEvent" and kwargs.get("type") == "mousePressed":
+                clicks["n"] += 1
+
+        def cookies(self, all_domains=True, all_info=True):
+            return [{"name": "cf_clearance", "value": "x"}]
+
+    page = FakePage()
+    monkeypatch.setattr(life, "refresh_active_page", lambda: page)
+    monkeypatch.setattr(life, "_get_page", lambda: page)
+    monkeypatch.setattr(reg, "refresh_active_page", lambda: page)
+    monkeypatch.setattr(reg, "_get_page", lambda: page)
+
+    def advance(*a, **k):
+        clock["t"] += 4.0
+
+    monkeypatch.setattr(life, "sleep_with_cancel", advance)
+    monkeypatch.setattr(reg, "sleep_with_cancel", advance)
+    monkeypatch.setattr(life.time, "time", lambda: clock["t"])
+
+    with pytest.raises(Exception, match="未获取到 sso cookie"):
+        reg.wait_for_sso_cookie(timeout=120)
+
+    assert clicks["n"] >= 8
 
 
 def test_yyds_code_polling_triggers_resend_callback(monkeypatch):

@@ -635,6 +635,9 @@ class RegistrationJob:
                         )
                         profile = dict(profile or {})
                         profile["signup_mode"] = "browser"
+                        # 供 SPA 卡住时 API 降级使用（OTP 只在浏览器侧验证过一次）
+                        profile["_otp_email"] = email
+                        profile["_otp_code"] = code
                     mail_ok = True
                     break
                 except ProfileSessionLost as profile_exc:
@@ -660,7 +663,41 @@ class RegistrationJob:
                 logf("[*] 5. 已通过 API create_account 获取 sso")
             else:
                 logf("[*] 5. 等待 sso cookie")
-                sso = wait_for_sso_cookie(log_callback=logf, cancel_callback=self.should_stop)
+                try:
+                    sso = wait_for_sso_cookie(log_callback=logf, cancel_callback=self.should_stop)
+                except Exception as sso_exc:
+                    # SPA 点 Complete 但 React 状态未吃到外部 Turnstile token 时，
+                    # 会反复 final-page-submit-target 却永不种 sso。OTP 仍有效时降级 HTTP 建号。
+                    otp_email = str((profile or {}).get("_otp_email") or email or "").strip()
+                    otp_code = str((profile or {}).get("_otp_code") or "").strip()
+                    can_api_fallback = (
+                        signup_mode in {"browser", "auto"}
+                        and otp_email
+                        and otp_code
+                        and "未获取到 sso" in str(sso_exc)
+                    )
+                    if not can_api_fallback:
+                        raise
+                    logf(
+                        f"[!] SPA 未拿到 sso，降级 API create_account: {sso_exc}"
+                    )
+                    sso_api, api_profile = register_via_api_after_otp(
+                        otp_email,
+                        otp_code,
+                        log_callback=logf,
+                        cancel_callback=self.should_stop,
+                        profile=profile,
+                    )
+                    sso = str(sso_api or "").strip()
+                    if not sso:
+                        raise Exception(
+                            f"SPA 与 API 均未拿到 sso；SPA={sso_exc}"
+                        )
+                    profile = dict(profile or {})
+                    profile.update(dict(api_profile or {}))
+                    profile["sso"] = sso
+                    profile["signup_mode"] = "browser+api-fallback"
+                    logf("[*] 5. 已通过 API create_account 降级获取 sso")
         raise_if_cancelled(self.should_stop)
         if self.settings.get("enable_nsfw"):
             logf("[*] 6. 开启 NSFW")

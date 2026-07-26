@@ -1650,13 +1650,23 @@ def register_via_api_after_otp(
     email_code,
     log_callback=None,
     cancel_callback=None,
+    profile=None,
 ):
-    """OTP 已在浏览器验证后：并行 Solver + HTTP create_account / CreateSession。"""
+    """OTP 已在浏览器验证后：并行 Solver + HTTP create_account / CreateSession。
+
+    profile: 可选，复用 SPA 已填的 given_name/family_name/password，
+    避免 SPA 半成功建号后 CreateSession 密码不一致。
+    """
     page = _get_page()
     if page is None:
         raise RuntimeError("页面未就绪，无法 API 建号")
 
-    given_name, family_name, password = build_profile()
+    profile = dict(profile or {})
+    given_name = str(profile.get("given_name") or "").strip()
+    family_name = str(profile.get("family_name") or "").strip()
+    password = str(profile.get("password") or "").strip()
+    if not (given_name and family_name and password):
+        given_name, family_name, password = build_profile()
     if log_callback:
         log_callback(f"[*] API 建号：{given_name} {family_name}")
 

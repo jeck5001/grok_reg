@@ -895,6 +895,143 @@ def _click_point_on_page(page, x, y):
     return {"x": x, "y": y, "nativeClicked": True}
 
 
+# openai-cpa / Camoufox 同款：Turnstile checkbox 多点在 widget 左侧
+_TURNSTILE_LEFT_TARGETS = (
+    (20, 0.50),
+    (24, 0.50),
+    (28, 0.52),
+    (18, 0.48),
+    (32, 0.50),
+    (26, 0.45),
+    (22, 0.55),
+    (14, 0.50),
+)
+
+_SSO_COOKIE_NAMES = ("sso", "sso-rw")
+
+
+def _cookie_name_value(item):
+    if isinstance(item, dict):
+        name = str(item.get("name", "")).strip()
+        value = str(item.get("value", "")).strip()
+    else:
+        name = str(getattr(item, "name", "") or "").strip()
+        value = str(getattr(item, "value", "") or "").strip()
+    return name, value
+
+
+def _extract_sso_from_cookies(cookies):
+    """优先 sso，其次 sso-rw（openai-cpa 兼容）。返回 (value, cookie_name)。"""
+    found = {}
+    for item in cookies or []:
+        name, value = _cookie_name_value(item)
+        if not name or not value:
+            continue
+        low = name.lower()
+        if low in {"sso", "sso-rw"} and low not in found:
+            found[low] = (value, name)
+    if "sso" in found:
+        return found["sso"]
+    if "sso-rw" in found:
+        return found["sso-rw"]
+    return "", ""
+
+
+def _click_turnstile_left_offsets(page, box, actions=None, label="left-offsets"):
+    """对 Turnstile widget box 按左侧多偏移点依次点击（对齐 openai-cpa）。"""
+    actions = actions if actions is not None else []
+    if not isinstance(box, dict):
+        return False
+    try:
+        bx = float(box.get("x") or 0)
+        by = float(box.get("y") or 0)
+        bw = float(box.get("width") or 0)
+        bh = float(box.get("height") or 0)
+    except Exception:
+        return False
+    if bw < 12 or bh < 12:
+        actions.append(f"skip-tiny-{label}:{bw}x{bh}")
+        return False
+    for dx, y_ratio in _TURNSTILE_LEFT_TARGETS:
+        try:
+            x = int(bx + min(float(dx), max(8.0, bw * 0.12)))
+            y = int(by + bh * float(y_ratio))
+            if x < 8 or y < 8:
+                continue
+            _click_point_on_page(page, x, y)
+            actions.append(f"left-click-{label}:{x},{y}")
+            sleep_with_cancel(0.28)
+            # token 已出则停止继续点
+            try:
+                if int(read_turnstile_token_len(page) or 0) >= 80:
+                    actions.append(f"token-ready-after-{label}:{x},{y}")
+                    return True
+            except Exception:
+                pass
+        except Exception as exc:
+            actions.append(f"left-click-{label}-fail:{exc}")
+            continue
+    return False
+
+
+def dump_browser_debug(page, tag="debug", log_callback=None):
+    """SSO/最终页失败时落盘截图 + HTML，便于对照 openai-cpa 的 debug dump。"""
+    tag = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(tag or "debug"))[:48] or "debug"
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(get_data_dir(), "browser_debug")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception:
+        return {}
+    base = os.path.join(out_dir, f"{ts}_{tag}")
+    result = {"dir": out_dir, "base": base}
+    # HTML
+    try:
+        html = ""
+        try:
+            html = page.html or ""
+        except Exception:
+            try:
+                html = page.run_js("return document.documentElement.outerHTML;") or ""
+            except Exception:
+                html = ""
+        if html:
+            html_path = base + ".html"
+            with open(html_path, "w", encoding="utf-8", errors="replace") as f:
+                f.write(str(html))
+            result["html"] = html_path
+    except Exception as exc:
+        result["html_error"] = str(exc)[:160]
+    # screenshot via CDP
+    try:
+        shot = page.run_cdp("Page.captureScreenshot", format="png", fromSurface=True) or {}
+        data = shot.get("data") if isinstance(shot, dict) else None
+        if data:
+            import base64
+
+            png_path = base + ".png"
+            with open(png_path, "wb") as f:
+                f.write(base64.b64decode(data))
+            result["png"] = png_path
+    except Exception as exc:
+        result["png_error"] = str(exc)[:160]
+    # URL / title
+    try:
+        result["url"] = str(getattr(page, "url", "") or "")
+    except Exception:
+        result["url"] = ""
+    if log_callback:
+        parts = []
+        if result.get("png"):
+            parts.append(f"png={result['png']}")
+        if result.get("html"):
+            parts.append(f"html={result['html']}")
+        if not parts:
+            parts.append(f"dump_failed={result}")
+        log_callback(f"[Debug] 浏览器调试快照已保存: {', '.join(parts)}")
+    return result
+
+
 def _locate_turnstile_target_via_js(page):
     """主文档 JS 定位（含 open shadow）。跨域 iframe 内文案看不到，但 iframe 元素本身应能看到。"""
     try:
@@ -1211,6 +1348,35 @@ def _click_turnstile_challenge_if_visible(page):
     if target.get("x") is None or target.get("y") is None:
         return {"state": "turnstile-challenge-missing-center", **target}
 
+    actions = []
+    # 有完整 box 时按左侧多偏移点选；否则退回中心点两次点击
+    box = None
+    try:
+        if target.get("width") and target.get("height"):
+            # 若只有中心点，用 width/height 反推左上角
+            cx = float(target.get("x"))
+            cy = float(target.get("y"))
+            bw = float(target.get("width") or 0)
+            bh = float(target.get("height") or 0)
+            if bw > 12 and bh > 12:
+                # 中心点附近偏左：x 本身常已是 left-ish，优先当 left 起点
+                box = {
+                    "x": max(0.0, cx - min(24.0, bw * 0.12)),
+                    "y": max(0.0, cy - bh / 2.0),
+                    "width": bw,
+                    "height": bh,
+                }
+    except Exception:
+        box = None
+    if box and _click_turnstile_left_offsets(page, box, actions=actions, label="challenge"):
+        return {
+            **target,
+            "nativeClicked": True,
+            "viaOffsets": True,
+            "actions": actions,
+            "attempts": attempts,
+        }
+
     click_meta = _click_point_on_page(page, target.get("x"), target.get("y"))
     # 有些实现要点两次才勾选
     sleep_with_cancel(0.15)
@@ -1218,7 +1384,7 @@ def _click_turnstile_challenge_if_visible(page):
         _click_point_on_page(page, int(target.get("x")), int(target.get("y")))
     except Exception:
         pass
-    return {**target, **click_meta, "attempts": attempts}
+    return {**target, **click_meta, "actions": actions, "attempts": attempts}
 
 
 def _dispatch_cdp_keypress(page, ch):
@@ -2207,6 +2373,9 @@ def _cdp_click_page_box_left(page, box, actions=None, label="page-box"):
     if not _is_page_absolute_turnstile_rect(box):
         actions.append(f"skip-bad-box-{label}:{box}")
         return False
+    # 先走 openai-cpa 同款左侧多偏移点选；失败再退回单点中心偏左
+    if _click_turnstile_left_offsets(page, box, actions=actions, label=label):
+        return True
     x = int(box["x"] + min(max(16, box["width"] * 0.12), 36))
     y = int(box["y"] + max(box["height"] / 2, 12))
     # 再保险：拒绝贴边误点
@@ -3140,31 +3309,45 @@ return 'final-trigger:' + (executed ? '1' : '0') + ':token=' + tokenLen;
 
             cookies = page.cookies(all_domains=True, all_info=True) or []
             for item in cookies:
-                if isinstance(item, dict):
-                    name = str(item.get("name", "")).strip()
-                    value = str(item.get("value", "")).strip()
-                else:
-                    name = str(getattr(item, "name", "")).strip()
-                    value = str(getattr(item, "value", "")).strip()
-
+                name, _value = _cookie_name_value(item)
                 if name:
                     last_seen_names.add(name)
 
-                if name == "sso" and value:
-                    if log_callback:
+            sso_value, sso_name = _extract_sso_from_cookies(cookies)
+            if sso_value:
+                if log_callback:
+                    if sso_name.lower() == "sso-rw":
+                        log_callback("[*] 已获取到 sso-rw cookie（兼容 openai-cpa）")
+                    else:
                         log_callback("[*] 已获取到 sso cookie")
-                    return value
+                return sso_value
         except PageDisconnectedError:
             refresh_active_page()
         except Exception as loop_exc:
             # 尽早失败 / 明确超时类异常向上抛，供 registration 做 API 降级
             msg = str(loop_exc or "")
             if "未获取到 sso" in msg or "Turnstile" in msg or "token长度=0" in msg:
+                try:
+                    dump_browser_debug(
+                        page if "page" in locals() else _get_page(),
+                        tag="sso_early_fail",
+                        log_callback=log_callback,
+                    )
+                except Exception:
+                    pass
                 raise
             pass
 
         sleep_with_cancel(1, cancel_callback)
 
+    try:
+        dump_browser_debug(
+            _get_page(),
+            tag="sso_timeout",
+            log_callback=log_callback,
+        )
+    except Exception:
+        pass
     raise Exception(
         f"等待超时：未获取到 sso cookie。最后最终页状态: {last_final_retry_state or 'unknown'}。"
         f"stuck_submit_hits={stuck_submit_hits} network={last_network_diag}。"

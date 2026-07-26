@@ -2091,6 +2091,7 @@ def test_wait_for_sso_cookie_raises_early_when_submit_stuck(monkeypatch):
 
     clicks = {"n": 0}
     clock = {"t": 1000.0}
+    dumps = []
 
     class FakePage:
         def run_js(self, script):
@@ -2116,6 +2117,11 @@ def test_wait_for_sso_cookie_raises_early_when_submit_stuck(monkeypatch):
     monkeypatch.setattr(life, "_get_page", lambda: page)
     monkeypatch.setattr(reg, "refresh_active_page", lambda: page)
     monkeypatch.setattr(reg, "_get_page", lambda: page)
+    monkeypatch.setattr(
+        life,
+        "dump_browser_debug",
+        lambda *a, **k: dumps.append(k.get("tag") or (a[1] if len(a) > 1 else "x")) or {},
+    )
 
     def advance(*a, **k):
         clock["t"] += 4.0
@@ -2128,6 +2134,57 @@ def test_wait_for_sso_cookie_raises_early_when_submit_stuck(monkeypatch):
         reg.wait_for_sso_cookie(timeout=120)
 
     assert clicks["n"] >= 8
+    assert dumps  # 失败时应 dump 调试快照
+
+
+def test_wait_for_sso_cookie_accepts_sso_rw(monkeypatch):
+    """兼容 openai-cpa：仅有 sso-rw 时也视为成功。"""
+    import core.browser.lifecycle as life
+
+    class FakePage:
+        def run_js(self, script):
+            return "not-final-page:done"
+
+        def cookies(self, all_domains=True, all_info=True):
+            return [{"name": "sso-rw", "value": "sso-rw-token-value"}]
+
+    page = FakePage()
+    monkeypatch.setattr(life, "refresh_active_page", lambda: page)
+    monkeypatch.setattr(life, "_get_page", lambda: page)
+    monkeypatch.setattr(reg, "refresh_active_page", lambda: page)
+    monkeypatch.setattr(reg, "_get_page", lambda: page)
+    monkeypatch.setattr(life, "sleep_with_cancel", lambda *a, **k: None)
+
+    assert reg.wait_for_sso_cookie(timeout=1) == "sso-rw-token-value"
+
+
+def test_click_turnstile_left_offsets_uses_multiple_points(monkeypatch):
+    import core.browser.lifecycle as life
+
+    points = []
+
+    class FakePage:
+        pass
+
+    monkeypatch.setattr(life, "sleep_with_cancel", lambda *a, **k: None)
+    monkeypatch.setattr(
+        life,
+        "_click_point_on_page",
+        lambda page, x, y: points.append((x, y)) or {"x": x, "y": y, "nativeClicked": True},
+    )
+    # 始终无 token，走完整偏移列表
+    monkeypatch.setattr(life, "read_turnstile_token_len", lambda page: 0)
+
+    ok = life._click_turnstile_left_offsets(
+        FakePage(),
+        {"x": 100, "y": 200, "width": 300, "height": 65},
+        actions=[],
+        label="unit",
+    )
+    assert ok is False
+    assert len(points) == len(life._TURNSTILE_LEFT_TARGETS)
+    # 第一个点：x=100+20, y=200+65*0.5
+    assert points[0] == (120, 232)
 
 
 def test_yyds_code_polling_triggers_resend_callback(monkeypatch):

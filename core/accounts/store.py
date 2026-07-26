@@ -21,7 +21,11 @@ _account_status_lock = threading.Lock()
 
 def _normalize_sso_token(raw_token):
     token = str(raw_token or "").strip()
-    if token.startswith("sso="):
+    # 兼容 "sso=..." / "sso-rw=..." 前缀
+    low = token.lower()
+    if low.startswith("sso-rw="):
+        token = token[7:]
+    elif low.startswith("sso="):
         token = token[4:]
     return token
 

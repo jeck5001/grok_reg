@@ -69,6 +69,7 @@ from core.turnstile.solver import (
     inject_turnstile_token_to_page as _solver_inject_turnstile_token_to_page,
 )
 from core.xai.protocol import (
+    SIGNUP_URL,
     register_via_api_after_otp as _xai_register_via_api_after_otp,
     resolve_signup_mode as _xai_resolve_signup_mode,
     scrape_signup_next_headers as _xai_scrape_signup_next_headers,

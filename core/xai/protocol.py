@@ -1114,13 +1114,14 @@ def obtain_sso_via_create_session(
                         cancel_callback=cancel_callback,
                     )
                     if isinstance(promo, dict) and promo.get("ok"):
-                        # 导出推广后 jar，供后续 Device Flow 复用（勿另开空 session）
+                        # 导出推广后 jar，供 Device Flow 的 verify/approve 复用。
+                        # device/code 与 token 则由 Device Flow 内部使用独立无 SSO 会话。
                         promo["cookies"] = promo.get("cookies") or _export_session_cookie_list(
                             session
                         )
                         promote_sso_session_cookies._last_promo = promo
-                        # 关键：在同一 CreateSession session 上立刻换 RT
-                        # （另开 Session 再塞 cookie 常出现 approve 成功但 token Access denied）
+                        # 关键：授权会话沿用刚完成 CookieSetter 的 session，避免丢失
+                        # auth.x.ai 状态；Device Flow 会将 device client 会话单独隔离。
                         try:
                             from core.push.integrations import (
                                 exchange_sso_to_refresh_token_via_device_flow,
@@ -2128,5 +2129,4 @@ def register_via_pure_http(log_callback=None, cancel_callback=None):
             session.close()
         except Exception:
             pass
-
 

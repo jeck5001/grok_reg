@@ -2157,6 +2157,7 @@ def exchange_sso_to_refresh_token_via_device_flow(
     retries=3,
     browser_cookies=None,
     session=None,
+    device_session=None,
 ):
     """对齐 grokcli-2api/sso_to_auth_json：纯 HTTP Device Flow，sso → refresh_token。
 
@@ -2270,6 +2271,7 @@ def exchange_sso_to_refresh_token_via_device_flow(
         _DEVICE_FLOW_LAST_TS = time.time()
 
         own_session = session is None
+        own_device_session = False
         if own_session:
             session = req.Session()
         try:
@@ -2385,6 +2387,13 @@ def exchange_sso_to_refresh_token_via_device_flow(
                 except Exception:
                     pass
 
+            # OAuth device-code issuance and the token exchange are performed by the
+            # device client, not the signed-in user agent. Keep that session free of
+            # SSO/CookieSetter cookies; verify and approve above must stay on session.
+            if device_session is None:
+                device_session = req.Session()
+                own_device_session = True
+
             last_err = ""
             for attempt in range(1, max(1, int(retries)) + 1):
                 raise_if_cancelled(cancel_callback)
@@ -2393,7 +2402,7 @@ def exchange_sso_to_refresh_token_via_device_flow(
 
                 # 2) device/code
                 try:
-                    r = session.post(
+                    r = device_session.post(
                         f"{issuer}/oauth2/device/code",
                         data={"client_id": client_id, "scope": scopes},
                         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -2565,7 +2574,11 @@ def exchange_sso_to_refresh_token_via_device_flow(
                     sleep_with_cancel(2.0 * attempt, cancel_callback)
                     continue
 
-                # 5) poll token（approve 后立即第一枪，不要先 sleep）
+                # xAI may need a short commit window before its token endpoint sees
+                # the completed approval. This matches the reference Device Flow.
+                sleep_with_cancel(1.0, cancel_callback)
+
+                # 5) poll token（approve 后第一枪，不要按服务端较长 interval 等待）
                 poll_deadline = time.time() + 45
                 interval = poll_interval
                 form = {
@@ -2580,7 +2593,7 @@ def exchange_sso_to_refresh_token_via_device_flow(
                         sleep_with_cancel(interval, cancel_callback)
                     first = False
                     try:
-                        r = session.post(
+                        r = device_session.post(
                             f"{issuer}/oauth2/token",
                             data=form,
                             headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -2627,6 +2640,11 @@ def exchange_sso_to_refresh_token_via_device_flow(
 
             raise RuntimeError(f"Device Flow 失败: {last_err or 'unknown'}")
         finally:
+            if own_device_session and device_session is not None:
+                try:
+                    device_session.close()
+                except Exception:
+                    pass
             if own_session:
                 try:
                     session.close()

@@ -1775,6 +1775,7 @@ def test_device_flow_sets_sso_rw_on_auth_domain(monkeypatch):
 
 def test_device_flow_uses_openai_cpa_approve_form(monkeypatch):
     calls = []
+    delays = []
 
     class FakeCookies:
         def set(self, *args, **kwargs):
@@ -1793,10 +1794,12 @@ def test_device_flow_uses_openai_cpa_approve_form(monkeypatch):
             return self.payload
 
     class FakeSession:
-        cookies = FakeCookies()
+        def __init__(self, kind):
+            self.kind = kind
+            self.cookies = FakeCookies()
 
         def get(self, url, **kwargs):
-            calls.append(("get", url, kwargs))
+            calls.append((self.kind, "get", url, kwargs))
             if url == "https://accounts.x.ai/":
                 return FakeResponse(url="https://accounts.x.ai/account")
             if "device/consent" in url:
@@ -1804,7 +1807,7 @@ def test_device_flow_uses_openai_cpa_approve_form(monkeypatch):
             return FakeResponse(url=url)
 
         def post(self, url, **kwargs):
-            calls.append(("post", url, kwargs))
+            calls.append((self.kind, "post", url, kwargs))
             if url.endswith("/device/code"):
                 return FakeResponse(
                     payload={
@@ -1823,27 +1826,35 @@ def test_device_flow_uses_openai_cpa_approve_form(monkeypatch):
             raise AssertionError(f"unexpected POST: {url}")
 
     monkeypatch.setattr(reg, "get_proxies", lambda: None)
-    monkeypatch.setattr(reg, "sleep_with_cancel", lambda *args, **kwargs: None)
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, *args, **kwargs: delays.append(seconds))
+    auth_session = FakeSession("auth")
+    device_session = FakeSession("device")
 
     result = reg.exchange_sso_to_refresh_token_via_device_flow(
         "sso-token",
         browser_cookies=[{"name": "sso", "value": "sso-token", "domain": "auth.x.ai"}],
-        session=FakeSession(),
+        session=auth_session,
+        device_session=device_session,
     )
 
     assert result == "refresh-token"
-    verify = next(item for item in calls if item[0] == "post" and item[1].endswith("/device/verify"))
-    approve = next(item for item in calls if item[0] == "post" and item[1].endswith("/device/approve"))
-    assert verify[2]["allow_redirects"] is False
-    assert approve[2]["allow_redirects"] is False
-    assert approve[2]["data"] == {
+    verify = next(item for item in calls if item[1] == "post" and item[2].endswith("/device/verify"))
+    approve = next(item for item in calls if item[1] == "post" and item[2].endswith("/device/approve"))
+    device_code = next(item for item in calls if item[1] == "post" and item[2].endswith("/device/code"))
+    token = next(item for item in calls if item[1] == "post" and item[2].endswith("/oauth2/token"))
+    assert verify[0] == approve[0] == "auth"
+    assert device_code[0] == token[0] == "device"
+    assert 1.0 in delays
+    assert verify[3]["allow_redirects"] is False
+    assert approve[3]["allow_redirects"] is False
+    assert approve[3]["data"] == {
         "user_code": "USER-CODE",
         "action": "allow",
         "principal_type": "User",
         "referrer": "grok-build",
         "plan": "generic",
     }
-    assert approve[2]["headers"]["Origin"] == "https://accounts.x.ai"
+    assert approve[3]["headers"]["Origin"] == "https://accounts.x.ai"
 
 
 def test_should_log_cloudflare_wait_throttles_repeated_same_length(monkeypatch):

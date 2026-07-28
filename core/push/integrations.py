@@ -2181,24 +2181,84 @@ def exchange_sso_to_refresh_token_via_device_flow(
     proxy_kw = {"proxies": proxies} if proxies else {}
     timeout = 20
     issuer = "https://auth.x.ai"
+    accounts = "https://accounts.x.ai"
     client_id = XAI_GROK_OAUTH_CLIENT_ID
-    # Access denied 时会自动降级到更短 scope 再试一轮
-    scope_candidates = [
-        XAI_GROK_OAUTH_SCOPE,
-        "openid profile email offline_access grok-cli:access api:access",
-        "openid profile email offline_access",
-    ]
     # 与 grokcli-2api 一致：每次请求带 impersonate=chrome（不要锁死 chrome131）
     impersonate = "chrome"
+    device_referrer = (
+        os.environ.get("GROK2API_DEVICE_REFERRER")
+        or os.environ.get("GROK_DEVICE_REFERRER")
+        or "grok-build"
+    ).strip() or "grok-build"
+    device_plan = (os.environ.get("GROK2API_OAUTH_PLAN") or "generic").strip() or "generic"
 
     def log(msg):
         if log_callback:
             log_callback(msg)
 
-    # 对齐 grokcli-2api：approve 始终传空 principal_id。
-    # CreateSession 的 sso JWT 通常只有 session_id，没有 user sub；
-    # 误把 session_id 当 principal_id 会导致 token 端 invalid_grant (Access denied)。
+    # session JWT 通常只有 session_id；这种情况必须省略 principal_id，不能传空字段。
     principal_id = ""
+    try:
+        payload = _parse_jwt_payload(token) or {}
+        for key in ("sub", "principal_id", "principalId", "user_id", "userId", "uid"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                principal_id = value
+                break
+    except Exception:
+        pass
+
+    def device_form_headers(referer=""):
+        return {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": accounts,
+            "Referer": referer or f"{accounts}/",
+            "Sec-Fetch-Site": "same-site",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+    def response_location(response):
+        try:
+            return str(response.headers.get("Location") or response.headers.get("location") or "").strip()
+        except Exception:
+            return ""
+
+    def absolute_url(base, location):
+        return urllib.parse.urljoin(f"{base}/", str(location or "").strip())
+
+    def is_sign_in_url(url):
+        text = str(url or "").lower()
+        return "sign-in" in text or "sign-up" in text
+
+    def is_rate_limited(status, url, body):
+        text = f"{status} {url or ''} {body or ''}".lower()
+        return any(marker in text for marker in ("429", "rate_limited", "rate limit", "too many"))
+
+    def is_device_done(url, body=""):
+        text = str(url or "").lower()
+        page = str(body or "").lower()
+        return (
+            "/oauth2/device/done" in text
+            or text.rstrip("/").endswith("/device/done")
+            or "device_authorized" in text
+            or "device authorized" in page
+            or "device is authorized" in page
+            or "authorization complete" in page
+        )
+
+    def consent_fields(html):
+        fields = {}
+        for tag in re.findall(r"<input[^>]+>", str(html or ""), flags=re.I):
+            name_match = re.search(r"name=[\"']([^\"']+)[\"']", tag, flags=re.I)
+            value_match = re.search(r"value=[\"']([^\"']*)[\"']", tag, flags=re.I)
+            if name_match and value_match and value_match.group(1):
+                fields[name_match.group(1)] = value_match.group(1)
+        return fields
 
     # 整段 Device Flow 串行，避免两线程同时 verify/approve 触发限流
     with _DEVICE_FLOW_LOCK:
@@ -2326,15 +2386,10 @@ def exchange_sso_to_refresh_token_via_device_flow(
                     pass
 
             last_err = ""
-            access_denied_hits = 0
             for attempt in range(1, max(1, int(retries)) + 1):
                 raise_if_cancelled(cancel_callback)
-                scopes = scope_candidates[min(access_denied_hits, len(scope_candidates) - 1)]
-                log(
-                    f"[*] Device Flow 第 {attempt}/{retries} 次..."
-                    f" scope={scopes.split()[-1] if access_denied_hits else 'full'}"
-                    f"{' (降级)' if access_denied_hits else ''}"
-                )
+                scopes = XAI_GROK_OAUTH_SCOPE
+                log(f"[*] Device Flow 第 {attempt}/{retries} 次... referrer={device_referrer}")
 
                 # 2) device/code
                 try:
@@ -2373,7 +2428,10 @@ def exchange_sso_to_refresh_token_via_device_flow(
                 poll_interval = max(0.4, min(poll_interval, 1.5))
                 log(f"[*] Device Flow user_code={user_code}")
 
-                # 3) verify
+                # 3) verify。对齐 openai-cpa：保留 302 的 Location，兼容 auth 与 accounts 两端点。
+                consent_ref = f"{accounts}/oauth2/device/consent?user_code={urllib.parse.quote(user_code)}"
+                already_done = False
+                verified = False
                 try:
                     if verify_url:
                         session.get(
@@ -2382,21 +2440,42 @@ def exchange_sso_to_refresh_token_via_device_flow(
                             timeout=timeout,
                             **proxy_kw,
                         )
-                    r = session.post(
+                    for verify_endpoint in (
                         f"{issuer}/oauth2/device/verify",
-                        data={"user_code": user_code},
-                        headers={"Content-Type": "application/x-www-form-urlencoded"},
-                        impersonate=impersonate,
-                        timeout=timeout,
-                        allow_redirects=True,
-                        **proxy_kw,
-                    )
-                    vurl = str(getattr(r, "url", "") or "")
-                    if "consent" not in vurl:
-                        last_err = f"verify 未到 consent: {vurl[:160]}"
+                        f"{accounts}/oauth2/device/verify",
+                    ):
+                        r = session.post(
+                            verify_endpoint,
+                            data={"user_code": user_code},
+                            headers=device_form_headers(verify_url),
+                            impersonate=impersonate,
+                            timeout=timeout,
+                            allow_redirects=False,
+                            **proxy_kw,
+                        )
+                        status = int(getattr(r, "status_code", 0) or 0)
+                        body = str(getattr(r, "text", "") or "")[:800]
+                        target = absolute_url(accounts, response_location(r))
+                        if is_rate_limited(status, target, body):
+                            last_err = f"verify rate_limited: {target[:160]}"
+                            break
+                        if is_sign_in_url(target):
+                            raise RuntimeError(f"Device Flow verify 落到登录页: {target[:160]}")
+                        if is_device_done(target, body):
+                            already_done = True
+                            verified = True
+                            break
+                        if status in (301, 302, 303, 307, 308) and target:
+                            consent_ref = target
+                            verified = True
+                            break
+                        if status < 400:
+                            verified = True
+                            break
+                    if not verified:
+                        last_err = last_err or "verify 未返回 consent/done"
                         log(f"[Debug] {last_err}")
-                        backoff = 4.0 * attempt if "rate_limited" in vurl else 2.0 * attempt
-                        sleep_with_cancel(backoff, cancel_callback)
+                        sleep_with_cancel(4.0 * attempt if "rate_limited" in last_err else 2.0 * attempt, cancel_callback)
                         continue
                 except Exception as exc:
                     last_err = f"verify 异常: {exc}"
@@ -2404,42 +2483,82 @@ def exchange_sso_to_refresh_token_via_device_flow(
                     sleep_with_cancel(2.0 * attempt, cancel_callback)
                     continue
 
-                # 4) approve（字段与 grokcli-2api 完全一致）
+                # 4) approve。xAI 会随版本改变同意页字段，因此依次尝试参考实现的三种表单。
+                approved = already_done
                 try:
-                    r = session.post(
-                        f"{issuer}/oauth2/device/approve",
-                        data={
-                            "user_code": user_code,
-                            "action": "allow",
-                            "principal_type": "User",
-                            "principal_id": principal_id,
-                        },
-                        headers={"Content-Type": "application/x-www-form-urlencoded"},
-                        impersonate=impersonate,
-                        timeout=timeout,
-                        allow_redirects=True,
-                        **proxy_kw,
-                    )
-                    aurl = str(getattr(r, "url", "") or "")
-                    astatus = int(getattr(r, "status_code", 0) or 0)
-                    # 仅认路径段 /done 或 query，避免误匹配其它含 done 的 URL
-                    aurl_l = aurl.lower()
-                    approved = (
-                        "/done" in aurl_l
-                        or aurl_l.rstrip("/").endswith("done")
-                        or "device/done" in aurl_l
-                        or "status=done" in aurl_l
-                    )
-                    if not approved:
-                        last_err = (
-                            f"approve 未到 done: HTTP {astatus} url={aurl[:180]} "
-                            f"body={(getattr(r, 'text', None) or '')[:120]}"
+                    base_form = {
+                        "user_code": user_code,
+                        "action": "allow",
+                        "principal_type": "User",
+                        "referrer": device_referrer,
+                        "plan": device_plan,
+                    }
+                    if principal_id:
+                        base_form["principal_id"] = principal_id
+                    overlay_form = dict(base_form)
+                    try:
+                        consent = session.get(
+                            consent_ref,
+                            impersonate=impersonate,
+                            timeout=timeout,
+                            allow_redirects=True,
+                            **proxy_kw,
                         )
+                        overlay_form.update(consent_fields(getattr(consent, "text", "")))
+                    except Exception as consent_exc:
+                        log(f"[Debug] Device Flow consent 表单读取失败: {consent_exc}")
+                    overlay_form.update({"user_code": user_code, "action": "allow", "referrer": device_referrer, "plan": device_plan})
+                    minimal_form = {"user_code": user_code, "action": "allow"}
+                    forms = (("referrer", base_form), ("overlay", overlay_form), ("minimal", minimal_form))
+                    for approve_endpoint in (
+                        f"{issuer}/oauth2/device/approve",
+                        f"{accounts}/oauth2/device/approve",
+                    ):
+                        for form_name, form in forms:
+                            r = session.post(
+                                approve_endpoint,
+                                data=form,
+                                headers=device_form_headers(consent_ref),
+                                impersonate=impersonate,
+                                timeout=timeout,
+                                allow_redirects=False,
+                                **proxy_kw,
+                            )
+                            status = int(getattr(r, "status_code", 0) or 0)
+                            body = str(getattr(r, "text", "") or "")[:1200]
+                            target = absolute_url(issuer, response_location(r))
+                            if is_rate_limited(status, target, body):
+                                last_err = f"approve rate_limited: {target[:160]}"
+                                break
+                            if is_sign_in_url(target):
+                                raise RuntimeError(f"Device Flow approve 落到登录页: {target[:160]}")
+                            if is_device_done(target, body):
+                                approved = True
+                                log(f"[*] Device Flow 已 approve form={form_name} (HTTP {status})")
+                                break
+                            if status in (301, 302, 303, 307, 308) and target:
+                                try:
+                                    follow = session.get(
+                                        target,
+                                        impersonate=impersonate,
+                                        timeout=timeout,
+                                        allow_redirects=False,
+                                        **proxy_kw,
+                                    )
+                                    follow_target = absolute_url(accounts, response_location(follow)) or target
+                                    if is_device_done(follow_target, getattr(follow, "text", "")):
+                                        approved = True
+                                        log(f"[*] Device Flow 已 approve form={form_name} (follow)")
+                                        break
+                                except Exception:
+                                    pass
+                        if approved or "rate_limited" in last_err:
+                            break
+                    if not approved:
+                        last_err = last_err or "approve 未到 done"
                         log(f"[Debug] {last_err}")
-                        backoff = 4.0 * attempt if "rate_limited" in aurl_l else 2.0 * attempt
-                        sleep_with_cancel(backoff, cancel_callback)
+                        sleep_with_cancel(4.0 * attempt if "rate_limited" in last_err else 2.0 * attempt, cancel_callback)
                         continue
-                    log(f"[*] Device Flow 已 approve (HTTP {astatus})")
                 except Exception as exc:
                     last_err = f"approve 异常: {exc}"
                     log(f"[Debug] {last_err}")
@@ -2495,14 +2614,9 @@ def exchange_sso_to_refresh_token_via_device_flow(
                             + (f" ({err_desc})" if err_desc else "")
                             + (f" body={body_preview}" if body_preview and not err_desc else "")
                         )
-                        # Access denied：换 device_code，并在后续 attempt 降级 scope
+                        # 参考 openai-cpa：保持完整 scope，用新 device_code 和兼容 approve 表单重试。
                         if error == "invalid_grant" and "access denied" in (err_desc or "").lower():
-                            access_denied_hits += 1
-                            log(
-                                "[Debug] token Access denied：将换新 device_code"
-                                + (" 并降级 scope" if access_denied_hits else "")
-                                + " 重试"
-                            )
+                            log("[Debug] token Access denied：将换新 device_code 并重试参考 approve 表单")
                             sleep_with_cancel(min(6.0, 2.0 * attempt + 1.0), cancel_callback)
                         break
                     except Exception as exc:
@@ -2656,4 +2770,3 @@ def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_cal
     snapshot_paths = save_xai_oauth_debug_snapshot(page, log_callback=log_callback)
     snapshot_text = f"，调试快照: {', '.join(snapshot_paths)}" if snapshot_paths else ""
     raise Exception(f"xAI OAuth 未在 {timeout}s 内返回 code，最后URL: {last_url}{snapshot_text}")
-

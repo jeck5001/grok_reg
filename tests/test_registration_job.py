@@ -1773,6 +1773,79 @@ def test_device_flow_sets_sso_rw_on_auth_domain(monkeypatch):
     assert ("sso-rw", "sso-token", {"domain": "auth.x.ai"}) in cookie_sets
 
 
+def test_device_flow_uses_openai_cpa_approve_form(monkeypatch):
+    calls = []
+
+    class FakeCookies:
+        def set(self, *args, **kwargs):
+            return None
+
+    class FakeResponse:
+        def __init__(self, status_code=200, payload=None, url="", text="", location=""):
+            self.status_code = status_code
+            self.payload = payload or {}
+            self.url = url
+            self.text = text
+            self.content = text.encode()
+            self.headers = {"Location": location} if location else {}
+
+        def json(self):
+            return self.payload
+
+    class FakeSession:
+        cookies = FakeCookies()
+
+        def get(self, url, **kwargs):
+            calls.append(("get", url, kwargs))
+            if url == "https://accounts.x.ai/":
+                return FakeResponse(url="https://accounts.x.ai/account")
+            if "device/consent" in url:
+                return FakeResponse(text='<input name="csrf" value="csrf-token">')
+            return FakeResponse(url=url)
+
+        def post(self, url, **kwargs):
+            calls.append(("post", url, kwargs))
+            if url.endswith("/device/code"):
+                return FakeResponse(
+                    payload={
+                        "device_code": "device-code",
+                        "user_code": "USER-CODE",
+                        "verification_uri_complete": "https://accounts.x.ai/oauth2/device?user_code=USER-CODE",
+                        "interval": 1,
+                    }
+                )
+            if url.endswith("/device/verify"):
+                return FakeResponse(status_code=302, location="/oauth2/device/consent?user_code=USER-CODE")
+            if url.endswith("/device/approve"):
+                return FakeResponse(status_code=302, location="/oauth2/device/done")
+            if url.endswith("/oauth2/token"):
+                return FakeResponse(payload={"access_token": "access", "refresh_token": "refresh-token"})
+            raise AssertionError(f"unexpected POST: {url}")
+
+    monkeypatch.setattr(reg, "get_proxies", lambda: None)
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda *args, **kwargs: None)
+
+    result = reg.exchange_sso_to_refresh_token_via_device_flow(
+        "sso-token",
+        browser_cookies=[{"name": "sso", "value": "sso-token", "domain": "auth.x.ai"}],
+        session=FakeSession(),
+    )
+
+    assert result == "refresh-token"
+    verify = next(item for item in calls if item[0] == "post" and item[1].endswith("/device/verify"))
+    approve = next(item for item in calls if item[0] == "post" and item[1].endswith("/device/approve"))
+    assert verify[2]["allow_redirects"] is False
+    assert approve[2]["allow_redirects"] is False
+    assert approve[2]["data"] == {
+        "user_code": "USER-CODE",
+        "action": "allow",
+        "principal_type": "User",
+        "referrer": "grok-build",
+        "plan": "generic",
+    }
+    assert approve[2]["headers"]["Origin"] == "https://accounts.x.ai"
+
+
 def test_should_log_cloudflare_wait_throttles_repeated_same_length(monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(reg.time, "time", lambda: now[0])

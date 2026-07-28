@@ -476,6 +476,38 @@ def build_sub2api_grok_refresh_token_payload(account, token_info=None, settings=
     return payload
 
 
+def build_sub2api_grok_sso_to_oauth_payload(account, settings=None, index=1):
+    """Build Sub2API's server-side Grok SSO conversion request."""
+    settings = {**_active_config(), **dict(settings or {})}
+    sso = _normalize_sso_token((account or {}).get("sso") or "")
+    if not sso:
+        raise ValueError(f"账号 {(account or {}).get('email', '') or index} 缺少 sso，不能推送到 sub2api")
+
+    credentials = {}
+    for key in ("access_token", "refresh_token", "id_token", "password"):
+        value = (account or {}).get(key)
+        if value:
+            credentials[key] = value
+    payload = {
+        "sso_tokens": [sso],
+        "name": _sub2api_account_name(account, settings, index=index),
+        "credentials": credentials,
+        "group_ids": _parse_int_list(settings.get("sub2api_group_ids", "")),
+        "expires_at": None,
+        "auto_pause_on_expired": True,
+    }
+    proxy_id = _optional_positive_int(settings.get("sub2api_proxy_id"), None)
+    if proxy_id is not None:
+        payload["proxy_id"] = proxy_id
+    concurrency = _optional_positive_int(settings.get("sub2api_concurrency"), None)
+    if concurrency is not None:
+        payload["concurrency"] = concurrency
+    priority = _optional_positive_int(settings.get("sub2api_priority"), None)
+    if priority is not None:
+        payload["priority"] = priority
+    return payload
+
+
 def _sub2api_test_models(settings=None):
     """探测只用 1 个模型，避免连打触发 oauth refresh account state changed。"""
     settings = settings or {}
@@ -811,32 +843,92 @@ def _push_one_account_to_sub2api(account, settings, base, headers, index, log_ca
     return item
 
 
+def _push_one_sso_account_to_sub2api(account, settings, base, headers, index, log_callback=None):
+    payload = build_sub2api_grok_sso_to_oauth_payload(account, settings, index=index)
+    request_headers = {
+        **headers,
+        "Idempotency-Key": f"grok-{secrets.token_hex(16)}",
+    }
+    if log_callback:
+        log_callback(f"[*] sub2api 使用 SSO 转换导入: {account.get('email', '')}")
+    converted = _sub2api_response_data(
+        http_post(
+            f"{base}/admin/grok/sso-to-oauth",
+            headers=request_headers,
+            json=payload,
+            timeout=60,
+            proxies={},
+        )
+    )
+    if isinstance(converted, dict):
+        failures = converted.get("failed") or converted.get("errors") or []
+        if failures:
+            raise ValueError(f"sub2api SSO 转换失败: {str(failures)[:1000]}")
+
+    account_id = _extract_sub2api_account_id(converted)
+    if not account_id and isinstance(converted, dict):
+        created = converted.get("created") or converted.get("success") or []
+        if isinstance(created, dict):
+            account_id = _extract_sub2api_account_id(created)
+        elif isinstance(created, list):
+            for record in created:
+                account_id = _extract_sub2api_account_id(record)
+                if account_id:
+                    break
+    if not account_id:
+        account_id = _sub2api_find_account_id_by_name(
+            base, headers, payload.get("name"), log_callback=log_callback
+        )
+    return {
+        "email": account.get("email", ""),
+        "status": "pushed",
+        "response": converted,
+        "remote_id": str(account_id or "").strip(),
+        "account_id": str(account_id or "").strip(),
+        "source": "sso-to-oauth",
+    }
+
+
 def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
     settings = {**_active_config(), **dict(settings or {})}
     base = _sub2api_api_base(settings)
     headers = _sub2api_headers(settings)
 
-    valid_accounts = [account for account in (accounts or []) if str(account.get("refresh_token") or "").strip()]
+    valid_accounts = [
+        account
+        for account in (accounts or [])
+        if str(account.get("refresh_token") or "").strip()
+        or _normalize_sso_token(account.get("sso") or "")
+    ]
     if not valid_accounts:
-        raise ValueError("没有可推送的账号：选中账号缺少 refresh_token")
+        raise ValueError("没有可推送的账号：选中账号缺少 refresh_token 和 sso")
     missing = [
         str(account.get("email") or account.get("id") or "").strip()
         for account in (accounts or [])
         if not str(account.get("refresh_token") or "").strip()
+        and not _normalize_sso_token(account.get("sso") or "")
     ]
     missing = [item for item in missing if item]
     if missing:
-        raise ValueError(f"账号 {', '.join(missing)} 缺少 refresh_token，不能推送到 sub2api")
+        raise ValueError(f"账号 {', '.join(missing)} 缺少 refresh_token 和 sso，不能推送到 sub2api")
 
     items = []
     for index, account in enumerate(valid_accounts, start=1):
-        step = "refresh-token"
+        has_refresh_token = bool(str(account.get("refresh_token") or "").strip())
+        step = "refresh-token" if has_refresh_token else "sso-to-oauth"
         try:
-            items.append(
-                _push_one_account_to_sub2api(
-                    account, settings, base, headers, index, log_callback=log_callback
+            if has_refresh_token:
+                items.append(
+                    _push_one_account_to_sub2api(
+                        account, settings, base, headers, index, log_callback=log_callback
+                    )
                 )
-            )
+            else:
+                items.append(
+                    _push_one_sso_account_to_sub2api(
+                        account, settings, base, headers, index, log_callback=log_callback
+                    )
+                )
         except Exception as exc:
             error_text = _sub2api_error_text(exc, step=step)
             if step == "refresh-token" and is_refresh_token_revoked_error(error_text) and account.get("sso"):
@@ -855,7 +947,22 @@ def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
                     )
                     continue
                 except Exception as retry_exc:
-                    error_text = f"{error_text}; retry_with_sso_failed: {_sub2api_error_text(retry_exc)}"
+                    try:
+                        if log_callback:
+                            log_callback(
+                                f"[*] 本地 SSO 重取 RT 失败，改由 sub2api SSO 转换: {account.get('email', '')}"
+                            )
+                        items.append(
+                            _push_one_sso_account_to_sub2api(
+                                account, settings, base, headers, index, log_callback=log_callback
+                            )
+                        )
+                        continue
+                    except Exception as conversion_exc:
+                        error_text = (
+                            f"{error_text}; retry_with_sso_failed: {_sub2api_error_text(retry_exc)}"
+                            f"; sso_to_oauth_failed: {_sub2api_error_text(conversion_exc)}"
+                        )
             items.append(
                 {
                     "email": account.get("email", ""),
@@ -880,7 +987,7 @@ def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
         "failed": failed_count,
         "probe_failed": probe_failed_count,
         "items": items,
-        "warning": "已按 Refresh Token 直接导入 sub2api；历史仅有 sso 的账号不能推送。探测失败可筛选「sub2api 探测失败」后重探或删远端。",
+        "warning": "含 Refresh Token 的账号会直导；仅含 SSO 的账号会由 sub2api 服务端转换。探测失败可筛选「sub2api 探测失败」后重探或删远端。",
     }
 
 

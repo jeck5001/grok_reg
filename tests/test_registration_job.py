@@ -1289,13 +1289,13 @@ def test_add_token_to_grok2api_remote_pool_uses_admin_api(monkeypatch):
     assert calls[0][1]["json"]["pool"] == "super"
 
 
-def test_import_accounts_to_sub2api_requires_refresh_token(monkeypatch):
+def test_import_accounts_to_sub2api_requires_refresh_token_or_sso(monkeypatch):
     calls = []
     monkeypatch.setattr(reg, "http_post", lambda *args, **kwargs: calls.append((args, kwargs)))
 
-    with pytest.raises(ValueError, match="缺少 refresh_token"):
+    with pytest.raises(ValueError, match="缺少 refresh_token 和 sso"):
         reg.import_accounts_to_sub2api(
-            [{"email": "user1@example.com", "sso": "sso-token-1"}],
+            [{"email": "user1@example.com"}],
             {
                 "sub2api_base": "https://sub2api.example/api/v1",
                 "sub2api_admin_token": "admin-key",
@@ -1303,6 +1303,80 @@ def test_import_accounts_to_sub2api_requires_refresh_token(monkeypatch):
         )
 
     assert calls == []
+
+
+def test_import_accounts_to_sub2api_converts_grok_sso(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"code": 0, "data": {"created": [{"id": 321}], "failed": []}}
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr(reg, "http_post", fake_post)
+    result = reg.import_accounts_to_sub2api(
+        [{"email": "user1@example.com", "sso": "sso=sso-token-1"}],
+        {
+            "sub2api_base": "https://sub2api.example/api/v1",
+            "sub2api_admin_token": "admin-key",
+            "sub2api_account_name": "Grok Auto",
+            "sub2api_group_ids": "1, 2",
+            "sub2api_concurrency": 5,
+            "sub2api_priority": 40,
+        },
+    )
+
+    assert result["imported"] is True
+    assert result["total"] == 1
+    assert result["items"][0]["remote_id"] == "321"
+    assert calls[0][0] == "https://sub2api.example/api/v1/admin/grok/sso-to-oauth"
+    assert calls[0][1]["headers"]["x-api-key"] == "admin-key"
+    assert calls[0][1]["headers"]["Idempotency-Key"].startswith("grok-")
+    assert calls[0][1]["json"] == {
+        "sso_tokens": ["sso-token-1"],
+        "name": "Grok Auto - user1@example.com",
+        "credentials": {},
+        "group_ids": [1, 2],
+        "expires_at": None,
+        "auto_pause_on_expired": True,
+        "concurrency": 5,
+        "priority": 40,
+    }
+
+
+def test_import_accounts_to_sub2api_reports_grok_sso_conversion_failure(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"code": 0, "data": {"failed": [{"error": "access denied"}]}}
+
+    monkeypatch.setattr(reg, "http_post", lambda *args, **kwargs: FakeResponse())
+    result = reg.import_accounts_to_sub2api(
+        [{"email": "user1@example.com", "sso": "sso-token-1"}],
+        {
+            "sub2api_base": "https://sub2api.example/api/v1",
+            "sub2api_admin_token": "admin-key",
+        },
+    )
+
+    assert result["imported"] is False
+    assert result["failed"] == 1
+    assert result["items"][0]["step"] == "sso-to-oauth"
+    assert "access denied" in result["items"][0]["error"]
 
 
 def test_import_accounts_to_sub2api_posts_grok_refresh_token(monkeypatch):

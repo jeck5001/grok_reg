@@ -156,3 +156,38 @@ def test_cf_global_and_jobs_live_in_core_modules():
     assert reg.RegistrationJob is jobs.RegistrationJob
     assert reg.read_job_log_lines is jobs.read_job_log_lines
     assert reg.save_job_snapshot is jobs.save_job_snapshot
+
+
+def test_setup_cf_email_catch_all_binds_active_domain(monkeypatch):
+    from core.cf_global import api as cf_global
+
+    calls = []
+    delays = []
+
+    def fake_request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        if method == "GET" and path == "/zones":
+            return {"success": True, "result": [{"id": "zone-1", "status": "active"}]}
+        if method == "POST" and path.endswith("/email/routing/enable"):
+            return {"success": True, "result": {}}
+        if method == "GET" and path.endswith("/email/routing/rules/catch_all"):
+            return {"success": True, "result": {"enabled": False, "actions": []}}
+        if method == "PUT" and path.endswith("/email/routing/rules/catch_all"):
+            return {"success": True, "result": {}}
+        raise AssertionError(f"unexpected Cloudflare request: {method} {path}")
+
+    monkeypatch.setattr(cf_global, "_cf_global_request", fake_request)
+    monkeypatch.setattr(cf_global.time, "sleep", lambda seconds: delays.append(seconds))
+
+    result = reg.setup_cf_email_catch_all(
+        domains="example.com",
+        settings={"cf_api_email": "user@example.com", "cf_api_key": "cf-key"},
+        worker_name="mail-worker",
+    )
+
+    assert result["ok"] is True
+    assert result["total"] == 1
+    assert result["items"][0]["msg"] == "Catch-All 已指向 Worker [mail-worker]"
+    assert delays == [0.3]
+    assert calls[-1][0] == "PUT"
+    assert calls[-1][2]["json_body"]["actions"] == [{"type": "worker", "value": ["mail-worker"]}]

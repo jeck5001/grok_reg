@@ -40,7 +40,7 @@ from core.config import DEFAULT_CONFIG, config, _parse_positive_int
 from core.http_client import get_proxies as _get_proxies_impl
 from core.paths import get_data_dir
 from core.runtime import _env_truthy, normalize_proxy_for_runtime
-from core.xai.protocol import _parse_jwt_payload
+from core.xai.protocol import _parse_jwt_payload, export_browser_cookies as _export_browser_cookies
 
 try:
     from curl_cffi import CurlMime as _CurlMimeImpl
@@ -127,6 +127,18 @@ def _get_page():
 
 def _get_browser():
     return _resolve("_get_browser", lambda: None)()
+
+
+def _current_browser_xai_cookies(page):
+    """Best-effort browser cookie export for the Device Flow session."""
+    if page is None:
+        return []
+    try:
+        export_fn = _resolve("export_browser_cookies", _export_browser_cookies)
+        cookies = export_fn(page)
+        return cookies if isinstance(cookies, list) else []
+    except Exception:
+        return []
 
 
 def _click_xai_oauth_consent_if_present(page):
@@ -2201,7 +2213,8 @@ def exchange_sso_to_refresh_token_via_device_flow(
         if own_session:
             session = req.Session()
         try:
-            # 多域种 sso（与 CreateSession 后 CookieSetter 推广一致）
+            # 与 openai-cpa 的 device-flow 保持一致：两个会话 cookie 都要覆盖 auth 域。
+            # 新号的 sso-rw 若只写 accounts 域，verify/approve 可能会落回登录页。
             for domain in (
                 "accounts.x.ai",
                 ".x.ai",
@@ -2210,19 +2223,16 @@ def exchange_sso_to_refresh_token_via_device_flow(
                 "grok.com",
                 "auth.grokusercontent.com",
             ):
-                try:
-                    session.cookies.set("sso", token, domain=domain)
-                except Exception:
-                    continue
+                for name in ("sso", "sso-rw"):
+                    try:
+                        session.cookies.set(name, token, domain=domain)
+                    except Exception:
+                        continue
             try:
                 session.cookies.set("sso", token)
+                session.cookies.set("sso-rw", token)
             except Exception:
                 pass
-            for domain in ("accounts.x.ai", ".x.ai", ".grok.com"):
-                try:
-                    session.cookies.set("sso-rw", token, domain=domain)
-                except Exception:
-                    continue
 
             # 优先使用建号阶段 CookieSetter 后的完整 jar（含 auth.x.ai 等）
             for c in browser_cookies or []:
@@ -2255,9 +2265,15 @@ def exchange_sso_to_refresh_token_via_device_flow(
                 raise RuntimeError(f"sso 无效（校验落到登录页）: {final_url}")
             log(f"[*] Device Flow: sso 有效（校验 URL={final_url[:80]}）")
 
-            # 若调用方已传入 CookieSetter 后的 cookies，则不再二次 CreateCookieSetterLink
-            # （二次调用易 403，且会丢掉第一次推广结果）
-            if browser_cookies:
+            # CookieSetter 产物会带 auth.x.ai 会话；只有这种完整 jar 才跳过推广。
+            # 浏览器注册完成后取到的 jar 可能只有 accounts.x.ai 的 sso，仍需推广。
+            has_auth_sso = any(
+                str(cookie.get("name") or "").lower() in {"sso", "sso-rw"}
+                and "auth.x.ai" in str(cookie.get("domain") or "").lower()
+                for cookie in browser_cookies or []
+                if isinstance(cookie, dict)
+            )
+            if has_auth_sso:
                 log(f"[*] Device Flow 复用建号 CookieSetter jar（{len(browser_cookies)} cookies）")
             else:
                 try:
@@ -2528,39 +2544,37 @@ def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_cal
     except Exception:
         pass
 
-    # API 建号路径：纯 HTTP Device Flow；若测试已注入浏览器（_get_browser 有值）则跳过直连网络。
-    browser_ready = _get_browser() is not None
-    if not browser_ready:
-        try:
-            if log_callback:
-                log_callback("[*] 获取 Refresh Token：优先 Device Flow（对齐 grokcli-2api）...")
-            device_fn = _resolve(
-                "exchange_sso_to_refresh_token_via_device_flow",
-                exchange_sso_to_refresh_token_via_device_flow,
-            )
-            promo_cookies = None
+    browser = _get_browser()
+    page = _get_page()
+    try:
+        if log_callback:
+            log_callback("[*] 获取 Refresh Token：优先 Device Flow（对齐 openai-cpa）...")
+        device_fn = _resolve(
+            "exchange_sso_to_refresh_token_via_device_flow",
+            exchange_sso_to_refresh_token_via_device_flow,
+        )
+        device_cookies = _current_browser_xai_cookies(page)
+        if not device_cookies:
             try:
                 from core.xai.protocol import promote_sso_session_cookies as _promo
 
                 last = getattr(_promo, "_last_promo", None)
                 if isinstance(last, dict) and last.get("cookies"):
-                    promo_cookies = last.get("cookies")
+                    device_cookies = last.get("cookies")
             except Exception:
-                promo_cookies = None
-            return device_fn(
-                token,
-                log_callback=log_callback,
-                cancel_callback=cancel_callback,
-                browser_cookies=promo_cookies,
-            )
-        except Exception as device_exc:
-            if log_callback:
-                log_callback(f"[!] Device Flow 失败，回退浏览器 OAuth: {device_exc}")
-    elif log_callback:
-        log_callback("[*] 检测到已有浏览器会话，跳过 Device Flow，走 OAuth 页面")
+                pass
+        if log_callback and device_cookies:
+            log_callback(f"[*] Device Flow 复用当前浏览器会话（{len(device_cookies)} cookies）")
+        return device_fn(
+            token,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            browser_cookies=device_cookies,
+        )
+    except Exception as device_exc:
+        if log_callback:
+            log_callback(f"[!] Device Flow 失败，回退浏览器 OAuth: {device_exc}")
 
-    browser = _get_browser()
-    page = _get_page()
     if browser is None or page is None:
         browser, page = start_browser(log_callback=log_callback)
     try:
@@ -2642,5 +2656,4 @@ def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_cal
     snapshot_paths = save_xai_oauth_debug_snapshot(page, log_callback=log_callback)
     snapshot_text = f"，调试快照: {', '.join(snapshot_paths)}" if snapshot_paths else ""
     raise Exception(f"xAI OAuth 未在 {timeout}s 内返回 code，最后URL: {last_url}{snapshot_text}")
-
 

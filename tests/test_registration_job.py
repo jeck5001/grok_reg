@@ -1604,6 +1604,11 @@ def test_fetch_xai_oauth_refresh_token_waits_after_first_consent_submit(monkeypa
     monkeypatch.setattr(reg, "_get_browser", lambda: FakeBrowser())
     monkeypatch.setattr(reg, "_get_page", lambda: FakePage())
     monkeypatch.setattr(reg, "_set_page", lambda page: None)
+    monkeypatch.setattr(
+        reg,
+        "exchange_sso_to_refresh_token_via_device_flow",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("device flow unavailable")),
+    )
     monkeypatch.setattr(reg, "_click_xai_oauth_consent_if_present", fake_click)
     monkeypatch.setattr(reg, "sleep_with_cancel", fake_sleep)
     monkeypatch.setattr(reg, "save_xai_oauth_debug_snapshot", lambda page, log_callback=None: [])
@@ -1646,6 +1651,11 @@ def test_fetch_xai_oauth_refresh_token_saves_debug_snapshot_on_timeout(monkeypat
     monkeypatch.setattr(reg, "_get_browser", lambda: FakeBrowser())
     monkeypatch.setattr(reg, "_get_page", lambda: FakePage())
     monkeypatch.setattr(reg, "_set_page", lambda page: None)
+    monkeypatch.setattr(
+        reg,
+        "exchange_sso_to_refresh_token_via_device_flow",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("device flow unavailable")),
+    )
     monkeypatch.setattr(reg, "_click_xai_oauth_consent_if_present", lambda page: {"clicked": False})
     monkeypatch.setattr(reg, "sleep_with_cancel", fake_sleep)
     monkeypatch.setattr(reg.secrets, "token_hex", lambda size: "fixed-state" if size == 32 else "fixed-nonce")
@@ -1686,6 +1696,11 @@ def test_fetch_xai_oauth_refresh_token_sets_sso_cookies_before_authorize(monkeyp
     monkeypatch.setattr(reg, "_get_browser", lambda: FakeBrowser())
     monkeypatch.setattr(reg, "_get_page", lambda: FakePage())
     monkeypatch.setattr(reg, "_set_page", lambda page: None)
+    monkeypatch.setattr(
+        reg,
+        "exchange_sso_to_refresh_token_via_device_flow",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("device flow unavailable")),
+    )
     monkeypatch.setattr(reg.secrets, "token_hex", lambda size: "fixed-state" if size == 32 else "fixed-nonce")
     monkeypatch.setattr(reg.secrets, "token_bytes", lambda size: b"a" * size)
     monkeypatch.setattr(
@@ -1699,6 +1714,63 @@ def test_fetch_xai_oauth_refresh_token_sets_sso_cookies_before_authorize(monkeyp
     assert "sso" in cookie_names
     assert "sso-rw" in cookie_names
     assert any(item[0] == "get" and "oauth2/authorize" in item[1] for item in events)
+
+
+def test_fetch_xai_oauth_refresh_token_uses_device_flow_with_browser_cookies(monkeypatch):
+    calls = []
+
+    class FakePage:
+        def cookies(self, **kwargs):
+            assert kwargs == {"all_domains": True, "all_info": True}
+            return [{"name": "sso", "value": "browser-sso", "domain": "accounts.x.ai"}]
+
+    class FakeBrowser:
+        def new_tab(self, url):
+            raise AssertionError("Device Flow success must not open the OAuth page")
+
+    monkeypatch.setattr(reg, "_get_browser", lambda: FakeBrowser())
+    monkeypatch.setattr(reg, "_get_page", lambda: FakePage())
+
+    def fake_device_flow(sso, **kwargs):
+        calls.append((sso, kwargs))
+        return "refresh-token"
+
+    monkeypatch.setattr(reg, "exchange_sso_to_refresh_token_via_device_flow", fake_device_flow)
+
+    assert reg.fetch_xai_oauth_refresh_token("sso-token") == "refresh-token"
+    assert calls == [
+        (
+            "sso-token",
+            {
+                "log_callback": None,
+                "cancel_callback": None,
+                "browser_cookies": [
+                    {"name": "sso", "value": "browser-sso", "domain": "accounts.x.ai", "path": "/"}
+                ],
+            },
+        )
+    ]
+
+
+def test_device_flow_sets_sso_rw_on_auth_domain(monkeypatch):
+    cookie_sets = []
+
+    class FakeCookies:
+        def set(self, name, value, **kwargs):
+            cookie_sets.append((name, value, kwargs))
+
+    class FakeSession:
+        cookies = FakeCookies()
+
+        def get(self, url, **kwargs):
+            return type("Response", (), {"url": "https://accounts.x.ai/sign-in"})()
+
+    monkeypatch.setattr(reg, "get_proxies", lambda: None)
+
+    with pytest.raises(RuntimeError, match="sso 无效"):
+        reg.exchange_sso_to_refresh_token_via_device_flow("sso-token", session=FakeSession())
+
+    assert ("sso-rw", "sso-token", {"domain": "auth.x.ai"}) in cookie_sets
 
 
 def test_should_log_cloudflare_wait_throttles_repeated_same_length(monkeypatch):

@@ -263,9 +263,44 @@ def invalidate_next_action_cache(log_callback=None):
         log_callback("[*] 已清除 next-action 缓存（将强制重扫）")
 
 
+_CHUNK_SRC_RE = re.compile(
+    r"""(?:src|href)=["'](/_next/static/chunks/[^"'?\s]+\.js)(?:\?[^"']*)?["']""",
+    re.IGNORECASE,
+)
+# RSC / 内联字符串里也可能出现 chunk 路径（带或不带 ?dpl=）
+_CHUNK_PATH_RE = re.compile(r"(/_next/static/chunks/[^\"'\\\s?]+\.js)")
+
+
+def _extract_next_chunk_paths(html):
+    """从 sign-up HTML 提取 /_next/static/chunks/*.js 路径。
+
+    2026-07 起 accounts.x.ai 的 script src 变成：
+      /_next/static/chunks/xxx.js?dpl=<deployId>
+    旧正则要求 `.js"` 紧贴结束引号，会匹配 0 条导致 next-action 扫不到。
+    """
+    html = str(html or "")
+    paths = []
+    seen = set()
+    for regex in (_CHUNK_SRC_RE, _CHUNK_PATH_RE):
+        for m in regex.findall(html):
+            path = str(m or "").strip()
+            if not path or path in seen:
+                continue
+            # 去掉偶发查询串
+            if "?" in path:
+                path = path.split("?", 1)[0]
+            if not path.endswith(".js"):
+                continue
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
 def _html_action_signature(html):
     """用页面引用的 chunk 文件名做指纹，部署变更时自动失效缓存。"""
-    names = re.findall(r"/_next/static/chunks/([^\"']+\.js)", str(html or ""))
+    names = []
+    for path in _extract_next_chunk_paths(html):
+        names.append(path.rsplit("/", 1)[-1])
     names = sorted(set(names))[:30]
     return hashlib.sha1("|".join(names).encode("utf-8")).hexdigest()[:16]
 
@@ -382,7 +417,8 @@ def scrape_signup_next_headers(
     # ---- next-action from JS chunks ----
     # 1) 先从 HTML/RSC 正文抠 42 位 hex（部分部署会内联）
     # 2) 再用「浏览器 cookie」下载 chunk（无 cookie 时代理下常被 CF 空响应）
-    js_paths = list(set(re.findall(r'src="(/_next/static/chunks/[^"]+\.js)"', html)))
+    # script src 现带 ?dpl=...，必须用兼容正则，否则 total=0
+    js_paths = _extract_next_chunk_paths(html)
     if log_callback:
         log_callback(f"[Debug] 扫描 JS chunk 查找 next-action（共 {len(js_paths)}）...")
 
@@ -470,31 +506,22 @@ def scrape_signup_next_headers(
 
     with _NEXT_ACTION_CACHE_LOCK:
         preferred_path = str(_NEXT_ACTION_CACHE.get("chunk_path") or "")
-    ordered = sorted(
-        js_paths,
-        key=lambda p: (
-            0 if preferred_path and p == preferred_path else 1,
-            0
-            if any(
-                x in p
-                for x in (
-                    "06rq",
-                    "create",
-                    "sign",
-                    "auth",
-                    "action",
-                    "0rq",
-                    "csyr",
-                    "user",
-                )
-            )
-            else 1,
-            p,
-        ),
-    )
-    # 命中 signup 关键字立即停；最多扫 12 个优先 chunk（避免 40 次空请求）
+    # 文件名是 content-hash，关键字命中率低；preferred_path 优先，其余保持 HTML 出现顺序
+    ordered = []
+    seen_order = set()
+    if preferred_path and preferred_path in js_paths:
+        ordered.append(preferred_path)
+        seen_order.add(preferred_path)
+    for path in js_paths:
+        if path in seen_order:
+            continue
+        ordered.append(path)
+        seen_order.add(path)
+
+    # 全量扫描直到命中 signup 关键字；命中即停。
+    # 以前只扫 12 个 + 文件名启发式，content-hash 命名后经常 miss。
     hit_path = ""
-    for path in ordered[:12]:
+    for path in ordered:
         scanned += 1
         h, is_signup = _fetch_chunk(path)
         if not h:
@@ -509,23 +536,6 @@ def scrape_signup_next_headers(
             fallback_hash = h
             if not hit_path:
                 hit_path = path
-    # 前 12 没命中 signup，再扩扫剩余（仍命中即停）
-    if not signup_hash:
-        for path in ordered[12:]:
-            scanned += 1
-            h, is_signup = _fetch_chunk(path)
-            if not h:
-                hit_empty += 1
-                continue
-            hit_ok += 1
-            if is_signup:
-                signup_hash = h
-                hit_path = path
-                break
-            if fallback_hash is None or (h.startswith("7f") and not str(fallback_hash).startswith("7f")):
-                fallback_hash = h
-                if not hit_path:
-                    hit_path = path
 
     try:
         if session is not None:

@@ -191,3 +191,77 @@ def test_setup_cf_email_catch_all_binds_active_domain(monkeypatch):
     assert delays == [0.3]
     assert calls[-1][0] == "PUT"
     assert calls[-1][2]["json_body"]["actions"] == [{"type": "worker", "value": ["mail-worker"]}]
+
+
+def test_extract_next_chunk_paths_handles_dpl_query():
+    """accounts.x.ai 现用 script src=...js?dpl=...，旧正则会扫到 0 个 chunk。"""
+    from core.xai.protocol import _extract_next_chunk_paths
+
+    html = """
+    <script src="/_next/static/chunks/13vv-2urxf686.js?dpl=f9c3b5ee3538777dfcd6b50f800d1a9943200faf"></script>
+    <script src='/_next/static/chunks/0l_9zajv2qwaj.js?dpl=abc'></script>
+    <script src="/_next/static/chunks/plain-no-query.js"></script>
+    <link rel="preload" href="/_next/static/chunks/preload-only.js?dpl=x" as="script"/>
+    self.__next_f.push([1,"/_next/static/chunks/rsc-inline.js"])
+    """
+    paths = _extract_next_chunk_paths(html)
+    assert "/_next/static/chunks/13vv-2urxf686.js" in paths
+    assert "/_next/static/chunks/0l_9zajv2qwaj.js" in paths
+    assert "/_next/static/chunks/plain-no-query.js" in paths
+    assert "/_next/static/chunks/preload-only.js" in paths
+    assert "/_next/static/chunks/rsc-inline.js" in paths
+    assert all("?" not in p for p in paths)
+
+
+def test_scrape_signup_next_headers_finds_action_with_dpl_src(monkeypatch):
+    """带 ?dpl= 的 HTML 应能发现 chunk 并提取 createServerReference action id。"""
+    from core.xai import protocol as xai
+
+    html = (
+        "<html><head>"
+        '<script src="/_next/static/chunks/runtime.js?dpl=abc"></script>'
+        '<script src="/_next/static/chunks/signup-page.js?dpl=abc"></script>'
+        "</head><body>Create Your Grok Account</body></html>"
+    )
+    chunks = {
+        "/_next/static/chunks/runtime.js": "console.log('runtime');",
+        "/_next/static/chunks/signup-page.js": (
+            'let ref=(0,mod.createServerReference)("7f604157223aec88bfc7caa59945c69e48dbba3397",mod.callServer);'
+            "X({emailValidationCode:code,createUserAndSessionRequest:{email},turnstileToken:tok});"
+        ),
+    }
+
+    class FakeResp:
+        def __init__(self, text):
+            self.text = text
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            pass
+
+        def get(self, url, headers=None, timeout=15):
+            path = url.replace("https://accounts.x.ai", "")
+            if "?" in path:
+                path = path.split("?", 1)[0]
+            return FakeResp(chunks.get(path, ""))
+
+        def close(self):
+            pass
+
+    class FakeRequests:
+        Session = FakeSession
+
+    monkeypatch.setattr(xai, "requests", FakeRequests)
+    monkeypatch.setattr(xai, "_load_next_action_disk_cache", lambda: None)
+    monkeypatch.setattr(xai, "_save_next_action_disk_cache", lambda: None)
+    with xai._NEXT_ACTION_CACHE_LOCK:
+        xai._NEXT_ACTION_CACHE.update(
+            {"action": "", "router": "", "chunk_path": "", "at": 0.0, "html_sig": ""}
+        )
+
+    logs = []
+    meta = xai.scrape_signup_next_headers(
+        html, log_callback=logs.append, force_refresh=True, browser_cookies=[]
+    )
+    assert meta["next_action"] == "7f604157223aec88bfc7caa59945c69e48dbba3397"
+    assert any("共 2" in line for line in logs)

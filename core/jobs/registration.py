@@ -698,6 +698,26 @@ class RegistrationJob:
                     profile["sso"] = sso
                     profile["signup_mode"] = "browser+api-fallback"
                     logf("[*] 5. 已通过 API create_account 降级获取 sso")
+        # 6a) 浏览器 warm-up：在浏览器里把 sso 注入 accounts.x.ai / auth.x.ai，让
+        # IdP 给这个新号建立一个真正的 web 会话。纯 HTTP 拿的 SSO 会话没有浏览器侧
+        # 的登录状态，直接走 Device Flow / OAuth redeem 的“首次授权”会被 IdP 以
+        # Access denied 拒绝（对应 token 端 invalid_grant）。预热步骤相当于先让账号
+        # 经由浏览器完成过一次 web login，再拿到的 cookie 袋用于后续 OAuth 授权。
+        raise_if_cancelled(self.should_stop)
+        try:
+            from core.push.integrations import warmup_sso_in_browser as _warmup_fn
+            warmup_result = _warmup_fn(
+                sso, log_callback=logf, cancel_callback=self.should_stop,
+            )
+            if warmup_result.get("ok"):
+                logf(
+                    f"[*] SSO 浏览器预热完成，cookie 数={len(warmup_result.get('cookies') or [])}, "
+                    f"final_url={str(warmup_result.get('final_url'))[:120]}"
+                )
+            else:
+                logf(f"[*] SSO 浏览器预热未生效（降级继续），原因={warmup_result.get('error') or warmup_result}")
+        except Exception as warmup_exc:
+            logf(f"[Debug] 浏览器预热异常，跳过（不影响注册流程）: {warmup_exc}")
         raise_if_cancelled(self.should_stop)
         if self.settings.get("enable_nsfw"):
             logf("[*] 6. 开启 NSFW")

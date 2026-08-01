@@ -2250,11 +2250,397 @@ _DEVICE_FLOW_LOCK = threading.RLock()
 _DEVICE_FLOW_LAST_TS = 0.0
 
 
+def _device_flow_browser_assist():
+    """Device Flow 允许浏览器辅助 verify/approve 的配置开关。"""
+    try:
+        return bool(int((_active_config() or {}).get("device_flow_browser_assist", 1) or 1))
+    except Exception:
+        return True
+
+
+def _browser_verify_and_approve_account(sso, user_code, verification_uri_complete,
+                                        device_code, issuer, accounts,
+                                        impersonate, log_callback=None,
+                                        cancel_callback=None):
+    """浏览器辅助：在真实浏览器里对同一个 user_code 走完 verify+approve。
+
+    IdP 对新号/某些 IP 拒绝把 HTTP POST /device/approve 视为真正 commit consent，
+    导致 /oauth2/token 拿 device_code 换 RT 时始终返回 Access denied。本函数把
+    verify + approve 放进浏览器，让 JS + cookie 链在浏览器里完整跑一遍，使 IdP 侧
+    真正记录“用户同意本次 scope 授权”。
+
+    返回 (ok, updated_browser_cookies, final_url)。
+    """
+    def log(msg):
+        if log_callback: log_callback(msg)
+
+    token = _normalize_sso_token(sso)
+    if not token:
+        return False, None, ""
+
+    user_code = str(user_code or "").strip()
+    if not user_code and verification_uri_complete:
+        try:
+            parsed = urllib.parse.urlparse(str(verification_uri_complete))
+            qs = urllib.parse.parse_qs(parsed.query)
+            user_code = str((qs.get("user_code") or [""])[0] or "").strip()
+        except Exception:
+            pass
+    if not user_code:
+        return False, None, ""
+
+    if verification_uri_complete:
+        verify_url = verification_uri_complete
+    else:
+        verify_url = f"{accounts}/oauth2/device/consent?user_code={urllib.parse.quote(user_code)}"
+
+    try:
+        browser = _get_browser()
+        page = _get_page()
+        if browser is None or page is None:
+            browser, page = start_browser(log_callback=log_callback)
+        if browser is None or page is None:
+            log("[Debug] 浏览器辅助 Device Flow：浏览器不可用")
+            return False, None, ""
+        try:
+            page = browser.new_tab(verify_url)
+            _set_page(page)
+        except Exception:
+            try:
+                page = refresh_active_page()
+                page.get(verify_url)
+            except Exception:
+                pass
+        # 注入 sso 到浏览器
+        injected = set_xai_sso_cookies_for_oauth(page, token, log_callback=log_callback)
+        if not injected:
+            log("[Debug] 浏览器辅助 Device Flow：sso 注入失败，仍继续")
+        # 落到 accounts / auth 域后再重新打开 verify_url，避免跨域 sign-in 空窗
+        try:
+            page.get("https://auth.x.ai/")
+            sleep_with_cancel(0.6, cancel_callback)
+            page.get(verify_url)
+        except Exception:
+            log("[Debug] 浏览器辅助 Device Flow：auth settle 失败，仍继续")
+
+        # 等页面加载
+        settle_ms = 0
+        consent_form_seen = False
+        seen_consent_url = ""
+        deadline = time.time() + 18
+        while time.time() < deadline:
+            time.sleep(0.7)
+            cur = str(getattr(page, "url", "") or "")
+            body = ""
+            try:
+                body = str(getattr(page, "html", "") or "") or str(getattr(page, "text", "") or "")
+            except Exception:
+                body = ""
+            low = (cur + " " + body[:4000]).lower()
+            if "/oauth2/device/consent" in cur or "/oauth2/device/done" in cur:
+                if "/oauth2/device/done" in cur:
+                    consent_form_seen = True
+                    seen_consent_url = cur
+                    break
+                consent_form_seen = True
+                seen_consent_url = cur
+            # 落到登录页 → 再次注入 sso 然后重开
+            if ("sign-in" in low or "/login" in low) and "oauth2/device" not in cur:
+                set_xai_sso_cookies_for_oauth(page, token, log_callback=log_callback)
+                try:
+                    page.get(verify_url)
+                except Exception:
+                    pass
+            settle_ms += 700
+            if settle_ms > 8000 and not consent_form_seen:
+                break
+
+        # 如果已经在 /done，提前成功
+        if consent_form_seen and "/oauth2/device/done" in seen_consent_url:
+            cookies = None
+            try:
+                cookies = _current_browser_xai_cookies(page)
+            except Exception:
+                cookies = None
+            return True, cookies or [], seen_consent_url
+
+        # 点 Allow / submit consent 表单
+        click_result = None
+        try:
+            # 用 JS 直接找 <form action="*approve*"> 并 submit，或点提交按钮
+            click_script = r"""
+(function() {
+  const userCode = String(new URLSearchParams(location.search).get('user_code') || '');
+  let form = null;
+  for (const f of document.querySelectorAll('form')) {
+    const action = String(f.getAttribute('action') || '').toLowerCase();
+    if (action.includes('approve') || action.includes('consent') || action.includes('/device/consent')) {
+      form = f; break;
+    }
+  }
+  if (!form) form = document.querySelector('form[action]') || document.querySelector('form');
+  if (!form) {
+    const btn = Array.from(document.querySelectorAll('button')).find(b => {
+      const t = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      return ['allow','authorize','authorise','continue','approve','accept','confirm','yes','submit'].some(w => t.includes(w));
+    });
+    if (btn) { btn.click(); return {clicked:true, via:'button', text: (btn.innerText||'').trim().slice(0,40)};
+    }
+    return {clicked:false, reason:'no-form-no-button', url: location.href};
+  }
+  // 确保字段存在，填 user_code 与 action=allow
+  const ensure = (name, val) => {
+    let el = form.querySelector('input[name="'+name+'"]');
+    if (!el) {
+      el = document.createElement('input');
+      el.type = 'hidden'; el.name = name;
+      form.appendChild(el);
+    }
+    el.value = val;
+  };
+  ensure('user_code', userCode);
+  ensure('action', 'allow');
+  ensure('principal_type', 'User');
+  try { form.submit(); return {clicked:true, via:'form-submit', action: String(form.action||'')} }
+  catch (e) { return {clicked:false, reason: String(e)} }
+})()"""
+            click_result = page.run_js(click_script)
+            if not isinstance(click_result, dict):
+                click_result = {"clicked": bool(click_result)}
+        except Exception as exc:
+            log(f"[Debug] Device Flow JS 点击异常: {exc}")
+            click_result = {"clicked": False, "error": str(exc)}
+
+        if click_result.get("clicked"):
+            log(f"[Debug] 浏览器辅助 Device Flow: clicked={click_result}")
+
+        # 等跳转
+        deadline2 = time.time() + 12
+        final_url = ""
+        while time.time() < deadline2:
+            time.sleep(0.5)
+            cur = str(getattr(page, "url", "") or "")
+            if "/done" in cur or "/complete" in cur or "device_authorized" in cur.lower():
+                final_url = cur; break
+            if "sign-in" in cur or "/login" in cur.lower():
+                # 仍落登录页 → 后退重试
+                set_xai_sso_cookies_for_oauth(page, token, log_callback=log_callback)
+                try:
+                    page.get(verify_url)
+                    sleep_with_cancel(1.0, cancel_callback)
+                except Exception:
+                    pass
+            final_url = cur
+        cookies = None
+        try:
+            cookies = _current_browser_xai_cookies(page)
+        except Exception:
+            cookies = None
+        ok = consent_form_seen or "/done" in final_url or "/complete" in final_url
+        return bool(ok), cookies or [], final_url
+    except Exception:
+        pass
+    return False, None, ""
+
+
 def _device_flow_gap_sec():
     try:
         return max(0.0, float(_active_config().get("device_flow_gap_seconds", 2.0) or 2.0))
     except Exception:
         return 2.0
+
+
+def warmup_sso_in_browser(sso, *, log_callback=None, cancel_callback=None,
+                          require_auth_domain=True):
+    """浏览器侧完整 web-session 预热：注入 sso → 走 CF + turnstile → 建立 auth 域 web 会话。
+
+    纯 HTTP 拿到的 SSO IdP 侧无法识别为“已登录的 web browser session”，Device Flow / OAuth
+    consent 在 /oauth2/token 端点会被以 invalid_grant / Access denied 拒绝。本函数把 sso
+    注入到真实浏览器里走一次 accounts.x.ai 主页加载 + CookieSetter hop 链，使浏览器上的
+    auth.x.ai / accounts.x.ai 域都被 IdP 以“真实浏览器 web session”方式标记为已登录；返回
+    此时浏览器中的完整 cookie 袋供后续流程使用。
+
+    返回 dict: {ok, cookies, final_url, error}。cookies 为 [{name,value,domain,path,...}]。
+    任何失败都不会抛错，而只返回 ok=False，调用方应视之为降级（走原逻辑）。
+    """
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    token = _normalize_sso_token(sso)
+    if not token:
+        return {"ok": False, "cookies": [], "final_url": "", "error": "empty sso"}
+
+    empty = {"ok": False, "cookies": [], "final_url": "", "error": ""}
+    try:
+        page = _get_page()
+        if page is None:
+            try:
+                browser, page = start_browser(log_callback=log_callback)
+                if browser is None or page is None:
+                    return dict(empty, error="browser unavailable")
+            except Exception as exc:
+                return dict(empty, error=f"browser start failed: {exc}")
+        browser = _get_browser()
+        if browser is None:
+            return dict(empty, error="browser unavailable")
+
+        # 探测/找一个可用的 tab
+        use_tab = page
+        try:
+            # 专用 tab，避免污染其它 tab 状态
+            new_tab = browser.new_tab("about:blank")
+            try:
+                _set_page(new_tab)
+            except Exception:
+                pass
+            use_tab = new_tab
+        except Exception:
+            use_tab = page
+
+        pre_cookies = []
+        try:
+            pre_cookies = _current_browser_xai_cookies(use_tab) or []
+        except Exception:
+            pre_cookies = []
+        pre_auth_count = sum(1 for c in pre_cookies
+                            if "auth.x.ai" in str(c.get("domain", "")))
+
+        # 1) 注入 sso
+        injected = False
+        try:
+            injected = set_xai_sso_cookies_for_oauth(use_tab, token, log_callback=log)
+        except Exception as exc:
+            log(f"[Debug] warmup inject err (non-fatal): {exc}")
+
+        # 2) 落 accounts 域，走主页让 CF + turnstile + 主页 JS 跑完
+        home_ok = False
+        for url in ("https://accounts.x.ai/", "https://accounts.x.ai/account"):
+            try:
+                use_tab.get(url)
+                sleep_with_cancel(1.5, cancel_callback)
+            except Exception:
+                continue
+            cur = str(getattr(use_tab, "url", "") or body_safe(use_tab))
+            body = body_text(use_tab, limit=1500)
+            combined = (cur + " " + body).lower()
+            if "sign-in" in combined or "/login" in combined:
+                set_xai_sso_cookies_for_oauth(use_tab, token, log_callback=log)
+                try:
+                    use_tab.get("https://accounts.x.ai/account")
+                    sleep_with_cancel(1.5, cancel_callback)
+                except Exception:
+                    continue
+                cur = str(getattr(use_tab, "url", "") or "")
+                combined = (cur + " ").lower()
+                if "sign-in" in combined or "/login" in combined:
+                    continue
+            if "account" in cur or "/account" in cur or "verify" in combined:
+                home_ok = True
+                break
+            if "accounts.x.ai" in cur and "sign-in" not in combined:
+                home_ok = True
+                break
+
+        try:
+            cookies_mid = _current_browser_xai_cookies(use_tab) or []
+        except Exception:
+            cookies_mid = []
+
+        # 3) 走 CookieSetter hop hop 链（通过 HTTP 仅拿 hop URL，再在浏览器里 follow）
+        setter_url = ""
+        try:
+            from core.xai.protocol import create_cookie_setter_link
+            csl = create_cookie_setter_link(
+                "https://accounts.x.ai/account",
+                session=None,
+                proxies=get_proxies(),
+                log_callback=log,
+            )
+            setter_url = str((csl or {}).get("cookie_setter_url") or "").strip()
+        except Exception as exc:
+            log(f"[Debug] warmup get setter url err (non-fatal): {exc}")
+
+        final_url = str(getattr(use_tab, "url", "") or "")
+        if setter_url:
+            try:
+                use_tab.get(setter_url)
+                sleep_with_cancel(1.5, cancel_callback)
+                final_url = str(getattr(use_tab, "url", "") or final_url)
+            except Exception:
+                log("[Debug] warmup follow setter err (non-fatal)")
+
+        # 4) 必要时再落一次 auth 域，让 IdP 用真正的 web session 状态刷新 cookie
+        if require_auth_domain:
+            try:
+                try:
+                    use_tab.get("https://auth.x.ai/")
+                except Exception:
+                    pass
+                sleep_with_cancel(1.0, cancel_callback)
+                cur = str(getattr(use_tab, "url", "") or "")
+                combined = (cur + " ").lower()
+                if "sign-in" in combined or "login" in combined:
+                    set_xai_sso_cookies_for_oauth(use_tab, token, log_callback=log)
+                    try:
+                        use_tab.get("https://auth.x.ai/")
+                        sleep_with_cancel(1.0, cancel_callback)
+                    except Exception:
+                        pass
+                if "sign-in" not in (str(getattr(use_tab, "url", "") or "") + "").lower():
+                    final_url = str(getattr(use_tab, "url", "") or final_url)
+            except Exception:
+                log("[Debug] warmup auth domain err (non-fatal)")
+
+        # 5) 收集 cookie
+        final_cookies = []
+        try:
+            final_cookies = _current_browser_xai_cookies(use_tab) or []
+        except Exception:
+            pass
+        if not final_cookies:
+            final_cookies = cookies_mid
+        if not final_cookies:
+            final_cookies = pre_cookies
+
+        post_auth_count = sum(1 for c in final_cookies
+                             if "auth.x.ai" in str(c.get("domain", "")))
+
+        ok = (home_ok
+              or (post_auth_count > pre_auth_count)
+              or (len(final_cookies) >= max(3, len(pre_cookies))))
+        if injected and not final_cookies:
+            ok = False
+        log(f"[*] SSO 浏览器预热: ok={ok} pre_auth={pre_auth_count} post_auth={post_auth_count} "
+            f"cookie_count={len(final_cookies)} final_url={final_url[:120]}")
+        return {
+            "ok": bool(ok),
+            "cookies": final_cookies,
+            "final_url": final_url,
+            "error": "" if ok else "no useful cookies",
+        }
+    except Exception as exc:
+        log(f"[!] SSO 浏览器预热异常: {exc}")
+        return {"ok": False, "cookies": [], "final_url": "", "error": str(exc)}
+
+
+def body_safe(page):
+    try:
+        return str(getattr(page, "url", "") or "")
+    except Exception:
+        return ""
+
+
+def body_text(page, limit=1500):
+    text = ""
+    try:
+        text = str(getattr(page, "html", "") or "") or ""
+    except Exception:
+        try:
+            text = str(getattr(page, "text", "") or "") or ""
+        except Exception:
+            text = ""
+    return text[:limit]
 
 
 def exchange_sso_to_refresh_token_via_device_flow(
@@ -2734,9 +3120,57 @@ def exchange_sso_to_refresh_token_via_device_flow(
                             + (f" ({err_desc})" if err_desc else "")
                             + (f" body={body_preview}" if body_preview and not err_desc else "")
                         )
-                        # 参考 openai-cpa：保持完整 scope，用新 device_code 和兼容 approve 表单重试。
+                        # HTTP approve 303 后门在新号/风控 IP 下经常只是“落地 done”而没有真正
+                        # commit consent，于是 /oauth2/token 一直 Access denied。此时把 verify+approve
+                        # 放回真实浏览器走一遍，让 IdP 真正记录 "scope 已授权"，并用浏览器拿到的 cookie
+                        # 更新 device_session 后再 poll token。
                         if error == "invalid_grant" and "access denied" in (err_desc or "").lower():
-                            log("[Debug] token Access denied：将换新 device_code 并重试参考 approve 表单")
+                            if _device_flow_browser_assist():
+                                log("[Debug] token Access denied：HTTP-only approve 未生效，"
+                                    "走浏览器辅助 verify/approve...")
+                                try:
+                                    assist_ok, assist_cookies, _assist_url = (
+                                        _browser_verify_and_approve_account(
+                                            sso=sso,
+                                            user_code=user_code,
+                                            verification_uri_complete=verify_url,
+                                            device_code=device_code,
+                                            issuer=issuer,
+                                            accounts=accounts,
+                                            impersonate=impersonate,
+                                            log_callback=log,
+                                            cancel_callback=cancel_callback,
+                                        )
+                                    )
+                                except Exception as assist_exc:
+                                    log(f"[Debug] 浏览器辅助 Device Flow 异常: {assist_exc}")
+                                    assist_ok, assist_cookies = False, None
+                                if assist_ok:
+                                    log("[*] 浏览器辅助 Device Flow：verify+approve 通过；"
+                                        "用浏览器 cookie 续 poll token")
+                                    for c in assist_cookies or []:
+                                        try:
+                                            val = c.get("value")
+                                            domain = c.get("domain") or ".x.ai"
+                                            path = c.get("path") or "/"
+                                            for s in (session, device_session):
+                                                try:
+                                                    s.cookies.set(
+                                                        c.get("name"), val,
+                                                        domain=domain, path=path,
+                                                    )
+                                                except Exception:
+                                                    try:
+                                                        s.cookies.set(c.get("name"), val)
+                                                    except Exception:
+                                                        pass
+                                        except Exception:
+                                            pass
+                                    # 浏览器已 commit consent：续 poll token（使用浏览器 cookie）
+                                    continue
+                                log("[Debug] 浏览器辅助 Device Flow 也未触发 consent；换新重试")
+                            else:
+                                log("[Debug] token Access denied：浏览器辅助已禁用，换新 device_code 重试")
                             sleep_with_cancel(min(6.0, 2.0 * attempt + 1.0), cancel_callback)
                         break
                     except Exception as exc:

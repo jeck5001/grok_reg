@@ -2327,9 +2327,9 @@ def _browser_verify_and_approve_account(sso, user_code, verification_uri_complet
         settle_ms = 0
         consent_form_seen = False
         seen_consent_url = ""
-        deadline = time.time() + 18
+        deadline = time.time() + 5
         while time.time() < deadline:
-            time.sleep(0.7)
+            time.sleep(0.4)
             cur = str(getattr(page, "url", "") or "")
             body = ""
             try:
@@ -2445,9 +2445,9 @@ def _browser_verify_and_approve_account(sso, user_code, verification_uri_complet
 
 def _device_flow_gap_sec():
     try:
-        return max(0.0, float(_active_config().get("device_flow_gap_seconds", 2.0) or 2.0))
+        return max(0.0, float(_active_config().get("device_flow_gap_seconds", 0.5) or 0.5))
     except Exception:
-        return 2.0
+        return 0.5
 
 
 def warmup_sso_in_browser(sso, *, log_callback=None, cancel_callback=None,
@@ -2463,6 +2463,9 @@ def warmup_sso_in_browser(sso, *, log_callback=None, cancel_callback=None,
     返回 dict: {ok, cookies, final_url, error}。cookies 为 [{name,value,domain,path,...}]。
     任何失败都不会抛错，而只返回 ok=False，调用方应视之为降级（走原逻辑）。
     """
+    global _LAST_BROWSER_WARMUP_OK
+    _LAST_BROWSER_WARMUP_OK = False
+
     def log(msg):
         if log_callback:
             log_callback(msg)
@@ -2611,6 +2614,7 @@ def warmup_sso_in_browser(sso, *, log_callback=None, cancel_callback=None,
               or (len(final_cookies) >= max(3, len(pre_cookies))))
         if injected and not final_cookies:
             ok = False
+        _LAST_BROWSER_WARMUP_OK = bool(ok)
         log(f"[*] SSO 浏览器预热: ok={ok} pre_auth={pre_auth_count} post_auth={post_auth_count} "
             f"cookie_count={len(final_cookies)} final_url={final_url[:120]}")
         return {
@@ -2647,7 +2651,7 @@ def exchange_sso_to_refresh_token_via_device_flow(
     sso,
     log_callback=None,
     cancel_callback=None,
-    retries=3,
+    retries=1,
     browser_cookies=None,
     session=None,
     device_session=None,
@@ -3193,7 +3197,10 @@ def exchange_sso_to_refresh_token_via_device_flow(
                     pass
 
 
-def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_callback=None):
+_LAST_BROWSER_WARMUP_OK = False
+
+
+def fetch_xai_oauth_refresh_token(sso, timeout=12, log_callback=None, cancel_callback=None):
     """优先 Device Flow（与 2api 一致）；失败再回退浏览器 OAuth consent。"""
     token = _normalize_sso_token(sso)
     if not token:
@@ -3219,34 +3226,45 @@ def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_cal
 
     browser = _get_browser()
     page = _get_page()
-    try:
-        if log_callback:
-            log_callback("[*] 获取 Refresh Token：优先 Device Flow（对齐 openai-cpa）...")
-        device_fn = _resolve(
-            "exchange_sso_to_refresh_token_via_device_flow",
-            exchange_sso_to_refresh_token_via_device_flow,
-        )
-        device_cookies = _current_browser_xai_cookies(page)
-        if not device_cookies:
-            try:
-                from core.xai.protocol import promote_sso_session_cookies as _promo
+    skip_device_flow = bool(globals().get("_LAST_BROWSER_WARMUP_OK"))
+    if skip_device_flow:
+        # warmup 后浏览器里已建立完整 web 会话，Device Flow HTTP approve 仍会被
+        # Access denied 拒绝，browser-assist 又会空转 5s/轮，3 轮 × 2 blocks = 30s+ 浪费
+        try:
+            if log_callback:
+                log_callback("[*] 浏览器预热已成功，跳过 Device Flow 直接走 OAuth 浏览器流程")
+            globals()["_LAST_BROWSER_WARMUP_OK"] = False
+        except Exception:
+            pass
+    else:
+        try:
+            if log_callback:
+                log_callback("[*] 获取 Refresh Token：优先 Device Flow（对齐 openai-cpa）...")
+            device_fn = _resolve(
+                "exchange_sso_to_refresh_token_via_device_flow",
+                exchange_sso_to_refresh_token_via_device_flow,
+            )
+            device_cookies = _current_browser_xai_cookies(page)
+            if not device_cookies:
+                try:
+                    from core.xai.protocol import promote_sso_session_cookies as _promo
 
-                last = getattr(_promo, "_last_promo", None)
-                if isinstance(last, dict) and last.get("cookies"):
-                    device_cookies = last.get("cookies")
-            except Exception:
-                pass
-        if log_callback and device_cookies:
-            log_callback(f"[*] Device Flow 复用当前浏览器会话（{len(device_cookies)} cookies）")
-        return device_fn(
-            token,
-            log_callback=log_callback,
-            cancel_callback=cancel_callback,
-            browser_cookies=device_cookies,
-        )
-    except Exception as device_exc:
-        if log_callback:
-            log_callback(f"[!] Device Flow 失败，回退浏览器 OAuth: {device_exc}")
+                    last = getattr(_promo, "_last_promo", None)
+                    if isinstance(last, dict) and last.get("cookies"):
+                        device_cookies = last.get("cookies")
+                except Exception:
+                    pass
+            if log_callback and device_cookies:
+                log_callback(f"[*] Device Flow 复用当前浏览器会话（{len(device_cookies)} cookies）")
+            return device_fn(
+                token,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+                browser_cookies=device_cookies,
+            )
+        except Exception as device_exc:
+            if log_callback:
+                log_callback(f"[!] Device Flow 失败，回退浏览器 OAuth: {device_exc}")
 
     if browser is None or page is None:
         browser, page = start_browser(log_callback=log_callback)
